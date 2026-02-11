@@ -105,15 +105,20 @@ jobs:
         with:
           ndk-version: r26d
       - name: install frontend dependencies
-        run: npm install
+        run: npm install # Already present, ensures client's package.json dependencies are installed
         working-directory: ./client
-      - name: Build Android
-        run: |
-          npm run tauri android init
-          npm run tauri android build
+      - name: Build Frontend
+        run: npm run build # Builds the frontend as specified in tauri.conf.json
         working-directory: ./client
         env:
           NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          JAVA_HOME: ${{ steps.setup-java.outputs.java-home }}
+      - name: Build Android App
+        run: cargo tauri build --target aarch64-linux-android # Builds the Android app using Tauri v2 command
+        working-directory: ./client/src-tauri
+        env:
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          JAVA_HOME: ${{ steps.setup-java.outputs.java-home }}
       - name: Find APK files
         id: find_apk
         run: |
