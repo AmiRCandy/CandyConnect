@@ -4,12 +4,46 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 0.1.0). Leave empty to use version from tauri.conf.json'
+        required: false
+        default: ''
 
 permissions:
   contents: write
 
 jobs:
+  # Determine the version and tag name to use for the release
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag_name: ${{ steps.get_version.outputs.tag_name }}
+      version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get version
+        id: get_version
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # Triggered by tag push — use the tag directly
+            TAG="${GITHUB_REF#refs/tags/}"
+            VERSION="${TAG#v}"
+          elif [ -n "${{ github.event.inputs.version }}" ]; then
+            # Manual trigger with version specified
+            VERSION="${{ github.event.inputs.version }}"
+            TAG="v${VERSION}"
+          else
+            # Manual trigger without version — read from tauri.conf.json
+            VERSION=$(grep -oP '"version":\s*"\K[^"]+' client/src-tauri/tauri.conf.json)
+            TAG="v${VERSION}"
+          fi
+          echo "tag_name=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: ${VERSION}, tag: ${TAG}"
+
   release:
+    needs: prepare
     permissions:
       contents: write
     strategy:
@@ -39,16 +73,15 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: v__VERSION__ # the action automatically replaces \_\_VERSION\_\_ with the app version
-          releaseName: 'CandyConnect VPN v__VERSION__'
+          tagName: ${{ needs.prepare.outputs.tag_name }}
+          releaseName: 'CandyConnect VPN ${{ needs.prepare.outputs.tag_name }}'
           releaseBody: 'See the assets to download this version and install.'
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           projectPath: ./client
 
-  # Mobile build job - simplified for now as it requires signing keys
-  # This serves as a template for mobile builds
   mobile-android:
+    needs: prepare
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -76,9 +109,30 @@ jobs:
         working-directory: ./client
       - name: Build Android
         run: |
-            npm run tauri android init
-            npm run tauri android build
+          npm run tauri android init
+          npm run tauri android build
         working-directory: ./client
         env:
-           NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-
+          NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+      - name: Find APK files
+        id: find_apk
+        run: |
+          APK_PATH=$(find client/src-tauri/gen/android -name "*.apk" -type f | head -1)
+          if [ -z "$APK_PATH" ]; then
+            echo "No APK found, looking for AAB..."
+            APK_PATH=$(find client/src-tauri/gen/android -name "*.aab" -type f | head -1)
+          fi
+          echo "artifact_path=${APK_PATH}" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$(basename ${APK_PATH})" >> "$GITHUB_OUTPUT"
+          echo "Found artifact: ${APK_PATH}"
+      - name: Upload Android artifact to release
+        if: steps.find_apk.outputs.artifact_path != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag_name }}
+          name: 'CandyConnect VPN ${{ needs.prepare.outputs.tag_name }}'
+          files: ${{ steps.find_apk.outputs.artifact_path }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
