@@ -54,11 +54,22 @@ async def lifespan(app: FastAPI):
     for d in [DATA_DIR, CORE_DIR, BACKUP_DIR, LOG_DIR]:
         os.makedirs(d, exist_ok=True)
 
-    await init_db()
-    await add_log("INFO", "System", "CandyConnect server started")
+    # Initialize database (graceful if Redis is unavailable)
+    db_ready = False
+    try:
+        await init_db()
+        db_ready = True
+    except Exception as e:
+        logger.warning(f"init_db failed: {e}. Starting without Redis (degraded mode).")
+
+    if db_ready:
+        try:
+            await add_log("INFO", "System", "CandyConnect server started")
+        except Exception:
+            pass
     logger.info("CandyConnect server started")
 
-    # Start background tasks
+    # Start background tasks (they are resilient to failures)
     tasks = [
         asyncio.create_task(traffic_updater()),
         asyncio.create_task(status_checker()),
@@ -69,7 +80,10 @@ async def lifespan(app: FastAPI):
     # Shutdown
     for t in tasks:
         t.cancel()
-    await add_log("INFO", "System", "CandyConnect server shutting down")
+    try:
+        await add_log("INFO", "System", "CandyConnect server shutting down")
+    except Exception:
+        pass
     await close_redis()
 
 

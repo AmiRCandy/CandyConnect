@@ -13,8 +13,36 @@ CORE_DIR = os.path.join(DATA_DIR, "cores")
 # ── Redis ──
 REDIS_URL = os.environ.get("CC_REDIS_URL", "redis://127.0.0.1:6379/0")
 
-# ── JWT ──
-JWT_SECRET = os.environ.get("CC_JWT_SECRET", secrets.token_urlsafe(48))
+# ── JWT (persist secret across restarts unless provided via env) ──
+
+def _load_or_create_jwt_secret() -> str:
+    # Priority 1: explicit environment variable
+    env_secret = os.environ.get("CC_JWT_SECRET")
+    if env_secret:
+        return env_secret
+    # Priority 2: secret file in DATA_DIR
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        secret_file = os.path.join(DATA_DIR, ".jwt_secret")
+        if os.path.exists(secret_file):
+            with open(secret_file, "r") as f:
+                val = f.read().strip()
+                if val:
+                    return val
+        # Create new persistent secret
+        val = secrets.token_urlsafe(48)
+        with open(secret_file, "w") as f:
+            f.write(val)
+        try:
+            os.chmod(secret_file, 0o600)
+        except Exception:
+            pass
+        return val
+    except Exception:
+        # Fallback: ephemeral secret (tokens will invalidate on restart)
+        return secrets.token_urlsafe(48)
+
+JWT_SECRET = _load_or_create_jwt_secret()
 JWT_ALGORITHM = "HS256"
 JWT_ADMIN_EXPIRE_HOURS = 24
 JWT_CLIENT_EXPIRE_HOURS = 720  # 30 days

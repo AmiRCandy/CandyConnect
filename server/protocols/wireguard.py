@@ -111,10 +111,23 @@ class WireGuardProtocol(BaseProtocol):
         return ""
 
     async def get_active_connections(self) -> int:
-        rc, out, _ = await self._run_cmd("sudo wg show all peers", check=False)
-        if rc == 0 and out:
-            return len(out.strip().split("\n"))
-        return 0
+        """Count peers that have a recent handshake (non-zero)."""
+        rc, out, _ = await self._run_cmd("sudo wg show all dump", check=False)
+        if rc != 0 or not out:
+            return 0
+        active = 0
+        for line in out.strip().split("\n"):
+            parts = line.split("\t")
+            # Peer lines in `wg show all dump` have >= 9 columns; interface lines have fewer
+            if len(parts) >= 9:
+                latest_handshake = parts[5]
+                try:
+                    if int(latest_handshake) > 0:
+                        active += 1
+                except ValueError:
+                    # If not parsable, skip
+                    continue
+        return active
 
     async def get_traffic(self) -> dict:
         """Get total traffic for all WireGuard interfaces."""

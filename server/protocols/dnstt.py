@@ -23,7 +23,7 @@ class DNSTTProtocol(BaseProtocol):
 
             # Install dependencies
             rc, _, err = await self._run_cmd(
-                "sudo apt update && sudo apt install golang-go openssh-server -y",
+                "sudo apt update && sudo apt install -y golang-go openssh-server git",
                 check=False,
             )
             if rc != 0:

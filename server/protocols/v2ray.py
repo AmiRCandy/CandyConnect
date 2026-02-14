@@ -28,9 +28,10 @@ class V2RayProtocol(BaseProtocol):
                 check=False,
             )
             if rc != 0 or not out:
-                # Fallback: use install script
+                # Fallback: use install script (ensures curl present)
+                await self._run_cmd("sudo apt update && sudo apt install -y curl", check=False)
                 rc, _, err = await self._run_cmd(
-                    f"bash -c 'curl -sL https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh | bash -s -- install'",
+                    "bash -c 'curl -sL https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh | bash -s -- install'",
                     check=False,
                 )
                 if rc != 0:
@@ -39,6 +40,8 @@ class V2RayProtocol(BaseProtocol):
                 # Link the binary
                 await self._run_cmd(f"ln -sf /usr/local/bin/xray {self.XRAY_BIN}", check=False)
             else:
+                # Ensure curl and unzip exist for manual download path
+                await self._run_cmd("sudo apt update && sudo apt install -y curl unzip", check=False)
                 download_url = out.strip()
                 zip_path = os.path.join(self.XRAY_DIR, "xray.zip")
                 await self._run_cmd(f"curl -sL -o {zip_path} '{download_url}'")
