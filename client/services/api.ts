@@ -191,17 +191,34 @@ function addLog(level: string, message: string) {
 }
 
 function mapAccount(account: any): ClientAccount {
+  if (!account) {
+    return {
+      username: 'User',
+      comment: '',
+      enabled: false,
+      trafficLimit: { value: 0, unit: 'GB' },
+      trafficUsed: 0,
+      timeLimit: { mode: 'monthly', value: 0, onHold: false },
+      timeUsed: 0,
+      createdAt: '',
+      expiresAt: '',
+      enabledProtocols: {},
+      lastConnectedIP: '',
+      lastConnectedTime: '',
+      connectionHistory: [],
+    };
+  }
   return {
-    username: account.username,
-    comment: account.comment,
-    enabled: account.enabled,
-    trafficLimit: account.traffic_limit,
-    trafficUsed: account.traffic_used,
-    timeLimit: account.time_limit,
-    timeUsed: account.time_used,
-    createdAt: account.created_at,
-    expiresAt: account.expires_at,
-    enabledProtocols: account.protocols,
+    username: account.username || 'User',
+    comment: account.comment || '',
+    enabled: !!account.enabled,
+    trafficLimit: account.traffic_limit || { value: 0, unit: 'GB' },
+    trafficUsed: account.traffic_used || 0,
+    timeLimit: account.time_limit || { mode: 'monthly', value: 0, onHold: false },
+    timeUsed: account.time_used || 0,
+    createdAt: account.created_at || '',
+    expiresAt: account.expires_at || '',
+    enabledProtocols: account.protocols || {},
     lastConnectedIP: account.last_connected_ip || '',
     lastConnectedTime: account.last_connected_time || '',
     connectionHistory: account.connection_history || [],
@@ -356,7 +373,7 @@ export const LoadProfiles = async (): Promise<Record<string, string>> => {
 };
 
 export const AddProfile = async (name: string, link: string): Promise<string> => name;
-export const DeleteProfile = async (name: string): Promise<void> => {};
+export const DeleteProfile = async (name: string): Promise<void> => { };
 
 export const PingProfile = async (name: string): Promise<PingResult> => {
   await new Promise(r => setTimeout(r, 200 + Math.random() * 500));
@@ -386,7 +403,7 @@ export const GetV2RaySubProtocols = async (): Promise<V2RaySubProtocol[]> => {
         status: 'running' as const,
       }));
     }
-  } catch {}
+  } catch { }
   return [];
 };
 
@@ -421,7 +438,7 @@ export const GetNetworkSpeed = async (): Promise<NetworkSpeed> => {
         protocol: _connectedProtocol,
         bytes_used: dl * 1024 + ul * 256,
       });
-    } catch {}
+    } catch { }
   }
 
   return {

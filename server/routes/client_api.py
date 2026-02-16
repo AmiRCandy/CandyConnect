@@ -22,11 +22,40 @@ async def client_login(req: ClientLoginRequest):
         raise HTTPException(status_code=401, detail="Invalid username, password or account disabled")
     
     token = auth.create_client_token(req.username, client["id"])
+    server_ip = await _get_server_ip()
+    
+    # Get panel config for server name if possible
+    panel_cfg = await db.get_core_config("candyconnect")
+    server_name = panel_cfg.get("panel_domain", "CandyConnect Server") if panel_cfg else "CandyConnect Server"
+
     return {
         "success": True, 
         "message": "Login successful", 
         "token": token,
-        "username": client["username"]
+        "server_info": {
+            "hostname": server_name,
+            "ip": server_ip,
+            "version": "1.4.2"
+        },
+        "account": _format_client(client)
+    }
+
+def _format_client(client: dict) -> dict:
+    """Consistently format client data for the API response."""
+    return {
+        "username": client["username"],
+        "comment": client.get("comment", ""),
+        "enabled": client["enabled"],
+        "traffic_used": client["traffic_used"],
+        "traffic_limit": client["traffic_limit"],
+        "time_limit": client.get("time_limit", {"mode": "monthly", "value": 30, "onHold": False}),
+        "time_used": client.get("time_used", 0),
+        "created_at": client["created_at"],
+        "expires_at": client["expires_at"],
+        "protocols": client["protocols"],
+        "last_connected_ip": client.get("last_connected_ip", ""),
+        "last_connected_time": client.get("last_connected_time", ""),
+        "connection_history": client.get("connection_history", [])
     }
 
 @router.get("/account")
@@ -38,13 +67,7 @@ async def get_account(payload=Depends(auth.require_client)):
     
     return {
         "success": True,
-        "data": {
-            "username": client["username"],
-            "traffic_used": client["traffic_used"],
-            "traffic_limit": client["traffic_limit"],
-            "expires_at": client["expires_at"],
-            "enabled": client["enabled"]
-        }
+        "data": _format_client(client)
     }
 
 @router.get("/protocols")
@@ -126,9 +149,9 @@ async def get_server_info():
     return {
         "success": True, 
         "data": {
+            "hostname": "CandyConnect Server",
             "ip": ip,
-            "version": "1.4.2",
-            "name": "CandyConnect VPN Server"
+            "version": "1.4.2"
         }
     }
 

@@ -44,10 +44,11 @@ class OpenVPNProtocol(BaseProtocol):
                 f"cd {self.EASYRSA_DIR} && EASYRSA_BATCH=1 ./easyrsa --batch build-server-full server nopass",
                 check=False,
             )
-            # Generate DH params
+            # Generate DH params (can be slow, increase timeout)
             await self._run_cmd(
                 f"cd {self.EASYRSA_DIR} && ./easyrsa --batch gen-dh",
                 check=False,
+                timeout=600,
             )
             # Generate TLS-Crypt key
             await self._run_cmd(
@@ -200,6 +201,7 @@ class OpenVPNProtocol(BaseProtocol):
         await self._run_cmd(
             f"cd {self.EASYRSA_DIR} && EASYRSA_BATCH=1 ./easyrsa --batch build-client-full {username} nopass",
             check=False,
+            timeout=120,
         )
         return {"cert_generated": True, "username": username}
 

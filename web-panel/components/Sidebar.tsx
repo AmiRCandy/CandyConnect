@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { LayoutDashboard, Users, Settings, Wrench, LogOut } from 'lucide-react';
+import { LayoutDashboard, Users, Settings, Wrench, LogOut, Activity } from 'lucide-react';
 import { getPanel, type PanelData } from '../services/api';
 import GreenCandy from '../assets/green-candy.svg';
 import RedCandy from '../assets/red-candy.svg';
@@ -15,6 +15,7 @@ interface SidebarProps {
 const pages = [
   { id: 'dashboard', title: 'Dashboard', icon: LayoutDashboard },
   { id: 'clients', title: 'Clients', icon: Users },
+  { id: 'logs', title: 'System Logs', icon: Activity },
   { id: 'coreconfigs', title: 'Core Configs', icon: Settings },
   { id: 'panelconfigs', title: 'Panel Configs', icon: Wrench },
 ];
@@ -29,7 +30,7 @@ const Sidebar: React.FC<SidebarProps> = ({ currentPage, onNavigate, onLogout, op
   }, []);
 
   useEffect(() => {
-    getPanel().then(setPanelData).catch(() => {});
+    getPanel().then(setPanelData).catch(() => { });
   }, []);
 
   const version = panelData?.config.version || '1.4.2';

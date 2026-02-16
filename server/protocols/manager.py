@@ -13,7 +13,11 @@ from database import (
     get_core_status,
     set_core_status,
     get_core_config,
+    get_all_clients,
+    update_client,
+    get_logs,
 )
+import database as db
 
 # Import protocol implementations (some may be placeholders)
 from protocols.v2ray import V2RayProtocol
@@ -46,7 +50,6 @@ class ProtocolManager:
     async def auto_start_protocols(self) -> None:
         """Automatically install and start cores, and sync existing clients."""
         import logging
-        from database import get_all_clients, update_client
         logger = logging.getLogger("candyconnect")
         
         # 1. Start Protocols
@@ -58,11 +61,9 @@ class ProtocolManager:
                     logger.info(f"Auto-started protocol: {pid}")
                 else:
                     # Fetch last error from DB logs for this protocol
-                    logs = await db.get_logs(20)
+                    logs = await get_logs(20)
                     reason = "Unknown error"
-                    for entry_str in logs:
-                        import json
-                        entry = json.loads(entry_str)
+                    for entry in logs:
                         if entry.get("source") == pid.upper() or entry.get("source") == pid:
                             if entry.get("level") == "ERROR":
                                 reason = entry.get("message")

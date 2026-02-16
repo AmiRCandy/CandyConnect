@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { getDashboard, type DashboardData } from '../services/api';
 import { formatUptime, formatTraffic } from '../utils/format';
 import ProgressBar from '../components/ProgressBar';
-import { Users, Link2, Cpu, Clock, Monitor, Zap, Shield, Lock, KeyRound, Radio, Globe, Wind, Castle, ArrowDownCircle, ArrowUpCircle, Activity, Server, Loader2 } from 'lucide-react';
+import { Users, Link2, Cpu, Clock, Monitor, Zap, Shield, Lock, KeyRound, Radio, Globe, Wind, Castle, ArrowDownCircle, ArrowUpCircle, Activity, Server, Loader2, ExternalLink } from 'lucide-react';
 
 const coreIcons: Record<string, React.ReactNode> = {
   v2ray: <Zap className="w-4.5 h-4.5 text-yellow-500" strokeWidth={2} />,
@@ -211,6 +211,13 @@ const DashboardPage: React.FC = () => {
           <h2 className="text-sm font-bold text-slate-800 dark:text-slate-200 uppercase tracking-wider flex items-center gap-2">
             <Activity className="w-4 h-4 text-slate-500" strokeWidth={2} />
             Recent Logs
+            <button
+              onClick={() => (window as any).ccNavigate('logs')}
+              className="ml-2 p-1 text-[10px] text-orange-500 hover:text-orange-600 dark:hover:text-orange-400 flex items-center gap-0.5 border border-orange-200 dark:border-orange-800/50 rounded-md transition-colors"
+            >
+              <ExternalLink className="w-2.5 h-2.5" />
+              View All
+            </button>
           </h2>
           <div className="flex items-center gap-3">
             <select

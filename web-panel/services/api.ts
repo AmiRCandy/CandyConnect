@@ -84,8 +84,8 @@ export interface DashboardData {
   };
 }
 
-export async function getDashboard(): Promise<DashboardData> {
-  const res = await request<DashboardData>('GET', '/dashboard');
+export async function getDashboard(limit: number = 10): Promise<DashboardData> {
+  const res = await request<DashboardData>('GET', `/dashboard?limit=${limit}`);
   if (!res.success || !res.data) throw new Error(res.message);
   return res.data;
 }
@@ -163,8 +163,8 @@ export async function deleteClient(id: string): Promise<void> {
 
 // ── Logs ──
 
-export async function getLogs(): Promise<LogEntry[]> {
-  const res = await request<LogEntry[]>('GET', '/logs');
+export async function getLogs(limit: number = 100): Promise<LogEntry[]> {
+  const res = await request<LogEntry[]>('GET', `/logs?limit=${limit}`);
   if (!res.success || !res.data) throw new Error(res.message);
   return res.data;
 }

@@ -262,6 +262,10 @@ DNS = {config.get('dns', '1.1.1.1')}
 PostUp = {config.get('post_up', '')}
 PostDown = {config.get('post_down', '')}
 """
-        conf_path = os.path.join(self.WG_DIR, f"{name}.conf")
-        await self._run_cmd(f"echo '{conf}' | sudo tee {conf_path}")
-        await self._run_cmd(f"sudo chmod 600 {conf_path}")
+        tmp_path = f"/tmp/cc_{name}.conf"
+        with open(tmp_path, "w") as f:
+            f.write(conf)
+            
+        await self._run_cmd(f"sudo mv {tmp_path} {conf_path}", check=False)
+        await self._run_cmd(f"sudo chown root:root {conf_path}", check=False)
+        await self._run_cmd(f"sudo chmod 600 {conf_path}", check=False)
