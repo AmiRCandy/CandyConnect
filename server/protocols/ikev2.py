@@ -173,9 +173,9 @@ class IKEv2Protocol(BaseProtocol):
             check=False,
         )
 
-        # Add EAP credentials to ipsec.secrets
+        # Add/Update EAP credentials in ipsec.secrets
+        await self._run_cmd(f"sudo sed -i '/{username} : EAP/d' /etc/ipsec.secrets 2>/dev/null || true", check=False)
         await self._run_cmd(
-            f"grep -q '{username}' /etc/ipsec.secrets 2>/dev/null || "
             f"echo '{username} : EAP \"{password}\"' | sudo tee -a /etc/ipsec.secrets",
             check=False,
         )

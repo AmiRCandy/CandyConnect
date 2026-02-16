@@ -2,13 +2,13 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version (e.g. 0.1.0). Leave empty to use version from tauri.conf.json'
+        description: "Release version (e.g. 0.1.0). Leave empty to use version from tauri.conf.json"
         required: false
-        default: ''
+        default: ""
 
 permissions:
   contents: write
@@ -74,14 +74,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tagName: ${{ needs.prepare.outputs.tag_name }}
-          releaseName: 'CandyConnect VPN ${{ needs.prepare.outputs.tag_name }}'
-          releaseBody: 'See the assets to download this version and install.'
+          releaseName: "CandyConnect VPN ${{ needs.prepare.outputs.tag_name }}"
+          releaseBody: "See the assets to download this version and install."
           releaseDraft: false
           prerelease: false
           projectPath: ./client
 
   mobile-android:
-    needs: prepare
+    needs: [prepare, release]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -95,8 +95,8 @@ jobs:
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
-          distribution: 'zulu'
-          java-version: '17'
+          distribution: "zulu"
+          java-version: "17"
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
       - name: Setup Android NDK
@@ -165,7 +165,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.tag_name }}
-          name: 'CandyConnect VPN ${{ needs.prepare.outputs.tag_name }}'
+          name: "CandyConnect VPN ${{ needs.prepare.outputs.tag_name }}"
           files: ${{ steps.find_apk.outputs.artifact_path }}
           draft: false
           prerelease: false

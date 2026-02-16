@@ -146,15 +146,14 @@ def _default_core_configs() -> dict:
             "api_port": 8444,
         },
         "wireguard": {
-            "interfaces": [
-                {
-                    "id": "wg0", "name": "wg0", "listen_port": 51820,
-                    "dns": "1.1.1.1, 8.8.8.8", "address": "10.66.66.1/24",
-                    "private_key": "", "public_key": "", "mtu": 1420,
-                    "post_up": "iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE",
-                    "post_down": "iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE",
-                }
-            ]
+            "listen_port": 51820,
+            "dns": "1.1.1.1, 8.8.8.8",
+            "address": "10.66.66.1/24",
+            "private_key": "",
+            "public_key": "",
+            "mtu": 1420,
+            "post_up": "iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE",
+            "post_down": "iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE",
         },
         "v2ray": {
             "config_json": json.dumps({
@@ -213,7 +212,7 @@ def _default_core_configs() -> dict:
             "listen_port": 5300,
             "domain": "dns.candyconnect.io",
             "public_key": "",
-            "tunnel_mode": "ssh", # 'ssh' or 'socks'
+            "tunnel_mode": "ssh",
             "mtu": 1232,
         },
         "slipstream": {
@@ -428,25 +427,32 @@ async def verify_client(username: str, password: str) -> Optional[dict]:
     return client
 
 
-async def record_client_connection(client_id: str, ip: str, protocol: str):
-    """Record a client connection event."""
+async def add_connection_history(client_id: str, protocol: str, event: str, ip: str):
+    """Record a connection event (connect/disconnect)."""
     r = await get_redis()
     raw = await r.hget(K_CLIENTS, client_id)
     if not raw:
         return
     client = json.loads(raw)
     now = time.strftime("%Y-%m-%d %H:%M:%S")
-    client["last_connected_ip"] = ip
-    client["last_connected_time"] = now
+    
+    if event == "connect":
+        client["last_connected_ip"] = ip
+        client["last_connected_time"] = now
+        
     history = client.get("connection_history", [])
     history.insert(0, {
         "ip": ip,
         "time": now,
         "protocol": protocol,
-        "duration": "Active",
+        "event": event,
     })
     client["connection_history"] = history[:50]  # Keep last 50
     await r.hset(K_CLIENTS, client_id, json.dumps(client))
+
+async def record_client_connection(client_id: str, ip: str, protocol: str):
+    """Legacy wrapper for backward compatibility."""
+    await add_connection_history(client_id, protocol, "connect", ip)
 
 
 async def update_client_traffic(client_id: str, protocol: str, bytes_used: float):

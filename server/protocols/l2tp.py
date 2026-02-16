@@ -196,9 +196,12 @@ connect-delay 5000
             check=False,
         )
 
-        # PSK secret
+        # PSK secret - update if changed
         await self._run_cmd(
-            f"grep -q 'L2TP' /etc/ipsec.secrets 2>/dev/null || "
+            f"sudo sed -i '/%any %any : PSK/d' /etc/ipsec.secrets 2>/dev/null || true",
+            check=False,
+        )
+        await self._run_cmd(
             f"echo '%any %any : PSK \"{psk}\"' | sudo tee -a /etc/ipsec.secrets",
             check=False,
         )

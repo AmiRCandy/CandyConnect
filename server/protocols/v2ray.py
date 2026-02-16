@@ -181,30 +181,87 @@ class V2RayProtocol(BaseProtocol):
         if not config:
             return {}
 
-        sub_protocols = []
+        outbounds = []
         try:
             config_obj = json.loads(config.get("config_json", "{}"))
             for inbound in config_obj.get("inbounds", []):
                 proto = inbound.get("protocol", "")
+                if proto not in ("vless", "vmess", "trojan", "shadowsocks"):
+                    continue
+                
                 port = inbound.get("port", 443)
-                tag = inbound.get("tag", proto)
                 stream = inbound.get("streamSettings", {})
                 network = stream.get("network", "tcp")
                 security = stream.get("security", "none")
-
-                sub_protocols.append({
-                    "tag": tag,
+                
+                # Build client outbound
+                outbound = {
                     "protocol": proto,
-                    "port": port,
-                    "transport": network,
-                    "security": security,
-                })
+                    "settings": {
+                        "vnext": [{
+                            "address": server_ip,
+                            "port": port,
+                            "users": [{"id": client_uuid, "encryption": "none", "level": 0}]
+                        }]
+                    },
+                    "streamSettings": stream, # Copy stream settings (network, security, tlsSettings)
+                    "tag": f"proxy-{proto}-{port}"
+                }
+
+                # Protocol specific adjustments
+                if proto == "vless":
+                    outbound["settings"]["vnext"][0]["users"][0]["encryption"] = "none"
+                    if "flow" in inbound.get("settings", {}).get("clients", [{}])[0]:
+                        outbound["settings"]["vnext"][0]["users"][0]["flow"] = "xtls-rprx-vision"
+                
+                elif proto == "trojan":
+                    outbound["settings"] = {
+                        "servers": [{
+                            "address": server_ip,
+                            "port": port,
+                            "password": protocol_data.get("password") or username,
+                            "email": f"{username}@candyconnect"
+                        }]
+                    }
+                
+                elif proto == "shadowsocks":
+                    # Shadowsocks usually has one global password - adjust if per-user logic added later
+                    pass
+
+                outbounds.append(outbound)
         except json.JSONDecodeError:
             pass
+
+        # Create a full Xray client config structure
+        client_json = {
+            "log": {"loglevel": "warning"},
+            "inbounds": [
+                {
+                    "port": 10808,
+                    "listen": "127.0.0.1",
+                    "protocol": "socks",
+                    "settings": {"auth": "noauth", "udp": True}
+                },
+                {
+                    "port": 10809,
+                    "listen": "127.0.0.1",
+                    "protocol": "http",
+                    "settings": {}
+                }
+            ],
+            "outbounds": outbounds + [{"protocol": "freedom", "tag": "direct"}],
+            "routing": {
+                "domainStrategy": "AsIs",
+                "rules": [
+                    {"type": "field", "outboundTag": "direct", "domain": ["geosite:cn", "geosite:private"]},
+                    {"type": "field", "outboundTag": "direct", "ip": ["geoip:cn", "geoip:private"]}
+                ]
+            }
+        }
 
         return {
             "type": "v2ray",
             "server": server_ip,
             "uuid": client_uuid,
-            "sub_protocols": sub_protocols,
+            "config_json": client_json,
         }

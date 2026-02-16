@@ -89,8 +89,8 @@ class DNSTTProtocol(BaseProtocol):
 
             domain = config.get("domain", "dns.candyconnect.io")
             listen_port = config.get("listen_port", 5300)
-            mtu = config.get("mtu", 1232)
             tunnel_mode = config.get("tunnel_mode", "ssh")
+            mtu = config.get("mtu", 1232)
             key_prefix = domain.replace(".", "_")
             priv_key = os.path.join(self.DNSTT_DIR, f"{key_prefix}_server.key")
 
@@ -102,17 +102,20 @@ class DNSTTProtocol(BaseProtocol):
                 await self._setup_dante()
                 await self._run_cmd("sudo systemctl start danted", check=False)
             else:
-                # Detect SSH port (as in dnstt-deploy.sh)
-                rc, ssh_p, _ = await self._run_cmd("ss -tlnp | grep sshd | awk '{print $4}' | cut -d':' -f2 | head -1", check=False)
+                # Detect SSH port (as in dnstt-deploy.sh) - use more robust awk
+                rc, ssh_p, _ = await self._run_cmd("sudo ss -tlnp | grep sshd | awk '{print $4}' | awk -F: '{print $NF}' | head -1", check=False)
                 if rc == 0 and ssh_p.strip():
-                    target_port = int(ssh_p.strip())
+                    try:
+                        target_port = int(ssh_p.strip())
+                    except ValueError:
+                        target_port = 22
                 
                 # Ensure ssh is running
-                rc, _, _ = await self._run_cmd("sudo systemctl start ssh", check=False)
-                if rc != 0:
-                    # Docker fallback
-                    await self._run_cmd("sudo /usr/sbin/sshd", check=False)
+                await self._run_cmd("sudo systemctl start ssh", check=False)
 
+            # Clean up old iptables rules to avoid duplicates
+            await self._run_cmd("sudo iptables -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT 2>/dev/null || true", check=False)
+            
             # Redirect port 53 to listen_port
             await self._setup_redirection(listen_port)
 
@@ -130,28 +133,22 @@ class DNSTTProtocol(BaseProtocol):
             await add_log("ERROR", self.PROTOCOL_NAME, f"Failed to start: {e}")
             return False
 
-    async def _setup_redirection(self, port: int):
-        """Redirect port 53/udp to the custom listen port using iptables."""
-        # Get default interface
-        _, iface, _ = await self._run_cmd("ip route | grep default | awk '{print $5}' | head -1", check=False)
-        iface = iface.strip() or "eth0"
+    async def stop(self) -> bool:
+        """Enhanced stop to ensure no hanging processes block restarts."""
+        # 1. Base stop (kills by PID)
+        await super().stop()
         
-        # Add rules
-        await self._run_cmd(f"sudo iptables -I INPUT -p udp --dport {port} -j ACCEPT", check=False)
-        await self._run_cmd(
-            f"sudo iptables -t nat -I PREROUTING -i {iface} -p udp --dport 53 -j REDIRECT --to-ports {port}",
-            check=False,
-        )
-        # IPv6 support if available
-        await self._run_cmd(f"sudo ip6tables -I INPUT -p udp --dport {port} -j ACCEPT", check=False)
-        await self._run_cmd(
-            f"sudo ip6tables -t nat -I PREROUTING -i {iface} -p udp --dport 53 -j REDIRECT --to-ports {port}",
-            check=False,
-        )
+        # 2. Force kill any remaining dnstt-server by name
+        await self._run_cmd("sudo pkill -9 dnstt-server", check=False)
+        
+        # 3. Clean up iptables for redirection
+        await self._run_cmd("sudo iptables -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT 2>/dev/null || true", check=False)
+        
+        return True
 
     async def _setup_redirection(self, port: int):
         """Redirect port 53/udp to the custom listen port using iptables."""
-        # Get default interface (as in dnstt-deploy.sh)
+        # Get default interface
         _, iface, _ = await self._run_cmd("ip route | grep default | awk '{print $5}' | head -1", check=False)
         iface = iface.strip() or "eth0"
         
@@ -175,28 +172,9 @@ class DNSTTProtocol(BaseProtocol):
         iface = iface.strip() or "eth0"
         
         config_path = "/etc/danted.conf"
-        content = f"""
-logoutput: syslog
-user.privileged: root
-user.unprivileged: nobody
-
-internal: 127.0.0.1 port = 1080
-external: {iface}
-socksmethod: none
-compatibility: sameport
-extension: bind
-
-client pass {{
-    from: 127.0.0.1/8 to: 0.0.0.0/0
-    log: error
-}}
-
-socks pass {{
-    from: 127.0.0.1/8 to: 0.0.0.0/0
-    command: bind connect udpassociate
-    log: error
-}}
-"""
+        # Use single quotes for the multiline string to avoid f-string escaping issues
+        content = f"logoutput: syslog\nuser.privileged: root\nuser.unprivileged: nobody\n\ninternal: 127.0.0.1 port = 1080\nexternal: {iface}\nsocksmethod: none\ncompatibility: sameport\nextension: bind\n\nclient pass {{\n    from: 127.0.0.1/8 to: 0.0.0.0/0\n    log: error\n}}\n\nsocks pass {{\n    from: 127.0.0.1/8 to: 0.0.0.0/0\n    command: bind connect udpassociate\n    log: error\n}}\n"
+        
         # Backup and write
         await self._run_cmd(f"echo '{content}' | sudo tee {config_path}", check=False)
         await self._run_cmd("sudo systemctl enable danted", check=False)
@@ -223,7 +201,6 @@ socks pass {{
             return 0
 
     async def add_client(self, username: str, client_data: dict) -> dict:
-        """Create a non-root SSH user for DNSTT access."""
         ssh_user = f"dnstt_{username}"
         password = client_data.get("password", self._gen_password())
 

@@ -237,8 +237,7 @@ class ProtocolManager:
             if not cfg:
                 return default_port
             if pid == "wireguard":
-                if cfg.get("interfaces"):
-                    return int(cfg["interfaces"][0].get("listen_port", default_port))
+                return int(cfg.get("listen_port", default_port))
             elif pid == "openvpn":
                 return int(cfg.get("port", default_port))
             elif pid == "ikev2":

@@ -39,18 +39,17 @@ class WireGuardProtocol(BaseProtocol):
     async def start(self) -> bool:
         try:
             config = await get_core_config("wireguard")
-            if not config or not config.get("interfaces"):
-                await add_log("ERROR", self.PROTOCOL_NAME, "No interfaces configured")
+            if not config:
+                await add_log("ERROR", self.PROTOCOL_NAME, "No config found")
                 return False
 
-            for iface in config["interfaces"]:
-                name = iface["name"]
-                await self._write_config(iface)
-                await self._run_cmd(f"sudo systemctl enable wg-quick@{name}", check=False)
-                rc, _, err = await self._run_cmd(f"sudo systemctl start wg-quick@{name}", check=False)
-                if rc != 0:
-                    # Try bringing up directly
-                    await self._run_cmd(f"sudo wg-quick up {name}", check=False)
+            name = "wg0" # Use wg0 as primary
+            await self._write_config(config)
+            await self._run_cmd(f"sudo systemctl enable wg-quick@{name}", check=False)
+            rc, _, err = await self._run_cmd(f"sudo systemctl start wg-quick@{name}", check=False)
+            if rc != 0:
+                # Try bringing up directly
+                await self._run_cmd(f"sudo wg-quick up {name}", check=False)
 
             version = await self.get_version()
             await set_core_status(self.PROTOCOL_ID, {
@@ -68,11 +67,9 @@ class WireGuardProtocol(BaseProtocol):
     async def stop(self) -> bool:
         try:
             config = await get_core_config("wireguard")
-            if config and config.get("interfaces"):
-                for iface in config["interfaces"]:
-                    name = iface["name"]
-                    await self._run_cmd(f"sudo systemctl stop wg-quick@{name}", check=False)
-                    await self._run_cmd(f"sudo wg-quick down {name}", check=False)
+            name = "wg0"
+            await self._run_cmd(f"sudo systemctl stop wg-quick@{name}", check=False)
+            await self._run_cmd(f"sudo wg-quick down {name}", check=False)
 
             status = await get_core_status(self.PROTOCOL_ID)
             await set_core_status(self.PROTOCOL_ID, {
@@ -88,13 +85,10 @@ class WireGuardProtocol(BaseProtocol):
             return False
 
     async def is_running(self) -> bool:
-        config = await get_core_config("wireguard")
-        if not config or not config.get("interfaces"):
-            return False
-        for iface in config["interfaces"]:
-            active = await self._is_service_active(f"wg-quick@{iface['name']}")
-            if active:
-                return True
+        name = "wg0"
+        active = await self._is_service_active(f"wg-quick@{name}")
+        if active:
+            return True
         return False
 
     async def get_version(self) -> str:
@@ -150,55 +144,41 @@ class WireGuardProtocol(BaseProtocol):
         }
 
     async def add_client(self, username: str, client_data: dict) -> dict:
-        """Generate/reuse WireGuard keys for a client and add peer to config."""
-        privkey = client_data.get("private_key")
-        pubkey = client_data.get("public_key")
-        address = client_data.get("address")
-
-        if not privkey or not pubkey:
-            # Generate new client keys
-            rc, privkey, _ = await self._run_cmd("wg genkey")
-            if rc != 0:
-                raise RuntimeError("Failed to generate WireGuard private key")
-
+        """Create a new WireGuard peer for a client."""
+        client_privkey = ""
+        client_pubkey = ""
+        
+        # 1. Generate client keys
+        rc, client_privkey, _ = await self._run_cmd("wg genkey")
+        if rc == 0:
             proc = await asyncio.create_subprocess_shell(
                 "wg pubkey",
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
             )
-            pubkey_out, _ = await proc.communicate(privkey.encode())
-            pubkey = pubkey_out.decode().strip()
+            pub_out, _ = await proc.communicate(client_privkey.encode())
+            client_pubkey = pub_out.decode().strip()
 
-        # Get server config
+        # 2. Get server config
         config = await get_core_config("wireguard")
-        if not config or not config.get("interfaces"):
-            raise RuntimeError("No WireGuard interfaces configured")
+        name = "wg0"
+        
+        # 3. Choose next IP (random for now within the 10.66.66.0/24 subnet)
+        import random
+        last_octet = random.randint(2, 254)
+        client_address = f"10.66.66.{last_octet}/32"
 
-        iface = config["interfaces"][0]
-
-        if not address:
-            # Assign IP
-            base_ip = iface["address"].split("/")[0].rsplit(".", 1)[0]
-            # Simple unique IP generation based on username (deterministic)
-            import hashlib
-            h = int(hashlib.md5(username.encode()).hexdigest(), 16)
-            next_ip = f"{base_ip}.{h % 250 + 2}"
-            address = f"{next_ip}/32"
-
-        # Add peer to interface
+        # 4. Add peer to running interface
         await self._run_cmd(
-            f"sudo wg set {iface['name']} peer {pubkey} allowed-ips {address}",
+            f"sudo wg set {name} peer {client_pubkey} allowed-ips {client_address}",
             check=False,
         )
-
+        
         return {
-            "private_key": privkey,
-            "public_key": pubkey,
-            "address": address,
-            "dns": iface.get("dns", "1.1.1.1"),
-            "endpoint_port": iface.get("listen_port", 51820),
-            "server_public_key": iface.get("public_key", ""),
+            "private_key": client_privkey,
+            "public_key": client_pubkey,
+            "address": client_address,
+            "server_public_key": config.get("public_key", ""),
         }
 
     async def remove_client(self, username: str, protocol_data: dict):
@@ -207,28 +187,25 @@ class WireGuardProtocol(BaseProtocol):
         if not pubkey:
             return
 
-        config = await get_core_config("wireguard")
-        if config and config.get("interfaces"):
-            iface = config["interfaces"][0]
-            await self._run_cmd(f"sudo wg set {iface['name']} peer {pubkey} remove", check=False)
+        name = "wg0"
+        await self._run_cmd(f"sudo wg set {name} peer {pubkey} remove", check=False)
 
     async def get_client_config(self, username: str, server_ip: str, protocol_data: dict) -> dict:
         config = await get_core_config("wireguard")
-        if not config or not config.get("interfaces"):
+        if not config:
             return {}
-        iface = config["interfaces"][0]
 
         # Build full WG config string for convenience
         address = protocol_data.get("address", "")
         privkey = protocol_data.get("private_key", "")
-        pubkey = iface.get("public_key", "")
-        port = iface.get("listen_port", 51820)
+        pubkey = config.get("public_key", "")
+        port = config.get("listen_port", 51820)
 
         wg_config = f"""[Interface]
 PrivateKey = {privkey}
 Address = {address}
-DNS = {iface.get('dns', '1.1.1.1')}
-MTU = {iface.get('mtu', 1420)}
+DNS = {config.get('dns', '1.1.1.1')}
+MTU = {config.get('mtu', 1420)}
 
 [Peer]
 PublicKey = {pubkey}
@@ -244,45 +221,40 @@ PersistentKeepalive = 25
             "server_public_key": pubkey,
             "client_private_key": privkey,
             "client_address": address,
-            "dns": iface.get("dns", "1.1.1.1"),
-            "mtu": iface.get("mtu", 1420),
+            "dns": config.get("dns", "1.1.1.1"),
+            "mtu": config.get("mtu", 1420),
             "wg_config": wg_config,
         }
 
-    async def _write_config(self, iface: dict):
+    async def _write_config(self, config: dict):
         """Write WireGuard config file."""
         os.makedirs(self.WG_DIR, exist_ok=True)
-        name = iface["name"]
+        name = "wg0"
 
         # Generate keys if not set
-        if not iface.get("private_key"):
+        if not config.get("private_key"):
             rc, privkey, _ = await self._run_cmd("wg genkey")
             if rc == 0:
-                iface["private_key"] = privkey
+                config["private_key"] = privkey.strip()
                 proc = await asyncio.create_subprocess_shell(
                     "wg pubkey",
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                 )
                 pubkey_out, _ = await proc.communicate(privkey.encode())
-                iface["public_key"] = pubkey_out.decode().strip()
+                config["public_key"] = pubkey_out.decode().strip()
                 # Update config in DB
                 from database import update_core_config
-                config = await get_core_config("wireguard")
-                for i, existing in enumerate(config.get("interfaces", [])):
-                    if existing["id"] == iface["id"]:
-                        config["interfaces"][i] = iface
-                        break
                 await update_core_config("wireguard", config)
 
         conf = f"""[Interface]
-Address = {iface['address']}
-ListenPort = {iface['listen_port']}
-PrivateKey = {iface['private_key']}
-MTU = {iface.get('mtu', 1420)}
-DNS = {iface.get('dns', '1.1.1.1')}
-PostUp = {iface.get('post_up', '')}
-PostDown = {iface.get('post_down', '')}
+Address = {config['address']}
+ListenPort = {config['listen_port']}
+PrivateKey = {config['private_key']}
+MTU = {config.get('mtu', 1420)}
+DNS = {config.get('dns', '1.1.1.1')}
+PostUp = {config.get('post_up', '')}
+PostDown = {config.get('post_down', '')}
 """
         conf_path = os.path.join(self.WG_DIR, f"{name}.conf")
         await self._run_cmd(f"echo '{conf}' | sudo tee {conf_path}")
