@@ -131,18 +131,11 @@ jobs:
           rm -f xray.zip sing-box.$SING_EXT
           cp dnstt-client${{ matrix.platform == 'windows-latest' && '.exe' || '' }} extra-tools/
         shell: bash
-      - uses: tauri-apps/tauri-action@v0
-        id: tauri_build
+      - name: build tauri app
+        run: npm run tauri build -- --no-bundle
+        working-directory: ./client
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: ${{ needs.prepare.outputs.tag_name }}
-          releaseName: "CandyConnect VPN ${{ needs.prepare.outputs.tag_name }}"
-          releaseBody: "See the assets to download this version and install."
-          releaseDraft: false
-          prerelease: false
-          projectPath: ./client
-          args: "--no-bundle" # Only build the binary for the zip package
 
       - name: package release zip
         run: |
