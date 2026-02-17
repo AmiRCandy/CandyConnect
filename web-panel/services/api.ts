@@ -55,7 +55,7 @@ export async function login(username: string, password: string): Promise<LoginRe
 // ── Dashboard ──
 
 export interface ServerInfo {
-  hostname: string; ip: string; os: string; kernel: string; uptime: number;
+  hostname: string; domain?: string; ip: string; os: string; kernel: string; uptime: number;
   cpu: { model: string; cores: number; usage: number };
   ram: { total: number; used: number };
   disk: { total: number; used: number };

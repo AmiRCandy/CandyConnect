@@ -86,13 +86,11 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack }) => {
         </div>
         <button
           onClick={onToggle}
-          className={`relative inline-flex h-6 w-11 flex-shrink-0 items-center rounded-full transition-colors focus:outline-none ml-3 ${
-            value ? 'bg-orange-500' : 'bg-slate-200 dark:bg-slate-600'
-          }`}
+          className={`relative inline-flex h-6 w-11 flex-shrink-0 items-center rounded-full transition-colors focus:outline-none ml-3 ${value ? 'bg-orange-500' : 'bg-slate-200 dark:bg-slate-600'
+            }`}
         >
-          <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-            value ? 'translate-x-6' : 'translate-x-1'
-          }`} />
+          <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${value ? 'translate-x-6' : 'translate-x-1'
+            }`} />
         </button>
       </div>
     </div>
@@ -206,6 +204,18 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack }) => {
           ]}
           selectedValue={settings?.wireguardCore || 'amnezia'}
           onSelectionChange={(value) => handleCoreChange('wireguard', value)}
+        />
+      </div>
+
+      {/* Debug Section */}
+      <div className="space-y-3 pb-8">
+        <h3 className="text-sm font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">Debug & Testing</h3>
+        <ToggleRow
+          icon={<NetworkIcon className="w-5 h-5" />}
+          title="Simulate Traffic (1MB/s)"
+          desc="Force-add 1MB of traffic per second for tracking tests"
+          value={settings?.simulateTraffic || false}
+          onToggle={() => handleToggle('simulateTraffic')}
         />
       </div>
     </div>

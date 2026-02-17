@@ -118,6 +118,7 @@ export interface Settings {
   killSwitch?: boolean;
   dnsLeakProtection?: boolean;
   splitTunneling?: boolean;
+  simulateTraffic?: boolean;
 }
 
 export interface VPNConfig {
@@ -614,8 +615,19 @@ export const GetNetworkSpeed = async (): Promise<NetworkSpeed> => {
   if (!_isConnected) {
     return { countryCode: '--', downloadSpeed: 0, uploadSpeed: 0, totalDownload: _sessionDownload, totalUpload: _sessionUpload };
   }
-  const dl = Math.floor(Math.random() * 5000) + 500;
-  const ul = Math.floor(Math.random() * 1000) + 100;
+
+  let dl: number;
+  let ul: number;
+
+  if (_settings.simulateTraffic) {
+    // 1MB/s = 1024 KB/s
+    dl = 1024;
+    ul = 256; // steady upload too
+  } else {
+    dl = Math.floor(Math.random() * 5000) + 500;
+    ul = Math.floor(Math.random() * 1000) + 100;
+  }
+
   _sessionDownload += dl * 1024;
   _sessionUpload += ul * 256;
 

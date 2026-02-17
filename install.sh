@@ -126,6 +126,12 @@ install_dependencies() {
     systemctl enable redis-server || true
     systemctl start redis-server || true
 
+    # Wipe database to ensure fresh config (per user request)
+    if command -v redis-cli &>/dev/null; then
+        log "Wiping existing Redis database..."
+        redis-cli FLUSHALL >/dev/null 2>&1 || true
+    fi
+
     log "Dependencies installed"
 }
 
@@ -190,8 +196,9 @@ ask_domain() {
     echo -e "${BOLD}${CYAN}         Domain Configuration             ${NC}"
     echo -e "${BOLD}${CYAN}═══════════════════════════════════════════${NC}"
     echo -e "Please enter your domain name (e.g., vpn.yourdomain.com)."
-    echo -e "This will be used for your panel and VPN configs (like DNSTT)."
-    read -p "Domain [vpn.candyconnect.io]: " CC_DOMAIN
+    echo -e "This is CRITICAL for DNSTT and client configuration links."
+    echo -ne "${BOLD}${YELLOW}Domain [vpn.candyconnect.io]: ${NC}"
+    read CC_DOMAIN
     if [ -z "$CC_DOMAIN" ]; then
         CC_DOMAIN="vpn.candyconnect.io"
     fi

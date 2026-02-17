@@ -73,7 +73,8 @@ const DashboardPage: React.FC = () => {
           </h1>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 flex items-center gap-1.5">
             <Server className="w-3 h-3" strokeWidth={2} />
-            {s.hostname} &middot; {s.ip}
+            {s.hostname} &middot; {s.domain || s.ip}
+            {s.domain && s.ip && <span className="opacity-60 ml-1">({s.ip})</span>}
           </p>
         </div>
         <span className="text-[10px] font-semibold text-slate-400 dark:text-slate-500 uppercase tracking-wider">

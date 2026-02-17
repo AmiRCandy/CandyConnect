@@ -34,6 +34,15 @@ async def login(req: LoginRequest):
 @router.get("/dashboard")
 async def get_dashboard(limit: int = 10, user=Depends(auth.require_admin)):
     server_info = await get_server_info()
+    
+    # Enrich with database configuration
+    panel_cfg = await db.get_core_config("candyconnect") or {}
+    server_info["domain"] = panel_cfg.get("panel_domain") or ""
+    
+    # If a manual server_ip is set in database, prioritize it
+    if panel_cfg.get("server_ip"):
+        server_info["ip"] = panel_cfg["server_ip"]
+
     vpn_cores = await protocol_manager.get_all_cores_info()
     logs = await db.get_logs(limit)
     

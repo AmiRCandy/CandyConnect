@@ -460,7 +460,9 @@ async def record_client_connection(client_id: str, ip: str, protocol: str):
 async def update_client_traffic(client_id: str, protocol: str, bytes_used: float):
     """Update traffic usage for a client on a specific protocol."""
     r = await get_redis()
-    key = f"{client_id}:{protocol}"
+    # Normalize protocol name to avoid mismatches (e.g. V2Ray-1 vs v2ray-1)
+    proto = str(protocol).lower()
+    key = f"{client_id}:{proto}"
     await r.hincrbyfloat(K_TRAFFIC, key, bytes_used)
 
     # Update total traffic_used in client record
@@ -472,22 +474,21 @@ async def update_client_traffic(client_id: str, protocol: str, bytes_used: float
         await r.hset(K_CLIENTS, client_id, json.dumps(client))
 
 
-async def _get_client_protocol_traffic(r: redis.Redis, client_id: str) -> dict:
+async def _get_client_protocol_traffic(r, client_id: str) -> dict:
+    """Scan Redis for all traffic keys belonging to this client."""
     result = {}
-    for proto in ["v2ray", "wireguard", "openvpn", "ikev2", "l2tp", "dnstt", "slipstream", "trusttunnel"]:
-        val = await r.hget(K_TRAFFIC, f"{client_id}:{proto}")
-        if val:
-            result[proto] = float(val)
+    # Use hscan_iter to find all keys for this client efficiently
+    async for key, val in r.hscan_iter(K_TRAFFIC, match=f"{client_id}:*"):
+        proto = key.decode().split(":", 1)[1]
+        result[proto] = float(val)
     return result
 
 
-async def _calc_total_traffic(r: redis.Redis, client_id: str) -> float:
+async def _calc_total_traffic(r, client_id: str) -> float:
     """Sum all protocol traffic for a client, return in GB."""
     total_bytes = 0.0
-    for proto in ["v2ray", "wireguard", "openvpn", "ikev2", "l2tp", "dnstt", "slipstream", "trusttunnel"]:
-        val = await r.hget(K_TRAFFIC, f"{client_id}:{proto}")
-        if val:
-            total_bytes += float(val)
+    async for _, val in r.hscan_iter(K_TRAFFIC, match=f"{client_id}:*"):
+        total_bytes += float(val)
     return total_bytes / (1024 ** 3)  # Convert bytes to GB
 
 

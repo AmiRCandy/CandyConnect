@@ -67,8 +67,11 @@ async fn measure_latency(host: String) -> Result<u64, String> {
     
     // Determine the ping command based on the OS
     let mut cmd = if cfg!(target_os = "windows") {
+        use std::os::windows::process::CommandExt;
         let mut c = Command::new("ping");
         c.args(&["-n", "1", "-w", "2000", &host]);
+        // 0x08000000 is CREATE_NO_WINDOW
+        c.creation_flags(0x08000000);
         c
     } else {
         let mut c = Command::new("ping");
