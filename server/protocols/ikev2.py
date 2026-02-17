@@ -28,13 +28,17 @@ class IKEv2Protocol(BaseProtocol):
             for d in ["cacerts", "certs", "private"]:
                 os.makedirs(os.path.join(self.IPSEC_DIR, d), exist_ok=True)
 
+            # Read cert_validity from config (default 3650 days)
+            config = await get_core_config("ikev2") or {}
+            cert_validity = config.get("cert_validity", 3650)
+
             # Generate CA key and cert
             await self._run_cmd(
                 f"ipsec pki --gen --type rsa --size 4096 --outform pem > {self.IPSEC_DIR}/private/ca-key.pem",
                 check=False,
             )
             await self._run_cmd(
-                f"ipsec pki --self --ca --lifetime 3650 --in {self.IPSEC_DIR}/private/ca-key.pem "
+                f"ipsec pki --self --ca --lifetime {cert_validity} --in {self.IPSEC_DIR}/private/ca-key.pem "
                 f"--type rsa --dn 'CN=CandyConnect VPN CA' --outform pem > {self.IPSEC_DIR}/cacerts/ca-cert.pem",
                 check=False,
             )
@@ -54,7 +58,7 @@ class IKEv2Protocol(BaseProtocol):
 
             await self._run_cmd(
                 f"ipsec pki --pub --in {self.IPSEC_DIR}/private/server-key.pem --type rsa | "
-                f"ipsec pki --issue --lifetime 3650 --cacert {self.IPSEC_DIR}/cacerts/ca-cert.pem "
+                f"ipsec pki --issue --lifetime {cert_validity} --cacert {self.IPSEC_DIR}/cacerts/ca-cert.pem "
                 f"--cakey {self.IPSEC_DIR}/private/ca-key.pem "
                 f"--dn 'CN={server_ip}' --san '{server_ip}' --san '@{server_ip}' "
                 f"--flag serverAuth --flag ikeIntermediate "
@@ -152,6 +156,10 @@ class IKEv2Protocol(BaseProtocol):
         """Generate client certificate for IKEv2."""
         password = client_data.get("password", username)
 
+        # Read cert_validity from config (default 3650 days)
+        config = await get_core_config("ikev2") or {}
+        cert_validity = config.get("cert_validity", 3650)
+
         # Generate client key
         await self._run_cmd(
             f"ipsec pki --gen --type rsa --size 2048 --outform pem > {self.IPSEC_DIR}/private/{username}-key.pem",
@@ -160,7 +168,7 @@ class IKEv2Protocol(BaseProtocol):
         # Generate client cert
         await self._run_cmd(
             f"ipsec pki --pub --in {self.IPSEC_DIR}/private/{username}-key.pem --type rsa | "
-            f"ipsec pki --issue --lifetime 3650 "
+            f"ipsec pki --issue --lifetime {cert_validity} "
             f"--cacert {self.IPSEC_DIR}/cacerts/ca-cert.pem "
             f"--cakey {self.IPSEC_DIR}/private/ca-key.pem "
             f"--dn 'CN={username}' --san '{username}' "
@@ -222,6 +230,8 @@ class IKEv2Protocol(BaseProtocol):
 
         subnet = config.get("subnet", "10.10.0.0/24")
 
+        nat_port = config.get("nat_port", 4500)
+
         ipsec_conf = f"""config setup
     charondebug="ike 1, knl 1, cfg 0"
     uniqueids=no
@@ -253,6 +263,9 @@ conn ikev2-vpn
     ikelifetime={config.get('lifetime', '24h')}
     margintime={config.get('margintime', '3h')}
 """
+        # Configure NAT-T port if non-default
+        if nat_port != 4500:
+            ipsec_conf += f"    nat_traversal=yes\n"
         with open("/tmp/cc_ipsec.conf", "w") as f:
             f.write(ipsec_conf)
         await self._run_cmd("sudo mv /tmp/cc_ipsec.conf /etc/ipsec.conf", check=False)

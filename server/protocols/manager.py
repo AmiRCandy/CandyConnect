@@ -64,7 +64,8 @@ class ProtocolManager:
                     logs = await get_logs(20)
                     reason = "Unknown error"
                     for entry in logs:
-                        if entry.get("source") == pid.upper() or entry.get("source") == pid:
+                        entry_source = str(entry.get("source", "")).lower()
+                        if entry_source == pid.lower():
                             if entry.get("level") == "ERROR":
                                 reason = entry.get("message")
                                 break

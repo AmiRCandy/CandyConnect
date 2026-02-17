@@ -34,20 +34,16 @@ export interface Client {
     lastConnectedIP: string | null; lastConnectedTime: string | null;
     connectionHistory: ConnectionHistoryEntry[];
 }
-export interface WgInterface {
-    id: string; name: string; listenPort: number; dns: string; address: string;
-    privateKey: string; publicKey: string; mtu: number; postUp: string; postDown: string;
-}
 export interface CoreConfigs {
-    candyconnect: { panelDomain: string; sslEnabled: boolean; sslCertPath: string; sslKeyPath: string; maxClients: number; logLevel: string; autoBackup: boolean; backupInterval: number; apiEnabled: boolean; apiPort: number; };
-    wireguard: { interfaces: WgInterface[] };
-    v2ray: { configJson: string };
-    openvpn: { port: number; protocol: string; device: string; cipher: string; auth: string; dh: string; tlsCrypt: boolean; dns1: string; dns2: string; subnet: string; maxClients: number; keepalive: string; compLzo: boolean; };
-    ikev2: { port: number; natPort: number; cipher: string; lifetime: string; margintime: string; dns: string; subnet: string; certValidity: number; };
-    l2tp: { port: number; ipsecPort: number; psk: string; localIP: string; remoteRange: string; dns: string; mtu: number; mru: number; };
-    dnstt: { listenPort: number; domain: string; upstreamDNS: string; publicKey: string; ttl: number; maxPayload: number; };
-    slipstream: { port: number; method: string; obfs: string; obfsHost: string; fastOpen: boolean; noDelay: boolean; udpRelay: boolean; timeout: number; };
-    trusttunnel: { port: number; protocol: string; camouflage: string; fragmentSize: number; fragmentInterval: number; sni: string; alpn: string; padding: boolean; timeout: number; };
+    candyconnect: { panel_domain: string; ssl_enabled: boolean; ssl_cert_path: string; ssl_key_path: string; max_clients: number; log_level: string; auto_backup: boolean; backup_interval: number; api_enabled: boolean; api_port: number; };
+    wireguard: { listen_port: number; dns: string; address: string; private_key: string; public_key: string; mtu: number; post_up: string; post_down: string; };
+    v2ray: { config_json: string };
+    openvpn: { port: number; protocol: string; device: string; cipher: string; auth: string; dh: string; tls_crypt: boolean; dns1: string; dns2: string; subnet: string; max_clients: number; keepalive: string; comp_lzo: boolean; };
+    ikev2: { port: number; nat_port: number; cipher: string; lifetime: string; margintime: string; dns: string; subnet: string; cert_validity: number; };
+    l2tp: { port: number; ipsec_port: number; psk: string; local_ip: string; remote_range: string; dns: string; mtu: number; mru: number; };
+    dnstt: { listen_port: number; domain: string; public_key: string; tunnel_mode: string; mtu: number; };
+    slipstream: { port: number; method: string; obfs: string; obfs_host: string; fast_open: boolean; no_delay: boolean; udp_relay: boolean; timeout: number; };
+    trusttunnel: { port: number; protocol: string; camouflage: string; fragment_size: number; fragment_interval: number; sni: string; alpn: string; padding: boolean; timeout: number; };
 }
 
 export const MockData = {
@@ -98,20 +94,20 @@ export const MockData = {
         { id: 'c008', username: 'brotherhood', password: 'St33lReign!', comment: 'Corporate VPN access', enabled: true, trafficLimit: { value: 500, unit: 'GB' }, trafficUsed: 156.9, timeLimit: { mode: 'months', value: 12, onHold: false }, timeUsed: 4, createdAt: '2025-10-10 08:00:00', expiresAt: '2026-10-10 08:00:00', protocols: { v2ray: true, wireguard: true, openvpn: true, ikev2: true, l2tp: true, dnstt: true, slipstream: true, trusttunnel: true }, lastConnectedIP: '31.56.78.234', lastConnectedTime: '2026-02-10 10:15:00', connectionHistory: [{ ip: '31.56.78.234', time: '2026-02-10 10:15:00', protocol: 'WireGuard', duration: '1h 37m' }, { ip: '31.56.78.234', time: '2026-02-09 08:00:00', protocol: 'V2Ray', duration: '12h 00m' }, { ip: '31.56.79.100', time: '2026-02-08 09:00:00', protocol: 'OpenVPN', duration: '10h 30m' }] },
     ] as Client[],
     coreConfigs: {
-        candyconnect: { panelDomain: 'vpn.candyconnect.io', sslEnabled: true, sslCertPath: '/etc/ssl/certs/candyconnect.pem', sslKeyPath: '/etc/ssl/private/candyconnect.key', maxClients: 500, logLevel: 'info', autoBackup: true, backupInterval: 24, apiEnabled: true, apiPort: 8444 },
+        candyconnect: { panel_domain: 'vpn.candyconnect.io', ssl_enabled: true, ssl_cert_path: '/etc/ssl/certs/candyconnect.pem', ssl_key_path: '/etc/ssl/private/candyconnect.key', max_clients: 500, log_level: 'info', auto_backup: true, backup_interval: 24, api_enabled: true, api_port: 8444 },
         wireguard: {
-            interfaces: [
-                { id: 'wg0', name: 'wg0', listenPort: 51820, dns: '1.1.1.1, 8.8.8.8', address: '10.66.66.1/24', privateKey: 'YHR0fH8kN3qFbGx1T2VzXzRfZG9udF9sb29rXw==', publicKey: 'aGVsbG9fd2FzdGVsYW5kX3dhbmRlcmVyXzQy', mtu: 1420, postUp: 'iptables -A FORWARD -i %i -j ACCEPT', postDown: 'iptables -D FORWARD -i %i -j ACCEPT' },
-                { id: 'wg1', name: 'wg1', listenPort: 51821, dns: '9.9.9.9', address: '10.77.77.1/24', privateKey: 'c2Vjb25kX2ludGVyZmFjZV9rZXlfaGVyZQ==', publicKey: 'cHVibGljX2tleV9mb3Jfd2cx', mtu: 1420, postUp: 'iptables -A FORWARD -i %i -j ACCEPT', postDown: 'iptables -D FORWARD -i %i -j ACCEPT' },
-            ]
+            listen_port: 51820, dns: '1.1.1.1, 8.8.8.8', address: '10.66.66.1/24',
+            private_key: 'YHR0fH8kN3qFbGx1T2VzXzRfZG9udF9sb29rXw==', public_key: 'aGVsbG9fd2FzdGVsYW5kX3dhbmRlcmVyXzQy',
+            mtu: 1420, post_up: 'iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE',
+            post_down: 'iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE',
         },
-        v2ray: { configJson: '{\n  "log": { "loglevel": "warning" },\n  "inbounds": [\n    { "tag": "vless-ws", "port": 443, "protocol": "vless" },\n    { "tag": "vmess-ws", "port": 8443, "protocol": "vmess" },\n    { "tag": "trojan-tcp", "port": 2083, "protocol": "trojan" },\n    { "tag": "shadowsocks", "port": 1080, "protocol": "shadowsocks" },\n    { "tag": "vless-grpc", "port": 2053, "protocol": "vless" }\n  ],\n  "outbounds": [\n    { "tag": "direct", "protocol": "freedom" },\n    { "tag": "blocked", "protocol": "blackhole" }\n  ]\n}' },
-        openvpn: { port: 1194, protocol: 'udp', device: 'tun', cipher: 'AES-256-GCM', auth: 'SHA512', dh: 'none', tlsCrypt: true, dns1: '1.1.1.1', dns2: '8.8.8.8', subnet: '10.8.0.0/24', maxClients: 100, keepalive: '10 120', compLzo: false },
-        ikev2: { port: 500, natPort: 4500, cipher: 'aes256-sha256-modp2048', lifetime: '24h', margintime: '3h', dns: '1.1.1.1', subnet: '10.10.0.0/24', certValidity: 3650 },
-        l2tp: { port: 1701, ipsecPort: 500, psk: 'CandyConnect_L2TP_PSK_2026', localIP: '10.20.0.1', remoteRange: '10.20.0.10-10.20.0.250', dns: '1.1.1.1', mtu: 1400, mru: 1400 },
-        dnstt: { listenPort: 53, domain: 'dns.candyconnect.io', upstreamDNS: '8.8.8.8', publicKey: 'ZG5zdHRfcHVibGljX2tleV9jYW5keWNvbm5lY3Q=', ttl: 60, maxPayload: 200 },
-        slipstream: { port: 8388, method: 'aes-256-cfb', obfs: 'tls', obfsHost: 'www.microsoft.com', fastOpen: true, noDelay: true, udpRelay: true, timeout: 300 },
-        trusttunnel: { port: 9443, protocol: 'https', camouflage: 'cloudflare', fragmentSize: 100, fragmentInterval: 50, sni: 'www.google.com', alpn: 'h2,http/1.1', padding: true, timeout: 60 },
+        v2ray: { config_json: '{\n  "log": { "loglevel": "warning" },\n  "inbounds": [\n    { "tag": "vless-ws", "port": 443, "protocol": "vless" },\n    { "tag": "vmess-ws", "port": 8443, "protocol": "vmess" },\n    { "tag": "trojan-tcp", "port": 2083, "protocol": "trojan" },\n    { "tag": "shadowsocks", "port": 1080, "protocol": "shadowsocks" },\n    { "tag": "vless-grpc", "port": 2053, "protocol": "vless" }\n  ],\n  "outbounds": [\n    { "tag": "direct", "protocol": "freedom" },\n    { "tag": "blocked", "protocol": "blackhole" }\n  ]\n}' },
+        openvpn: { port: 1194, protocol: 'udp', device: 'tun', cipher: 'AES-256-GCM', auth: 'SHA512', dh: 'none', tls_crypt: true, dns1: '1.1.1.1', dns2: '8.8.8.8', subnet: '10.8.0.0/24', max_clients: 100, keepalive: '10 120', comp_lzo: false },
+        ikev2: { port: 500, nat_port: 4500, cipher: 'aes256-sha256-modp2048', lifetime: '24h', margintime: '3h', dns: '1.1.1.1', subnet: '10.10.0.0/24', cert_validity: 3650 },
+        l2tp: { port: 1701, ipsec_port: 500, psk: 'CandyConnect_L2TP_PSK_2026', local_ip: '10.20.0.1', remote_range: '10.20.0.10-10.20.0.250', dns: '1.1.1.1', mtu: 1400, mru: 1400 },
+        dnstt: { listen_port: 5300, domain: 'dns.candyconnect.io', public_key: '', tunnel_mode: 'ssh', mtu: 1232 },
+        slipstream: { port: 8388, method: 'aes-256-cfb', obfs: 'tls', obfs_host: 'www.microsoft.com', fast_open: true, no_delay: true, udp_relay: true, timeout: 300 },
+        trusttunnel: { port: 9443, protocol: 'https', camouflage: 'cloudflare', fragment_size: 100, fragment_interval: 50, sni: 'www.google.com', alpn: 'h2,http/1.1', padding: true, timeout: 60 },
     } as CoreConfigs,
     generateId: () => 'c' + Math.random().toString(36).substr(2, 9),
     generatePassword: () => {

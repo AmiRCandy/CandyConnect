@@ -40,8 +40,26 @@ class WireGuardProtocol(BaseProtocol):
         try:
             config = await get_core_config("wireguard")
             if not config:
-                await add_log("ERROR", self.PROTOCOL_NAME, "No config found")
-                return False
+                config = {}
+
+            # Set defaults if missing
+            updated = False
+            if "address" not in config:
+                config["address"] = "10.66.66.1/24"
+                updated = True
+            if "listen_port" not in config:
+                config["listen_port"] = self.DEFAULT_PORT
+                updated = True
+            if "mtu" not in config:
+                config["mtu"] = 1420
+                updated = True
+            if "dns" not in config:
+                config["dns"] = "1.1.1.1"
+                updated = True
+            
+            if updated:
+                from database import update_core_config
+                await update_core_config("wireguard", config)
 
             name = "wg0" # Use wg0 as primary
             await self._write_config(config)
@@ -236,6 +254,7 @@ PersistentKeepalive = 25
         """Write WireGuard config file."""
         os.makedirs(self.WG_DIR, exist_ok=True)
         name = "wg0"
+        conf_path = os.path.join(self.WG_DIR, f"{name}.conf")
 
         # Generate keys if not set
         if not config.get("private_key"):

@@ -68,6 +68,15 @@ uninstall_cc() {
         systemctl stop "$CC_SERVICE" 2>/dev/null
         systemctl disable "$CC_SERVICE" 2>/dev/null
         
+        echo -e "${CYAN}[i] Stopping active VPN sessions...${NC}"
+        systemctl stop "wg-quick@*" 2>/dev/null
+        systemctl stop "openvpn-server@*" 2>/dev/null
+        systemctl stop "strongswan-starter" 2>/dev/null
+        systemctl stop "xl2tpd" 2>/dev/null
+        # Force kill any lingering processes
+        pkill -f "dnstt-server" || true
+        pkill -f "xray" || true
+        
         echo -e "${CYAN}[i] Removing service files...${NC}"
         rm -f "/etc/systemd/system/$CC_SERVICE.service"
         systemctl daemon-reload
@@ -78,6 +87,13 @@ uninstall_cc() {
         echo -e "${CYAN}[i] Removing protocol binaries...${NC}"
         rm -f "/usr/local/bin/dnstt-server"
         rm -f "/usr/local/bin/xray"
+
+        read -p "Do you also want to remove installed packages (wireguard, openvpn, strongswan, etc)? (y/n): " remove_pkgs
+        if [[ "$remove_pkgs" == "y" || "$remove_pkgs" == "Y" ]]; then
+            echo -e "${CYAN}[i] Removing installed packages...${NC}"
+            apt remove -y wireguard wireguard-tools openvpn easy-rsa strongswan strongswan-pki xl2tpd dante-server redis-server nodejs
+            apt autoremove -y
+        fi
         
         echo -e "${GREEN}[✓] CandyConnect has been completely uninstalled.${NC}"
     else

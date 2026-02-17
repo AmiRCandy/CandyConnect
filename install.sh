@@ -166,14 +166,17 @@ install_panel() {
         err "Web panel source directory not found at $SCRIPT_DIR/web-panel"
     fi
 
-    # Copy web-panel source (exclude node_modules if present)
-    rsync -a --exclude='node_modules' --exclude='dist' "$SCRIPT_DIR/web-panel/" "$CC_PANEL_DIR/" 2>/dev/null || \
+    # Clean old build output so stale files don't persist on rebuild failure
+    rm -rf "$CC_PANEL_DIR/dist"
+
+    # Copy web-panel source (exclude node_modules and dist if present)
+    rsync -a --delete --exclude='node_modules' --exclude='dist' "$SCRIPT_DIR/web-panel/" "$CC_PANEL_DIR/" 2>/dev/null || \
         cp -r "$SCRIPT_DIR/web-panel/"* "$CC_PANEL_DIR/"
 
     # Install npm dependencies and build
     cd "$CC_PANEL_DIR"
     npm install --legacy-peer-deps
-    npm run build
+    npm run build || err "Web panel build failed. Check TypeScript errors above."
 
     if [ ! -d "$CC_PANEL_DIR/dist" ]; then
         err "Web panel build failed - dist directory not created"

@@ -237,7 +237,7 @@ const CoreConfigsPage: React.FC = () => {
     <WireGuardConfigPanel cfg={cfg} saving={saving} save={save} restart={restart} />
   );
 
-  const renderSimpleConfig = (id: string, title: string, fields: { label: string; key: string; type?: string; options?: string[]; value: any }[], toggles: { label: string; key: string; value: boolean }[] = []) => (
+  const renderSimpleConfig = (id: string, title: string, fields: { label: string; key: string; type?: string; options?: string[]; value: any; readOnly?: boolean }[], toggles: { label: string; key: string; value: boolean }[] = []) => (
     <SimpleConfigPanel key={id} id={id} title={title} cfg={cfg} cores={cores} saving={saving} fields={fields} toggles={toggles} save={save} restart={restart} />
   );
 

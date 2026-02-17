@@ -176,6 +176,8 @@ connect-delay 5000
 
         # IPSec config for L2TP
         psk = config.get("psk", "CandyConnect_L2TP_PSK")
+        ipsec_port = config.get("ipsec_port", 500)
+        l2tp_port = config.get("port", 1701)
         ipsec_conf = f"""conn L2TP-PSK
     authby=secret
     pfs=no
@@ -183,11 +185,12 @@ connect-delay 5000
     keyexchange=ikev1
     type=transport
     left=%defaultroute
-    leftprotoport=17/1701
+    leftprotoport=17/{l2tp_port}
     right=%any
     rightprotoport=17/%any
     rekey=no
     forceencaps=yes
+    ikeport={ipsec_port}
 """
         with open("/tmp/cc_l2tp_ipsec.conf", "w") as f:
             f.write(ipsec_conf)
