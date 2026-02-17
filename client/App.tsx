@@ -16,14 +16,16 @@ import { LanguageProvider, useLanguage } from './contexts/LanguageContext';
 import { GearIcon, InformationCircleIcon } from './components/icons';
 import {
   ConnectToProtocol,
+  ConnectToConfig,
   DisconnectAll,
   GetConnectionStatus,
   IsConnected,
   IsCoreRunning,
   Logout,
   GetAccountInfo,
+  LoadConfigs,
 } from './services/api';
-import type { ServerInfo, ClientAccount } from './services/api';
+import type { ServerInfo, ClientAccount, VPNConfig } from './services/api';
 
 
 const AppContent: React.FC = () => {
@@ -39,6 +41,9 @@ const AppContent: React.FC = () => {
   const [isConnecting, setIsConnecting] = useState(false);
   const [connectedProtocol, setConnectedProtocol] = useState<string | null>(null);
   const [connectionError, setConnectionError] = useState('');
+
+  // Configs state (for resolving config names in status display)
+  const [configsMap, setConfigsMap] = useState<Record<string, VPNConfig>>({});
 
   // Navigation state
   const [currentPage, setCurrentPage] = useState<'home' | 'settings' | 'about' | 'account' | 'proxy' | 'logs' | 'profiles'>('home');
@@ -78,11 +83,19 @@ const AppContent: React.FC = () => {
     return () => clearInterval(interval);
   }, [isLoggedIn]);
 
-  const handleLoginSuccess = (server: ServerInfo, account: ClientAccount) => {
+  const handleLoginSuccess = async (server: ServerInfo, account: ClientAccount) => {
     setServerInfo(server);
     setClientAccount(account);
     setIsLoggedIn(true);
     setCurrentPage('home');
+
+    // Preload configs map for better status labels
+    try {
+      const cfgs = await LoadConfigs();
+      const map: Record<string, VPNConfig> = {};
+      cfgs.forEach(c => { map[c.id] = c; });
+      setConfigsMap(map);
+    } catch {}
   };
 
   const handleLogout = async () => {
@@ -98,7 +111,7 @@ const AppContent: React.FC = () => {
     setCurrentPage('home');
   };
 
-  const handleConnectToProtocol = async (protocolId: string) => {
+  const handleConnectToProtocol = async (configId: string) => {
     setIsConnecting(true);
     setConnectionError('');
     try {
@@ -106,16 +119,33 @@ const AppContent: React.FC = () => {
         await DisconnectAll();
         setIsConnected(false);
         setConnectedProtocol(null);
-        // small delay before reconnecting to a different protocol
+        // small delay before reconnecting to a different config
         await new Promise(r => setTimeout(r, 300));
       }
-      await ConnectToProtocol(protocolId);
+
+      // New flow: connect by config id (mocked for now)
+      await ConnectToConfig(configId);
       setIsConnected(true);
-      setConnectedProtocol(protocolId);
+      setConnectedProtocol(configId);
+
+      // Refresh configs map in case server changed or configs updated
+      try {
+        const cfgs = await LoadConfigs();
+        const map: Record<string, VPNConfig> = {};
+        cfgs.forEach(c => { map[c.id] = c; });
+        setConfigsMap(map);
+      } catch {}
     } catch (error: any) {
-      setConnectionError(error?.message || 'Connection failed');
-      setIsConnected(false);
-      setConnectedProtocol(null);
+      // Backward compatibility: if it's not a config id, try connecting by protocol id
+      try {
+        await ConnectToProtocol(configId);
+        setIsConnected(true);
+        setConnectedProtocol(configId);
+      } catch {
+        setConnectionError(error?.message || 'Connection failed');
+        setIsConnected(false);
+        setConnectedProtocol(null);
+      }
     } finally {
       setIsConnecting(false);
     }
@@ -138,10 +168,30 @@ const AppContent: React.FC = () => {
   const handleConnectToggle = async () => {
     if (isConnected) {
       await handleDisconnect();
-    } else {
-      // Connect with the last used or default protocol
-      await handleConnectToProtocol(connectedProtocol || 'v2ray');
+      return;
     }
+
+    // Connect with the last selected config (fallback to first available)
+    try {
+      const { LoadSettings } = await import('./services/api');
+      const settings = await LoadSettings();
+      const selected = (settings as any).selectedProfile as string | undefined;
+      if (selected) {
+        await handleConnectToProtocol(selected);
+        return;
+      }
+    } catch {}
+
+    try {
+      const cfgs = await LoadConfigs();
+      if (cfgs.length > 0) {
+        await handleConnectToProtocol(cfgs[0].id);
+        return;
+      }
+    } catch {}
+
+    // Final fallback (legacy)
+    await handleConnectToProtocol(connectedProtocol || 'v2ray');
   };
 
   // Render login page if not authenticated
@@ -149,14 +199,8 @@ const AppContent: React.FC = () => {
     return <LoginPage onLoginSuccess={handleLoginSuccess} />;
   }
 
-  const protocolNames: Record<string, string> = {
-    v2ray: 'V2Ray', wireguard: 'WireGuard', openvpn: 'OpenVPN',
-    ikev2: 'IKEv2', l2tp: 'L2TP', dnstt: 'DNSTT',
-    slipstream: 'SlipStream', trusttunnel: 'TrustTunnel',
-  };
-
   const statusLocation = isConnected && connectedProtocol
-    ? `${protocolNames[connectedProtocol] || connectedProtocol} · ${serverInfo?.ip || ''}`
+    ? `${configsMap[connectedProtocol]?.name || connectedProtocol} · ${serverInfo?.ip || ''}`
     : serverInfo?.ip
       ? `${serverInfo.hostname} (${serverInfo.ip})`
       : t('disconnected');

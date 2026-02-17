@@ -261,6 +261,48 @@ let logs: Array<{ timestamp: string; level: string; message: string }> = [
   { timestamp: new Date().toISOString(), level: 'info', message: 'Ready to connect to server' },
 ];
 
+// --- Mock Configs (individual connection configs per user) ---
+
+export interface VPNConfig {
+  id: string;
+  name: string;
+  protocol: string;
+  transport: string;
+  security: string;
+  address: string;
+  port: number;
+  configLink: string;
+  icon: string;
+}
+
+const MOCK_CONFIGS: VPNConfig[] = [
+  { id: 'vless-ws-tls', name: 'VLESS + WebSocket', protocol: 'V2Ray', transport: 'websocket', security: 'tls', address: '185.220.101.47', port: 443, configLink: 'vless://abc123@185.220.101.47:443?type=ws&security=tls#VLESS-WS', icon: '⚡' },
+  { id: 'vless-grpc-tls', name: 'VLESS + gRPC', protocol: 'V2Ray', transport: 'grpc', security: 'tls', address: '185.220.101.47', port: 2053, configLink: 'vless://def456@185.220.101.47:2053?type=grpc&security=tls#VLESS-gRPC', icon: '⚡' },
+  { id: 'vless-tcp-reality', name: 'VLESS + TCP (Reality)', protocol: 'V2Ray', transport: 'tcp', security: 'reality', address: '185.220.101.47', port: 443, configLink: 'vless://ghi789@185.220.101.47:443?type=tcp&security=reality#VLESS-Reality', icon: '⚡' },
+  { id: 'vmess-ws-tls', name: 'VMess + WebSocket', protocol: 'V2Ray', transport: 'websocket', security: 'tls', address: '185.220.101.47', port: 443, configLink: 'vmess://eyJhZGQiOiIxODUuMjIwLjEwMS40NyJ9#VMess-WS', icon: '⚡' },
+  { id: 'trojan-ws-tls', name: 'Trojan + WebSocket', protocol: 'V2Ray', transport: 'websocket', security: 'tls', address: '185.220.101.47', port: 443, configLink: 'trojan://pass123@185.220.101.47:443?type=ws#Trojan-WS', icon: '⚡' },
+  { id: 'trojan-grpc-tls', name: 'Trojan + gRPC', protocol: 'V2Ray', transport: 'grpc', security: 'tls', address: '185.220.101.47', port: 2083, configLink: 'trojan://pass456@185.220.101.47:2083?type=grpc#Trojan-gRPC', icon: '⚡' },
+  { id: 'shadowsocks', name: 'Shadowsocks', protocol: 'V2Ray', transport: 'tcp', security: 'aead', address: '185.220.101.47', port: 8388, configLink: 'ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ=@185.220.101.47:8388#Shadowsocks', icon: '⚡' },
+  { id: 'wireguard-1', name: 'WireGuard', protocol: 'WireGuard', transport: 'udp', security: 'curve25519', address: '185.220.101.47', port: 51820, configLink: 'wireguard://key123@185.220.101.47:51820', icon: '🛡️' },
+  { id: 'openvpn-1', name: 'OpenVPN (UDP)', protocol: 'OpenVPN', transport: 'udp', security: 'tls', address: '185.220.101.47', port: 1194, configLink: 'openvpn://185.220.101.47:1194?proto=udp', icon: '🔒' },
+  { id: 'ikev2-1', name: 'IKEv2/IPSec', protocol: 'IKEv2', transport: 'udp', security: 'ipsec', address: '185.220.101.47', port: 500, configLink: 'ikev2://185.220.101.47:500', icon: '🔐' },
+  { id: 'dnstt-1', name: 'DNSTT Tunnel', protocol: 'DNSTT', transport: 'dns', security: 'obfs', address: '185.220.101.47', port: 53, configLink: 'dnstt://185.220.101.47:53', icon: '🌐' },
+  { id: 'slipstream-1', name: 'SlipStream', protocol: 'SlipStream', transport: 'tcp', security: 'tls', address: '185.220.101.47', port: 8388, configLink: 'slipstream://185.220.101.47:8388', icon: '💨' },
+  { id: 'trusttunnel-1', name: 'TrustTunnel', protocol: 'TrustTunnel', transport: 'tcp', security: 'tls', address: '185.220.101.47', port: 9443, configLink: 'trusttunnel://185.220.101.47:9443', icon: '🏰' },
+];
+
+// Map user protocols to which configs they can access
+const PROTOCOL_TO_CONFIG_PREFIX: Record<string, string[]> = {
+  v2ray: ['vless-', 'vmess-', 'trojan-', 'shadowsocks'],
+  wireguard: ['wireguard-'],
+  openvpn: ['openvpn-'],
+  ikev2: ['ikev2-'],
+  l2tp: [],  // no configs for stopped protocol
+  dnstt: ['dnstt-'],
+  slipstream: ['slipstream-'],
+  trusttunnel: ['trusttunnel-'],
+};
+
 // --- API Functions ---
 
 export const Login = async (credentials: LoginCredentials): Promise<{ success: boolean; error?: string; serverInfo?: ServerInfo; account?: ClientAccount }> => {
@@ -427,6 +469,52 @@ export const GetV2RaySubProtocols = async (): Promise<V2RaySubProtocol[]> => {
   return [...MOCK_V2RAY_SUB_PROTOCOLS];
 };
 
+export const LoadConfigs = async (): Promise<VPNConfig[]> => {
+  if (!isAuthenticated || !currentUser) return [];
+  // Filter configs based on which protocols the user has enabled
+  const enabledPrefixes: string[] = [];
+  Object.entries(currentUser.enabledProtocols).forEach(([proto, enabled]) => {
+    if (enabled && PROTOCOL_TO_CONFIG_PREFIX[proto]) {
+      enabledPrefixes.push(...PROTOCOL_TO_CONFIG_PREFIX[proto]);
+    }
+  });
+  return MOCK_CONFIGS.filter(config =>
+    enabledPrefixes.some(prefix => config.id.startsWith(prefix))
+  ).map(config => ({
+    ...config,
+    address: currentServer?.ip || config.address,
+  }));
+};
+
+export const ConnectToConfig = async (configId: string): Promise<void> => {
+  console.log('Mock: ConnectToConfig', configId);
+  await new Promise(r => setTimeout(r, 1200)); // simulate connection delay
+
+  const config = MOCK_CONFIGS.find(c => c.id === configId);
+  if (!config) {
+    throw new Error(`Config ${configId} not found`);
+  }
+
+  isConnected = true;
+  connectedProtocol = configId;
+  connectionStartTime = new Date().toISOString();
+  sessionTotalDownload = 0;
+  sessionTotalUpload = 0;
+
+  logs.push({ timestamp: new Date().toISOString(), level: 'info', message: `Connected via ${config.name} (${config.protocol}) on port ${config.port}` });
+};
+
+export const PingConfig = async (configId: string): Promise<PingResult> => {
+  console.log('Mock: PingConfig', configId);
+  await new Promise(r => setTimeout(r, 200 + Math.random() * 600));
+  const config = MOCK_CONFIGS.find(c => c.id === configId);
+  return {
+    profileName: config?.name || configId,
+    latency: config ? Math.floor(Math.random() * 180) + 20 : 0,
+    success: config ? Math.random() > 0.1 : false,
+  };
+};
+
 export const PingProtocol = async (protocolId: string): Promise<PingResult> => {
   console.log('Mock: PingProtocol', protocolId);
   await new Promise(r => setTimeout(r, 200 + Math.random() * 600));
@@ -486,17 +574,20 @@ export default {
   GetServerInfo,
   ConnectToProtocol,
   ConnectToProfile,
+  ConnectToConfig,
   DisconnectAll,
   GetConnectionStatus,
   IsConnected,
   IsCoreRunning,
   IsAuthenticated,
   LoadProfiles,
+  LoadConfigs,
   AddProfile,
   DeleteProfile,
   PingProfile,
   PingAllProfiles,
   PingProtocol,
+  PingConfig,
   LoadSettings,
   SaveSettings,
   GetNetworkSpeed,

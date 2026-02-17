@@ -407,6 +407,97 @@ export const GetV2RaySubProtocols = async (): Promise<V2RaySubProtocol[]> => {
   return [];
 };
 
+export interface VPNConfig {
+  id: string;
+  name: string;
+  protocol: string;
+  transport: string;
+  security: string;
+  address: string;
+  port: number;
+  configLink: string;
+  icon: string;
+}
+
+export const LoadConfigs = async (): Promise<VPNConfig[]> => {
+  if (!_token) return [];
+  try {
+    const protocols = await GetProtocols();
+    const v2raySubs = await GetV2RaySubProtocols();
+    const configs: VPNConfig[] = [];
+
+    // Add V2Ray sub-protocol configs
+    if (protocols.find(p => p.id === 'v2ray' && p.status !== 'stopped')) {
+      v2raySubs.forEach(sub => {
+        if (sub.status === 'running') {
+          const protoName = sub.id.split('-')[0] || 'vless';
+          configs.push({
+            id: sub.id,
+            name: sub.name,
+            protocol: 'V2Ray',
+            transport: sub.transport,
+            security: sub.security,
+            address: _serverInfo?.ip || '0.0.0.0',
+            port: sub.port,
+            configLink: `${protoName}://${_serverInfo?.ip || '0.0.0.0'}:${sub.port}`,
+            icon: '⚡',
+          });
+        }
+      });
+    }
+
+    // Add other protocol configs
+    protocols.forEach(p => {
+      if (p.id !== 'v2ray' && p.status !== 'stopped') {
+        const iconMap: Record<string, string> = {
+          wireguard: '🛡️', openvpn: '🔒', ikev2: '🔐',
+          l2tp: '📡', dnstt: '🌐', slipstream: '💨', trusttunnel: '🏰',
+        };
+        configs.push({
+          id: `${p.id}-1`,
+          name: p.name,
+          protocol: p.name,
+          transport: 'default',
+          security: 'default',
+          address: _serverInfo?.ip || '0.0.0.0',
+          port: p.port,
+          configLink: `${p.id}://${_serverInfo?.ip || '0.0.0.0'}:${p.port}`,
+          icon: iconMap[p.id] || '🔌',
+        });
+      }
+    });
+
+    return configs;
+  } catch (e: any) {
+    addLog('error', `Failed to load configs: ${e.message}`);
+    return [];
+  }
+};
+
+export const ConnectToConfig = async (configId: string): Promise<void> => {
+  addLog('info', `Connecting via config ${configId}...`);
+  try {
+    await apiRequest('POST', '/connect', { protocol: configId });
+  } catch {
+    // Server tracking is optional
+  }
+  _isConnected = true;
+  _connectedProtocol = configId;
+  _connectionStartTime = new Date().toISOString();
+  _sessionDownload = 0;
+  _sessionUpload = 0;
+  addLog('info', `Connected via config ${configId}`);
+};
+
+export const PingConfig = async (configId: string): Promise<PingResult> => {
+  await new Promise(r => setTimeout(r, 200 + Math.random() * 600));
+  return {
+    profileName: configId,
+    latency: Math.floor(Math.random() * 180) + 20,
+    success: Math.random() > 0.1,
+  };
+};
+
 export const PingProtocol = async (protocolId: string): Promise<PingResult> => {
   await new Promise(r => setTimeout(r, 200 + Math.random() * 600));
   return {
@@ -458,9 +549,10 @@ export const ValidateProxyLink = async (link: string): Promise<boolean> =>
 
 export default {
   Login, Logout, GetProtocols, GetV2RaySubProtocols, GetAccountInfo,
-  GetServerInfo, ConnectToProtocol, ConnectToProfile, DisconnectAll,
-  GetConnectionStatus, IsConnected, IsCoreRunning, IsAuthenticated,
-  LoadProfiles, AddProfile, DeleteProfile, PingProfile, PingAllProfiles,
-  PingProtocol, LoadSettings, SaveSettings, GetNetworkSpeed,
+  GetServerInfo, ConnectToProtocol, ConnectToProfile, ConnectToConfig,
+  DisconnectAll, GetConnectionStatus, IsConnected, IsCoreRunning,
+  IsAuthenticated, LoadProfiles, LoadConfigs, AddProfile, DeleteProfile,
+  PingProfile, PingAllProfiles, PingProtocol, PingConfig,
+  LoadSettings, SaveSettings, GetNetworkSpeed,
   LoadLogs, ClearLogs, ValidateProxyLink,
 };
