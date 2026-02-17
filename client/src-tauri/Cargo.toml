@@ -25,6 +25,8 @@ tauri = { version = "2.0.0-rc.17", features = [] }
 
 tauri-plugin-log = "2.0.0-rc"
 tauri-plugin-fs = "2.0.0-rc"
+libc = "0.2"
+windows-sys = { version = "0.52", features = ["Win32_UI_Shell", "Win32_Foundation"] }
 
 [features]
 default = ["custom-protocol"]

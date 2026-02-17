@@ -27,6 +27,8 @@ import {
   CheckSystemExecutables,
   LoadSavedCredentials,
   Login,
+  IsAdmin,
+  RestartAsAdmin,
 } from './services/api';
 import type { ServerInfo, ClientAccount, VPNConfig } from './services/api';
 
@@ -45,6 +47,7 @@ const AppContent: React.FC = () => {
   const [connectedProtocol, setConnectedProtocol] = useState<string | null>(null);
   const [connectionError, setConnectionError] = useState('');
   const [missingTools, setMissingTools] = useState<string[]>([]);
+  const [isAdmin, setIsAdmin] = useState(true); // Default to true to avoid flash
 
   // Configs state (for resolving config names in status display)
   const [configsMap, setConfigsMap] = useState<Record<string, VPNConfig>>({});
@@ -70,6 +73,12 @@ const AppContent: React.FC = () => {
       } catch (e) {
         console.error('System check failed:', e);
       }
+
+      // 1.5 Check if admin
+      try {
+        const admin = await IsAdmin();
+        setIsAdmin(admin);
+      } catch { }
 
       // 2. Auto-login if we have saved credentials
       const saved = LoadSavedCredentials();
@@ -342,6 +351,27 @@ const AppContent: React.FC = () => {
                     <p className="text-amber-600 dark:text-amber-400 text-xs mt-0.5">
                       The following components are missing: {missingTools.join(', ')}. Some protocols may not work.
                     </p>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Admin Privilege Warning */}
+            {!isAdmin && (
+              <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl p-3">
+                <div className="flex items-start space-x-2">
+                  <div className="w-2 h-2 bg-red-500 rounded-full flex-shrink-0 mt-1.5"></div>
+                  <div className="flex-1">
+                    <p className="text-red-700 dark:text-red-300 text-sm font-bold">Admin Privileges Required</p>
+                    <p className="text-red-600 dark:text-red-400 text-xs mt-0.5">
+                      CandyConnect needs administrator rights to manage VPN connections and system routes.
+                    </p>
+                    <button
+                      onClick={() => RestartAsAdmin()}
+                      className="mt-2 text-[10px] bg-red-600 hover:bg-red-700 text-white px-2 py-1 rounded-md font-bold uppercase tracking-wider transition-colors"
+                    >
+                      Restart as Admin
+                    </button>
                   </div>
                 </div>
               </div>

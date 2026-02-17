@@ -137,6 +137,72 @@ async fn check_system_executables(app: tauri::AppHandle) -> Result<Vec<String>, 
     Ok(missing)
 }
 
+#[tauri::command]
+async fn is_admin() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW = 0x08000000
+        let output = Command::new("net")
+            .arg("session")
+            .creation_flags(0x08000000)
+            .output();
+        
+        match output {
+            Ok(out) => out.status.success(),
+            Err(_) => false,
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // On Unix-like systems, check if UID is 0
+        unsafe { libc::getuid() == 0 }
+    }
+}
+
+#[tauri::command]
+async fn restart_as_admin(app: tauri::AppHandle) -> Result<(), String> {
+    let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use std::ptr;
+        
+        let path: Vec<u16> = current_exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let operation: Vec<u16> = std::ffi::OsStr::new("runas").encode_wide().chain(std::iter::once(0)).collect();
+        
+        unsafe {
+            windows_sys::Win32::UI::Shell::ShellExecuteW(
+                0,
+                operation.as_ptr(),
+                path.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                1, // SW_SHOWNORMAL
+            );
+        }
+        app.exit(0);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::process::Command;
+        // Try pkexec for Linux or just sudo for macOS if we have a terminal (usually GUI apps use other ways)
+        // For simplicity, we'll try pkexec
+        let status = Command::new("pkexec")
+            .arg(current_exe)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        
+        app.exit(0);
+        Ok(())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
@@ -157,7 +223,7 @@ pub fn run() {
 
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![measure_latency, check_system_executables])
+    .invoke_handler(tauri::generate_handler![measure_latency, check_system_executables, is_admin, restart_as_admin])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }

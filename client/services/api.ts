@@ -681,6 +681,24 @@ export const CheckSystemExecutables = async (): Promise<string[]> => {
   }
 };
 
+export const IsAdmin = async (): Promise<boolean> => {
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    return await invoke<boolean>('is_admin');
+  } catch {
+    return false;
+  }
+};
+
+export const RestartAsAdmin = async (): Promise<void> => {
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    await invoke('restart_as_admin');
+  } catch (e) {
+    console.error('Restart as admin failed:', e);
+  }
+};
+
 export default {
   Login, Logout, GetProtocols, GetV2RaySubProtocols, GetAccountInfo,
   GetServerInfo, ConnectToProtocol, ConnectToProfile, ConnectToConfig,
@@ -689,4 +707,5 @@ export default {
   PingProfile, PingAllProfiles, PingAllConfigs, PingProtocol, PingConfig,
   LoadSettings, SaveSettings, GetNetworkSpeed,
   LoadLogs, ClearLogs, ValidateProxyLink, CheckSystemExecutables, LoadSavedCredentials,
+  IsAdmin, RestartAsAdmin,
 };
