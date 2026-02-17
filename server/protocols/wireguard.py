@@ -272,14 +272,25 @@ PersistentKeepalive = 25
                 from database import update_core_config
                 await update_core_config("wireguard", config)
 
+        # Auto-generate NAT rules if PostUp/PostDown are empty
+        interface = config.get("bind_interface", "eth0")
+        
+        post_up = config.get("post_up", "")
+        if not post_up and interface:
+            post_up = f"iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o {interface} -j MASQUERADE"
+            
+        post_down = config.get("post_down", "")
+        if not post_down and interface:
+            post_down = f"iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o {interface} -j MASQUERADE"
+
         conf = f"""[Interface]
 Address = {config['address']}
 ListenPort = {config['listen_port']}
 PrivateKey = {config['private_key']}
 MTU = {config.get('mtu', 1420)}
 DNS = {config.get('dns', '1.1.1.1')}
-PostUp = {config.get('post_up', '')}
-PostDown = {config.get('post_down', '')}
+PostUp = {post_up}
+PostDown = {post_down}
 """
         tmp_path = f"/tmp/cc_{name}.conf"
         with open(tmp_path, "w") as f:

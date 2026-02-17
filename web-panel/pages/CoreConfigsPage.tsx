@@ -67,6 +67,7 @@ const WireGuardConfigPanel: React.FC<{
         <div><Label>Listen Port</Label><Input type="number" value={formData.listen_port} onChange={e => setFormData({ ...formData, listen_port: +e.target.value })} /></div>
         <div><Label>DNS Servers</Label><Input value={formData.dns} onChange={e => setFormData({ ...formData, dns: e.target.value })} /></div>
         <div><Label>Internal Address</Label><Input value={formData.address} onChange={e => setFormData({ ...formData, address: e.target.value })} /></div>
+        <div><Label>Bind Interface (Network Adapter)</Label><Input value={formData.bind_interface || "eth0"} placeholder="e.g. eth0" onChange={e => setFormData({ ...formData, bind_interface: e.target.value })} /></div>
         <div><Label>MTU</Label><Input type="number" value={formData.mtu} onChange={e => setFormData({ ...formData, mtu: +e.target.value })} /></div>
         <div className="sm:col-span-2">
           <Label>Public Key (Read Only)</Label>

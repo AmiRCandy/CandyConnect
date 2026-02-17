@@ -207,6 +207,7 @@ export interface CoreConfigs {
     listen_port: number;
     dns: string;
     address: string;
+    bind_interface?: string;
     private_key: string;
     public_key: string;
     mtu: number;
