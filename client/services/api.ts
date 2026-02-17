@@ -130,6 +130,7 @@ export interface VPNConfig {
   port: number;
   configLink: string;
   icon: string;
+  extraData?: Record<string, any>;
 }
 
 // ── State ──
@@ -143,6 +144,7 @@ let _connectedProtocol: string | null = null;
 let _connectionStartTime: string | null = null;
 let _sessionDownload = 0;
 let _sessionUpload = 0;
+let _cachedConfigs: VPNConfig[] = [];
 
 let _settings: Settings = {
   autoConnect: false,
@@ -396,7 +398,7 @@ export const LoadConfigs = async (): Promise<VPNConfig[]> => {
     // Try to get configs directly from the backend
     const configs = await apiRequest<any[]>('GET', '/configs');
     if (Array.isArray(configs) && configs.length > 0) {
-      return configs.map(c => ({
+      _cachedConfigs = configs.map(c => ({
         id: c.id || 'unknown',
         name: c.name || 'Unknown',
         protocol: c.protocol || 'Unknown',
@@ -406,7 +408,9 @@ export const LoadConfigs = async (): Promise<VPNConfig[]> => {
         port: c.port || 0,
         configLink: c.configLink || c.config_link || '',
         icon: c.icon || '🔌',
+        extraData: c.extraData || c.extra_data,
       }));
+      return _cachedConfigs;
     }
   } catch (e: any) {
     addLog('warn', `Backend /configs failed (${e.message}), falling back to protocols`);
@@ -460,6 +464,7 @@ export const LoadConfigs = async (): Promise<VPNConfig[]> => {
       }
     });
 
+    _cachedConfigs = configs;
     return configs;
   } catch (e: any) {
     addLog('error', `Failed to load configs: ${e.message}`);
@@ -503,9 +508,39 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
 // ── Ping (with real backend call + mock fallback) ──
 
 export const PingConfig = async (configId: string): Promise<PingResult> => {
+  // 1. Try Rust/Tauri Ping first (Real TCP check)
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+
+    // Resolve host and port
+    let host = _serverInfo?.ip || '0.0.0.0';
+    let port = 8443; // Default panel port
+
+    const config = _cachedConfigs.find(c => c.id === configId);
+    if (config) {
+      host = config.address;
+      port = config.port;
+    } else if (configId === 'server' && _serverInfo) {
+      host = _serverInfo.ip;
+      port = 8443; // Backend API port
+    }
+
+    const latency = await invoke<number>('measure_latency', { host });
+
+    return {
+      profileName: configId,
+      configId: configId,
+      latency: Math.round(latency),
+      success: true,
+    };
+  } catch (e) {
+    // Rust ping failed or not in Tauri environment, fall back to Web/API methods
+    console.debug('Native ping failed, falling back to API:', e);
+  }
+
   const startTime = performance.now();
 
-  // Try real backend ping endpoint
+  // Try real backend ping endpoint (fallback method)
   try {
     const result = await apiRequest<any>('GET', `/ping/${encodeURIComponent(configId)}`);
     const networkRtt = performance.now() - startTime;
@@ -519,21 +554,16 @@ export const PingConfig = async (configId: string): Promise<PingResult> => {
       };
     }
   } catch {
-    // Backend ping not available, use mock with real network RTT
+    // Backend ping not available
   }
 
   // Mock fallback — use actual network round-trip time as base
   const networkRtt = performance.now() - startTime;
-  const mockLatency = Math.max(
-    Math.round(networkRtt + Math.random() * 50),
-    Math.floor(Math.random() * 180) + 20
-  );
-
   return {
     profileName: configId,
     configId: configId,
-    latency: mockLatency,
-    success: Math.random() > 0.1,
+    latency: Math.max(Math.round(networkRtt), 10),
+    success: true,
   };
 };
 

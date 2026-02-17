@@ -185,6 +185,20 @@ install_panel() {
     log "Web panel built"
 }
 
+ask_domain() {
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${CYAN}         Domain Configuration             ${NC}"
+    echo -e "${BOLD}${CYAN}═══════════════════════════════════════════${NC}"
+    echo -e "Please enter your domain name (e.g., vpn.yourdomain.com)."
+    echo -e "This will be used for your panel and VPN configs (like DNSTT)."
+    read -p "Domain [vpn.candyconnect.io]: " CC_DOMAIN
+    if [ -z "$CC_DOMAIN" ]; then
+        CC_DOMAIN="vpn.candyconnect.io"
+    fi
+    log "Domain set to: $CC_DOMAIN"
+    echo ""
+}
+
 generate_secrets() {
     info "Generating secrets..."
     JWT_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(48))")
@@ -201,6 +215,7 @@ CC_REDIS_URL=redis://127.0.0.1:6379/0
 CC_JWT_SECRET=$JWT_SECRET
 CC_PANEL_PORT=$CC_PORT
 CC_PANEL_PATH=/candyconnect
+CC_DOMAIN=$CC_DOMAIN
 CC_ADMIN_USER=admin
 CC_ADMIN_PASS=admin123
 EOF
@@ -326,6 +341,7 @@ main() {
     setup_directories
     install_server
     install_panel
+    ask_domain
     generate_secrets
     setup_firewall
     create_systemd_service

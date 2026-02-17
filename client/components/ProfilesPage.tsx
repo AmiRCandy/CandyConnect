@@ -6,6 +6,7 @@ import { ArrowLeftIcon, SpinnerIcon } from './icons';
 
 interface ProfilesPageProps {
   isConnected: boolean;
+  isConnecting: boolean;
   connectedProtocol: string | null;
   onConnect: (configId: string) => void;
   onDisconnect: () => void;
@@ -14,6 +15,7 @@ interface ProfilesPageProps {
 
 const ProfilesPage: React.FC<ProfilesPageProps> = ({
   isConnected,
+  isConnecting,
   connectedProtocol,
   onConnect,
   onDisconnect,
@@ -128,27 +130,6 @@ const ProfilesPage: React.FC<ProfilesPageProps> = ({
     try {
       await SaveSettings({ selectedProfile: configId });
     } catch { }
-  };
-
-  const handleConnect = async (configId: string) => {
-    if (connecting) return;
-
-    // If already connected to this config, disconnect
-    if (isConnected && connectedProtocol === configId) {
-      onDisconnect();
-      return;
-    }
-
-    setConnecting(configId);
-    setSelectedConfigId(configId);
-
-    try {
-      // Save selection
-      await SaveSettings({ selectedProfile: configId });
-      onConnect(configId);
-    } finally {
-      setTimeout(() => setConnecting(null), 1500);
-    }
   };
 
   const handleAutoPilotToggle = async () => {
@@ -302,8 +283,8 @@ const ProfilesPage: React.FC<ProfilesPageProps> = ({
             onClick={handlePingAll}
             disabled={pingingAll || loading}
             className={`px-4 py-2 rounded-lg text-xs font-bold transition-all active:scale-[0.96] flex items-center gap-1.5 flex-shrink-0 ${pingingAll
-                ? 'bg-indigo-300 dark:bg-indigo-700 text-white cursor-wait'
-                : 'bg-indigo-500 hover:bg-indigo-600 text-white shadow-sm hover:shadow-md'
+              ? 'bg-indigo-300 dark:bg-indigo-700 text-white cursor-wait'
+              : 'bg-indigo-500 hover:bg-indigo-600 text-white shadow-sm hover:shadow-md'
               }`}
           >
             {pingingAll ? (
@@ -364,8 +345,8 @@ const ProfilesPage: React.FC<ProfilesPageProps> = ({
           <button
             onClick={() => setFilterProtocol('all')}
             className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${filterProtocol === 'all'
-                ? 'bg-orange-500 text-white shadow-sm'
-                : 'bg-white dark:bg-slate-700 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-600'
+              ? 'bg-orange-500 text-white shadow-sm'
+              : 'bg-white dark:bg-slate-700 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-600'
               }`}
           >
             All ({configs.length})
@@ -377,8 +358,8 @@ const ProfilesPage: React.FC<ProfilesPageProps> = ({
                 key={proto}
                 onClick={() => setFilterProtocol(proto)}
                 className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${filterProtocol === proto
-                    ? 'bg-orange-500 text-white shadow-sm'
-                    : 'bg-white dark:bg-slate-700 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-600'
+                  ? 'bg-orange-500 text-white shadow-sm'
+                  : 'bg-white dark:bg-slate-700 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-600'
                   }`}
               >
                 {proto} ({count})
@@ -411,18 +392,17 @@ const ProfilesPage: React.FC<ProfilesPageProps> = ({
             const ping = pings[config.id];
             const isSelected = selectedConfigId === config.id;
             const isActiveConnection = isConnected && connectedProtocol === config.id;
-            const isThisConnecting = connecting === config.id;
+            const isThisConnecting = (connecting === config.id) || (isConnecting && selectedConfigId === config.id);
 
             return (
               <button
                 key={config.id}
-                onClick={() => handleConnect(config.id)}
-                disabled={!!connecting && !isThisConnecting}
+                onClick={() => handleSelectConfig(config.id)}
                 className={`w-full p-3.5 rounded-xl border-2 transition-all duration-200 active:scale-[0.98] ${isActiveConnection
-                    ? 'border-green-400 dark:border-green-500 bg-green-50 dark:bg-green-900/20'
-                    : isSelected && !isConnected
-                      ? 'border-orange-300 dark:border-orange-600 bg-orange-50 dark:bg-orange-900/10'
-                      : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800'
+                  ? 'border-green-400 dark:border-green-500 bg-green-50 dark:bg-green-900/20 shadow-sm shadow-green-100 dark:shadow-none'
+                  : isSelected
+                    ? 'border-orange-400 dark:border-orange-500 bg-orange-50 dark:bg-orange-900/20 shadow-sm shadow-orange-100 dark:shadow-none'
+                    : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800'
                   }`}
               >
                 <div className={`flex items-center justify-between ${isRTL ? 'flex-row-reverse' : ''}`}>
@@ -469,10 +449,15 @@ const ProfilesPage: React.FC<ProfilesPageProps> = ({
                         <span className="w-2.5 h-2.5 bg-green-500 rounded-full animate-pulse"></span>
                         <span className="text-xs font-bold text-green-600 dark:text-green-400">{t('connected')}</span>
                       </span>
+                    ) : isSelected ? (
+                      <span className="flex items-center space-x-1">
+                        <span className="w-2.5 h-2.5 bg-orange-500 rounded-full"></span>
+                        <span className="text-xs font-bold text-orange-600 dark:text-orange-400">Selected</span>
+                      </span>
                     ) : (
-                      <svg className="w-5 h-5 text-slate-400" fill="none" viewBox="0 0 24 24" strokeWidth={2} stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" />
-                      </svg>
+                      <div className="w-5 h-5 flex items-center justify-center">
+                        <div className="w-4 h-4 rounded-full border-2 border-slate-300 dark:border-slate-600"></div>
+                      </div>
                     )}
                   </div>
                 </div>

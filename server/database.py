@@ -9,7 +9,7 @@ import redis.asyncio as redis
 
 from config import (
     REDIS_URL, DEFAULT_ADMIN_USER, DEFAULT_ADMIN_PASS,
-    PANEL_PORT, PANEL_PATH, PANEL_VERSION, PANEL_BUILD_DATE,
+    PANEL_PORT, PANEL_PATH, PANEL_DOMAIN, PANEL_VERSION, PANEL_BUILD_DATE,
 )
 
 _pool: Optional[redis.Redis] = None
@@ -133,7 +133,7 @@ async def init_db():
 def _default_core_configs() -> dict:
     return {
         "candyconnect": {
-            "panel_domain": "vpn.candyconnect.io",
+            "panel_domain": PANEL_DOMAIN,
             "ssl_enabled": True,
             "ssl_cert_path": "/etc/ssl/certs/candyconnect.pem",
             "ssl_key_path": "/etc/ssl/private/candyconnect.key",
@@ -144,6 +144,8 @@ def _default_core_configs() -> dict:
             "backup_interval": 24,
             "api_enabled": True,
             "api_port": 8444,
+            "server_ip": "",        # Optional: Override auto-detected public IP
+            "server_name": "",      # Optional: Override display name
         },
         "wireguard": {
             "listen_port": 51820,
@@ -210,7 +212,7 @@ def _default_core_configs() -> dict:
         },
         "dnstt": {
             "listen_port": 5300,
-            "domain": "dns.candyconnect.io",
+            "domain": f"dns.{PANEL_DOMAIN}",
             "public_key": "",
             "tunnel_mode": "ssh",
             "mtu": 1232,

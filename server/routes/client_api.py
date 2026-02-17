@@ -10,6 +10,8 @@ from typing import Optional
 
 import database as db
 import auth
+import uuid
+from system_info import get_public_ip
 from protocols.manager import protocol_manager
 from config import SUPPORTED_PROTOCOLS
 
@@ -28,11 +30,15 @@ async def client_login(req: ClientLoginRequest):
         raise HTTPException(status_code=401, detail="Invalid username, password or account disabled")
     
     token = auth.create_client_token(req.username, client["id"])
-    server_ip = await _get_server_ip()
     
-    # Get panel config for server name if possible
-    panel_cfg = await db.get_core_config("candyconnect")
-    server_name = panel_cfg.get("panel_domain", "CandyConnect Server") if panel_cfg else "CandyConnect Server"
+    # Get panel config for server name and IP if possible
+    panel_cfg = await db.get_core_config("candyconnect") or {}
+    server_name = panel_cfg.get("server_name") or panel_cfg.get("panel_domain") or "CandyConnect Server"
+    
+    # Check if a custom server IP is set in config, otherwise auto-detect
+    server_ip = panel_cfg.get("server_ip")
+    if not server_ip:
+        server_ip = await get_public_ip()
 
     return {
         "success": True, 
@@ -120,7 +126,8 @@ async def get_protocols(payload=Depends(auth.require_client)):
 @router.get("/configs")
 async def get_all_configs(payload=Depends(auth.require_client)):
     """Return all VPN configs the client is entitled to use.
-    This builds a list of individual connection configs from the enabled protocols.
+    This builds a list of individual connection configs from the enabled protocols,
+    using the client's actual credentials (UUIDs, keys, etc.).
     """
     import json
     import logging
@@ -131,29 +138,33 @@ async def get_all_configs(payload=Depends(auth.require_client)):
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
     
-    server_ip = await _get_server_ip()
+    # Get panel config for IP
+    panel_cfg = await db.get_core_config("candyconnect") or {}
+    server_ip = panel_cfg.get("server_ip") or await get_public_ip()
     # Normalize protocol keys to lowercase for easier matching
     raw_protocols = client.get("protocols", {})
     client_protocols = {str(k).lower(): v for k, v in raw_protocols.items()}
+    protocol_data = client.get("protocol_data", {}) or {}
     
     configs = []
     cores = await protocol_manager.get_all_cores_info()
     core_map = {str(c["id"]).lower(): c for c in cores}
     
-    logger.info(f"Building configs for client {client_id}. Enabled: {list(client_protocols.keys())}")
+    logger.info(f"Building personalised configs for client {client_id}.")
 
     def is_enabled(proto_name: str) -> bool:
         return client_protocols.get(proto_name.lower()) is True
 
     # 1. V2Ray (Xray)
     if is_enabled("v2ray"):
-        v2ray_config = await db.get_core_config("v2ray")
-        status = core_map.get("v2ray", {}).get("status", "stopped")
+        v2ray_cfg_meta = await db.get_core_config("v2ray")
+        pdata = protocol_data.get("v2ray", {})
+        client_uuid = pdata.get("uuid") or str(uuid.uuid5(uuid.NAMESPACE_DNS, client["username"]))
         
         added_v2ray = False
-        if v2ray_config:
+        if v2ray_cfg_meta:
             try:
-                raw_json = v2ray_config.get("config_json", "{}")
+                raw_json = v2ray_cfg_meta.get("config_json", "{}")
                 xray_cfg = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
                 inbounds = xray_cfg.get("inbounds", [])
                 
@@ -165,6 +176,14 @@ async def get_all_configs(payload=Depends(auth.require_client)):
                     network = stream.get("network", "tcp")
                     security = stream.get("security", "none")
                     
+                    link_params = f"type={network}&security={security}"
+                    if security == "tls":
+                        tls_settings = stream.get("tlsSettings", {})
+                        sni = tls_settings.get("serverName", "")
+                        if sni: link_params += f"&sni={sni}"
+                    
+                    config_link = f"{protocol}://{client_uuid}@{server_ip}:{port}?{link_params}#CC-{protocol.upper()}-{network}"
+                    
                     network_display = {
                         "ws": "WebSocket", "websocket": "WebSocket",
                         "grpc": "gRPC", "tcp": "TCP", "kcp": "mKCP",
@@ -173,21 +192,21 @@ async def get_all_configs(payload=Depends(auth.require_client)):
                     
                     configs.append({
                         "id": tag if "-" in tag else f"v2ray-{tag}",
-                        "name": f"{protocol.upper()} + {network_display}",
+                        "name": f"V2Ray {protocol.upper()} + {network_display}",
                         "protocol": "V2Ray",
                         "transport": network,
                         "security": security if security != "none" else "plain",
                         "address": server_ip,
                         "port": port,
-                        "configLink": f"{protocol}://{server_ip}:{port}",
+                        "configLink": config_link,
                         "icon": "⚡",
+                        "extraData": {"uuid": client_uuid, "protocol": protocol}
                     })
                     added_v2ray = True
             except Exception as e:
-                logger.error(f"Failed to parse V2Ray config: {e}")
+                logger.error(f"Failed to build V2Ray personalised link: {e}")
 
         if not added_v2ray:
-            # Fallback basic V2Ray entry
             configs.append({
                 "id": "v2ray-basic",
                 "name": "V2Ray Basic",
@@ -196,14 +215,32 @@ async def get_all_configs(payload=Depends(auth.require_client)):
                 "security": "tls",
                 "address": server_ip,
                 "port": core_map.get("v2ray", {}).get("port", 443),
-                "configLink": f"vless://{server_ip}:443",
+                "configLink": f"vless://{client_uuid}@{server_ip}:443?type=tcp&security=tls#CC-Basic",
                 "icon": "⚡",
+                "extraData": {"uuid": client_uuid, "protocol": "vless"}
             })
 
     # 2. WireGuard
     if is_enabled("wireguard"):
-        wg_cfg = await db.get_core_config("wireguard")
-        port = int((wg_cfg or {}).get("listen_port", 51820))
+        wg_cfg_meta = await db.get_core_config("wireguard")
+        port = int((wg_cfg_meta or {}).get("listen_port", 51820))
+        pdata = protocol_data.get("wireguard", {})
+        privkey = pdata.get("private_key", "")
+        
+        # Link including private key if available
+        link = f"wireguard://{server_ip}:{port}"
+        if privkey:
+            link = f"wireguard://{privkey}@{server_ip}:{port}"
+
+        # Build extraData for WireGuard (the full config)
+        wg_extra = {
+            "private_key": privkey,
+            "address": pdata.get("address", ""),
+            "public_key": (wg_cfg_meta or {}).get("public_key", ""),
+            "dns": (wg_cfg_meta or {}).get("dns", "1.1.1.1"),
+            "mtu": (wg_cfg_meta or {}).get("mtu", 1420),
+        }
+
         configs.append({
             "id": "wireguard-1",
             "name": "WireGuard",
@@ -212,8 +249,9 @@ async def get_all_configs(payload=Depends(auth.require_client)):
             "security": "curve25519",
             "address": server_ip,
             "port": port,
-            "configLink": f"wireguard://{server_ip}:{port}",
+            "configLink": link,
             "icon": "🛡️",
+            "extraData": wg_extra
         })
 
     # 3. OpenVPN
@@ -231,6 +269,7 @@ async def get_all_configs(payload=Depends(auth.require_client)):
             "port": port,
             "configLink": f"openvpn://{server_ip}:{port}?proto={proto}",
             "icon": "🔒",
+            "extraData": {"proto": proto}
         })
 
     # 4. IKEv2
@@ -247,6 +286,7 @@ async def get_all_configs(payload=Depends(auth.require_client)):
             "port": port,
             "configLink": f"ikev2://{server_ip}:{port}",
             "icon": "🔐",
+            "extraData": {"username": client["username"]}
         })
 
     # 5. L2TP
@@ -263,6 +303,7 @@ async def get_all_configs(payload=Depends(auth.require_client)):
             "port": port,
             "configLink": f"l2tp://{server_ip}:{port}",
             "icon": "📡",
+            "extraData": {"username": client["username"]}
         })
 
     # 6. DNSTT
@@ -270,6 +311,9 @@ async def get_all_configs(payload=Depends(auth.require_client)):
         dnstt_cfg = await db.get_core_config("dnstt")
         port = int((dnstt_cfg or {}).get("listen_port", 5300))
         domain = (dnstt_cfg or {}).get("domain", "dns.candyconnect.io")
+        pdata = protocol_data.get("dnstt", {})
+        ssh_user = pdata.get("ssh_username", f"dnstt_{client['username']}")
+        
         configs.append({
             "id": "dnstt-1",
             "name": "DNSTT Tunnel",
@@ -278,8 +322,14 @@ async def get_all_configs(payload=Depends(auth.require_client)):
             "security": "obfs",
             "address": server_ip,
             "port": port,
-            "configLink": f"dnstt://{domain}:{port}",
+            "configLink": f"dnstt://{ssh_user}@{domain}:{port}",
             "icon": "🌐",
+            "extraData": {
+                "ssh_username": ssh_user,
+                "ssh_password": pdata.get("ssh_password", ""),
+                "public_key": (dnstt_cfg or {}).get("public_key", ""),
+                "domain": domain
+            }
         })
 
     # 7. SlipStream
@@ -314,7 +364,7 @@ async def get_all_configs(payload=Depends(auth.require_client)):
             "icon": "🏰",
         })
 
-    logger.info(f"Returning {len(configs)} configs for client {client_id}")
+    logger.info(f"Returning {len(configs)} personalised configs for client {client_id}")
     return {"success": True, "data": configs}
 
 
@@ -332,7 +382,9 @@ async def get_protocol_config(protocol: str, payload=Depends(auth.require_client
     if not client_protocols.get(protocol.lower()):
         raise HTTPException(status_code=403, detail=f"Protocol {protocol} not allowed for this account")
     
-    server_ip = await _get_server_ip()
+    # Get panel config for IP
+    panel_cfg = await db.get_core_config("candyconnect") or {}
+    server_ip = panel_cfg.get("server_ip") or await get_public_ip()
     p_mgr = protocol_manager.get_protocol(protocol)
     if not p_mgr:
         raise HTTPException(status_code=404, detail="Protocol manager not found")
@@ -378,9 +430,10 @@ async def report_connection(req: ConnectionEvent, payload=Depends(auth.require_c
 
 @router.get("/server")
 async def get_server_info():
-    ip = await _get_server_ip()
-    panel_cfg = await db.get_core_config("candyconnect")
-    hostname = panel_cfg.get("panel_domain", "CandyConnect Server") if panel_cfg else "CandyConnect Server"
+    # Get panel config for IP
+    panel_cfg = await db.get_core_config("candyconnect") or {}
+    ip = panel_cfg.get("server_ip") or await get_public_ip()
+    hostname = panel_cfg.get("server_name") or panel_cfg.get("panel_domain") or "CandyConnect Server"
     return {
         "success": True, 
         "data": {
@@ -408,6 +461,18 @@ async def ping_config(config_id: str, payload=Depends(auth.require_client)):
     # Simulate real processing: check if the protocol is running
     protocol_id = config_id.split("-")[0] if "-" in config_id else config_id
     
+    # Special case for generic server ping
+    if protocol_id.lower() in ["server", "ping", "all"]:
+        return {
+            "success": True,
+            "data": {
+                "config_id": config_id,
+                "latency": 0,
+                "reachable": True,
+                "protocol_status": "running",
+            }
+        }
+
     # Map config IDs to protocol IDs
     proto_map = {
         "vless": "v2ray", "vmess": "v2ray", "trojan": "v2ray", 
@@ -447,7 +512,7 @@ async def ping_config(config_id: str, payload=Depends(auth.require_client)):
             "success": True,
             "data": {
                 "config_id": config_id,
-                "latency": latency,
+                "latency": 0, # Client will measure real network RTT
                 "reachable": True,
                 "protocol_status": "running",
             }
@@ -475,7 +540,10 @@ async def ping_all_configs(payload=Depends(auth.require_client)):
         raise HTTPException(status_code=404, detail="Client not found")
     
     # Reuse the configs endpoint logic to get all config IDs
-    server_ip = await _get_server_ip()
+    # Get panel config for IP
+    panel_cfg = await db.get_core_config("candyconnect") or {}
+    server_ip = panel_cfg.get("server_ip") or await get_public_ip()
+    
     raw_protocols = client.get("protocols", {})
     client_protocols = {str(k).lower(): v for k, v in raw_protocols.items()}
     
@@ -497,33 +565,14 @@ async def ping_all_configs(payload=Depends(auth.require_client)):
         core_info = core_map.get(proto_id, {})
         is_running = core_info.get("status") == "running"
         
-        if is_running:
-            lo, hi = protocol_overhead.get(proto_id, (20, 60))
-            latency = int(random.uniform(lo, hi) + random.uniform(15, 50))
-            results.append({
-                "config_id": f"{proto_id}-1",
-                "protocol": proto_id,
-                "latency": latency,
-                "reachable": random.random() > 0.05,  # 95% success rate
-            })
-        else:
-            results.append({
-                "config_id": f"{proto_id}-1",
-                "protocol": proto_id,
-                "latency": 0,
-                "reachable": False,
-            })
+        results.append({
+            "config_id": f"{proto_id}-1",
+            "protocol": proto_id,
+            "latency": 0 if is_running else 0,
+            "reachable": is_running,
+        })
     
     return {"success": True, "data": results}
 
 
-async def _get_server_ip():
-    import socket
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("1.1.1.1", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
+

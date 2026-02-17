@@ -259,9 +259,31 @@ class V2RayProtocol(BaseProtocol):
             }
         }
 
+        # Extract sub-protocols for the client UI
+        sub_protocols = []
+        for outbound in outbounds:
+            proto = outbound.get("protocol", "")
+            if proto in ("vless", "vmess", "trojan", "shadowsocks"):
+                port = 443
+                if "settings" in outbound:
+                    vnext = outbound["settings"].get("vnext", [])
+                    if vnext: port = vnext[0].get("port", port)
+                    servers = outbound["settings"].get("servers", [])
+                    if servers: port = servers[0].get("port", port)
+                
+                stream = outbound.get("streamSettings", {})
+                sub_protocols.append({
+                    "tag": outbound.get("tag", f"{proto}-{port}"),
+                    "protocol": proto,
+                    "transport": stream.get("network", "tcp"),
+                    "security": stream.get("security", "none"),
+                    "port": port
+                })
+
         return {
             "type": "v2ray",
             "server": server_ip,
             "uuid": client_uuid,
             "config_json": client_json,
+            "sub_protocols": sub_protocols,
         }

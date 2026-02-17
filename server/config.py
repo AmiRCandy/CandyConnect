@@ -50,6 +50,7 @@ JWT_CLIENT_EXPIRE_HOURS = 720  # 30 days
 # ── Panel ──
 PANEL_PORT = int(os.environ.get("CC_PANEL_PORT", "8443"))
 PANEL_PATH = os.environ.get("CC_PANEL_PATH", "/candyconnect")
+PANEL_DOMAIN = os.environ.get("CC_DOMAIN", "vpn.candyconnect.io")
 PANEL_VERSION = "1.4.2"
 PANEL_BUILD_DATE = "2026-01-28"
 

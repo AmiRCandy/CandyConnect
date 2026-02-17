@@ -61,6 +61,46 @@ fn init_app_files(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[tauri::command]
+async fn measure_latency(host: String) -> Result<u64, String> {
+    use std::process::Command;
+    
+    // Determine the ping command based on the OS
+    let mut cmd = if cfg!(target_os = "windows") {
+        let mut c = Command::new("ping");
+        c.args(&["-n", "1", "-w", "2000", &host]);
+        c
+    } else {
+        let mut c = Command::new("ping");
+        c.args(&["-c", "1", "-W", "2", &host]);
+        c
+    };
+
+    let output = cmd.output().map_err(|e| e.to_string())?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    if output.status.success() {
+        // Parse "time=XXms" or "time=XX ms" from the output
+        for line in stdout.lines() {
+            if let Some(time_pos) = line.find("time=") {
+                let part = &line[time_pos + 5..];
+                // Handle cases like "time=14ms" or "time=14.2 ms"
+                let end_pos = part.find("ms").unwrap_or_else(|| {
+                    part.find(' ').unwrap_or(part.len())
+                });
+                let time_str = part[..end_pos].trim();
+                if let Ok(ms) = time_str.parse::<f64>() {
+                    return Ok(ms.round() as u64);
+                }
+            }
+        }
+        Err("Could not parse ping time".to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("Ping failed: {} {}", stdout, stderr))
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
@@ -81,6 +121,7 @@ pub fn run() {
 
       Ok(())
     })
+    .invoke_handler(tauri::generate_handler![measure_latency])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }

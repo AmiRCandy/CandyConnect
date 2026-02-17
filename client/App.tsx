@@ -45,6 +45,11 @@ const AppContent: React.FC = () => {
   // Configs state (for resolving config names in status display)
   const [configsMap, setConfigsMap] = useState<Record<string, VPNConfig>>({});
 
+  // Latency state
+  const [pingValue, setPingValue] = useState<number | undefined>(undefined);
+  const [pingSuccess, setPingSuccess] = useState(false);
+  const [isPinging, setIsPinging] = useState(false);
+
   // Navigation state
   const [currentPage, setCurrentPage] = useState<'home' | 'settings' | 'about' | 'account' | 'proxy' | 'logs' | 'profiles'>('home');
 
@@ -77,7 +82,7 @@ const AppContent: React.FC = () => {
       try {
         const account = await GetAccountInfo();
         if (account) setClientAccount(account);
-      } catch {}
+      } catch { }
     };
     const interval = setInterval(refreshAccount, 10000);
     return () => clearInterval(interval);
@@ -95,13 +100,13 @@ const AppContent: React.FC = () => {
       const map: Record<string, VPNConfig> = {};
       cfgs.forEach(c => { map[c.id] = c; });
       setConfigsMap(map);
-    } catch {}
+    } catch { }
   };
 
   const handleLogout = async () => {
     try {
       await Logout();
-    } catch {}
+    } catch { }
     setIsLoggedIn(false);
     setIsConnected(false);
     setIsConnecting(false);
@@ -109,6 +114,24 @@ const AppContent: React.FC = () => {
     setServerInfo(null);
     setClientAccount(null);
     setCurrentPage('home');
+    setPingValue(undefined);
+  };
+
+  const handlePing = async () => {
+    if (isPinging) return;
+    setIsPinging(true);
+    try {
+      const { PingConfig } = await import('./services/api');
+      // If connected, ping the specific protocol config, otherwise generic server info
+      const target = isConnected && connectedProtocol ? connectedProtocol : 'server';
+      const result = await PingConfig(target);
+      setPingValue(result.latency);
+      setPingSuccess(result.success);
+    } catch {
+      setPingSuccess(false);
+    } finally {
+      setIsPinging(false);
+    }
   };
 
   const handleConnectToProtocol = async (configId: string) => {
@@ -134,7 +157,7 @@ const AppContent: React.FC = () => {
         const map: Record<string, VPNConfig> = {};
         cfgs.forEach(c => { map[c.id] = c; });
         setConfigsMap(map);
-      } catch {}
+      } catch { }
     } catch (error: any) {
       // Backward compatibility: if it's not a config id, try connecting by protocol id
       try {
@@ -180,7 +203,7 @@ const AppContent: React.FC = () => {
         await handleConnectToProtocol(selected);
         return;
       }
-    } catch {}
+    } catch { }
 
     try {
       const cfgs = await LoadConfigs();
@@ -188,7 +211,7 @@ const AppContent: React.FC = () => {
         await handleConnectToProtocol(cfgs[0].id);
         return;
       }
-    } catch {}
+    } catch { }
 
     // Final fallback (legacy)
     await handleConnectToProtocol(connectedProtocol || 'v2ray');
@@ -224,6 +247,7 @@ const AppContent: React.FC = () => {
         return (
           <ProfilesPage
             isConnected={isConnected}
+            isConnecting={isConnecting}
             connectedProtocol={connectedProtocol}
             onConnect={handleConnectToProtocol}
             onDisconnect={handleDisconnect}
@@ -282,7 +306,10 @@ const AppContent: React.FC = () => {
               isConnected={isConnected}
               isConnecting={isConnecting}
               location={statusLocation}
-              onLocationClick={() => {}}
+              ping={pingValue}
+              pingSuccess={pingSuccess}
+              isPinging={isPinging}
+              onLocationClick={handlePing}
             />
 
             {/* Speed Monitor */}

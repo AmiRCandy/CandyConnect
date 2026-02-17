@@ -4,6 +4,7 @@ CandyConnect - L2TP/IPSec Protocol Manager
 import os, time
 from protocols.base import BaseProtocol
 from database import get_core_config, get_core_status, set_core_status, add_log
+from system_info import get_public_ip
 
 
 class L2TPProtocol(BaseProtocol):
@@ -128,10 +129,7 @@ class L2TPProtocol(BaseProtocol):
         )
         default_iface = default_iface.strip() or "eth0"
 
-        _, server_ip, _ = await self._run_cmd(
-            "curl -4 -s ifconfig.me || hostname -I | awk '{print $1}'", check=False,
-        )
-        server_ip = server_ip.strip() or "0.0.0.0"
+        server_ip = await get_public_ip()
 
         local_ip = config.get("local_ip", "10.20.0.1")
         remote_range = config.get("remote_range", "10.20.0.10-10.20.0.250")

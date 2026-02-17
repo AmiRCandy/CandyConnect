@@ -3,6 +3,41 @@ CandyConnect Server - System Information Collector
 """
 import platform, socket, asyncio
 import psutil
+import time
+
+
+async def get_public_ip() -> str:
+    """Get the public IP of the server with multiple fallbacks."""
+    # Attempt to get public IP via external services
+    services = [
+        "curl -4 -s --connect-timeout 2 ifconfig.me",
+        "curl -4 -s --connect-timeout 2 api.ipify.org",
+        "curl -4 -s --connect-timeout 2 icanhazip.com",
+    ]
+    
+    for cmd in services:
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+            ip = stdout.decode().strip()
+            if ip and len(ip.split('.')) == 4:
+                return ip
+        except Exception:
+            continue
+            
+    # Fallback to local interface IP
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
 
 
 async def get_server_info() -> dict:
@@ -45,24 +80,7 @@ async def get_server_info() -> dict:
 
     # Hostname & IP
     hostname = socket.gethostname()
-    try:
-        proc = await asyncio.create_subprocess_shell(
-            "curl -4 -s --connect-timeout 3 ifconfig.me",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        ip = stdout.decode().strip()
-        if not ip:
-            raise ValueError()
-    except Exception:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            s.close()
-        except Exception:
-            ip = "127.0.0.1"
+    ip = await get_public_ip()
 
     # OS / Kernel
     os_name = "Unknown"
@@ -78,9 +96,8 @@ async def get_server_info() -> dict:
     kernel = platform.release()
 
     # Uptime
-    uptime = int(psutil.boot_time())
-    import time
-    uptime_secs = int(time.time() - uptime)
+    boot_time = int(psutil.boot_time())
+    uptime_secs = int(time.time() - boot_time)
 
     return {
         "hostname": hostname,

@@ -60,7 +60,11 @@ const StatusDisplay: React.FC<StatusDisplayProps> = ({ isConnected, isConnecting
           </div>
         )}
       </div>
-      <div className="flex-grow min-w-0">
+      <div
+        className={`flex-grow min-w-0 cursor-pointer hover:opacity-80 transition-opacity group`}
+        onClick={onLocationClick}
+        title="Click to measure latency"
+      >
         <p className={`text-xl font-bold ${textColor}`}>{text}</p>
         <div className="flex items-center space-x-2">
           {isPinging ? (
@@ -77,7 +81,9 @@ const StatusDisplay: React.FC<StatusDisplayProps> = ({ isConnected, isConnecting
             ) : (
               <span className="text-red-600 dark:text-red-400 text-xs font-medium">Failed</span>
             )
-          ) : null}
+          ) : (
+            <span className="text-slate-400 group-hover:text-blue-400 text-xs font-medium transition-colors">Click to Ping</span>
+          )}
           <p className="text-slate-500 dark:text-slate-400 text-sm truncate">{location}</p>
         </div>
       </div>
