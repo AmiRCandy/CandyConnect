@@ -497,19 +497,505 @@ async fn start_vpn(
     Ok(())
 }
 
+/// Resolve the DNSTT resolver setting string into command-line arguments for dnstt-client.
+/// Returns (flag, address) e.g. ("-udp", "8.8.8.8:53") or ("-doh", "https://dns.google/dns-query").
+fn resolve_dnstt_resolver(resolver: &str) -> (&'static str, &'static str) {
+    match resolver {
+        // UDP resolvers
+        "udp-google"     => ("-udp", "8.8.8.8:53"),
+        "udp-cloudflare" => ("-udp", "1.1.1.1:53"),
+        "udp-quad9"      => ("-udp", "9.9.9.9:53"),
+        "udp-opendns"    => ("-udp", "208.67.222.222:53"),
+        // DoT resolvers
+        "dot-google"     => ("-dot", "dns.google:853"),
+        "dot-cloudflare" => ("-dot", "cloudflare-dns.com:853"),
+        "dot-quad9"      => ("-dot", "dns.quad9.net:853"),
+        // DoH resolvers
+        "doh-google"     => ("-doh", "https://dns.google/dns-query"),
+        "doh-cloudflare" => ("-doh", "https://cloudflare-dns.com/dns-query"),
+        "doh-quad9"      => ("-doh", "https://dns.quad9.net/dns-query"),
+        // Auto / fallback: use UDP with system-friendly Google DNS
+        _ => ("-udp", "8.8.8.8:53"),
+    }
+}
+
+#[tauri::command]
+async fn start_dnstt(
+    app: tauri::AppHandle,
+    domain: String,
+    public_key: String,
+    resolver: String,
+    mode: String,
+    proxy_host: String,
+    proxy_port: u64,
+    server_ip: String,
+    ssh_user: String,
+    ssh_pass: String,
+) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    use std::io::{BufRead, BufReader};
+    use std::thread;
+
+    let app_data_dir = app.path().app_data_dir().expect("Failed to get app dir");
+    let resource_dir = app.path().resource_dir().unwrap_or_else(|_| std::env::current_dir().unwrap());
+    let logs_path = app_data_dir.join("candy.logs");
+
+    // 1. Resolve dnstt-client binary
+    let resolve_tool = |base: &std::path::Path, rel_path: &str| -> std::path::PathBuf {
+        let p1 = base.join(rel_path);
+        if p1.exists() { return p1; }
+        let p2 = base.join("resources").join(rel_path);
+        if p2.exists() { return p2; }
+        p1
+    };
+
+    let dnstt_bin = resolve_tool(&resource_dir, if cfg!(target_os = "windows") { "dnstt-client.exe" } else { "dnstt-client" });
+    let sing_box_bin = resolve_tool(&resource_dir, if cfg!(target_os = "windows") { "sing-box/sing-box.exe" } else { "sing-box/sing-box" });
+
+    let _ = append_log(&logs_path, "info", &format!("Starting DNSTT client: {}", dnstt_bin.display()));
+
+    // 2. Build resolver arguments
+    let (resolver_flag, resolver_addr) = resolve_dnstt_resolver(&resolver);
+    let _ = append_log(&logs_path, "info", &format!("DNSTT resolver: {} {}", resolver_flag, resolver_addr));
+
+    // 3. Build the dnstt-client listen address (raw TCP tunnel to server SSH, NOT SOCKS)
+    // dnstt-client tunnels TCP to the server's SSH port. We then run SSH -D through it.
+    let dnstt_tunnel_port = proxy_port + 1; // internal port for dnstt TCP tunnel
+    let dnstt_listen_addr = format!("127.0.0.1:{}", dnstt_tunnel_port);
+    let _ = append_log(&logs_path, "info", &format!("DNSTT TCP tunnel will listen on {}", dnstt_listen_addr));
+
+    // The final SOCKS proxy will be created by SSH -D on proxy_host:proxy_port
+    let ssh_socks_addr = format!("{}:{}", proxy_host, proxy_port);
+    let _ = append_log(&logs_path, "info", &format!("SSH SOCKS proxy will listen on {}", ssh_socks_addr));
+
+    // 4. Spawn dnstt-client
+    // dnstt-client -udp <resolver> -pubkey-hex <key> <domain> <listen_addr>
+    let mut dnstt_cmd = Command::new(&dnstt_bin);
+    dnstt_cmd
+        .arg(resolver_flag)
+        .arg(resolver_addr)
+        .arg("-pubkey-hex")
+        .arg(&public_key)
+        .arg(&domain)
+        .arg(&dnstt_listen_addr)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        dnstt_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    let mut dnstt_child = dnstt_cmd.spawn().map_err(|e| {
+        let err_msg = format!("CRITICAL: Failed to spawn dnstt-client: {}", e);
+        let _ = append_log(&logs_path, "error", &err_msg);
+        err_msg
+    })?;
+
+    let _ = append_log(&logs_path, "info", &format!("dnstt-client spawned (PID: {})", dnstt_child.id()));
+
+    // Log dnstt-client output
+    let dnstt_stdout = dnstt_child.stdout.take().unwrap();
+    let dnstt_stderr = dnstt_child.stderr.take().unwrap();
+
+    let logs_p1 = logs_path.clone();
+    let dnstt_stdout_thread = thread::spawn(move || {
+        let reader = BufReader::new(dnstt_stdout);
+        for line in reader.lines() {
+            match line {
+                Ok(l) if !l.trim().is_empty() => {
+                    let _ = append_log(&logs_p1, "info", &format!("[DNSTT] {}", l));
+                }
+                Err(e) => {
+                    let _ = append_log(&logs_p1, "warn", &format!("[DNSTT] stdout read error: {}", e));
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let logs_p2 = logs_path.clone();
+    let dnstt_stderr_thread = thread::spawn(move || {
+        let reader = BufReader::new(dnstt_stderr);
+        for line in reader.lines() {
+            match line {
+                Ok(l) if !l.trim().is_empty() => {
+                    let _ = append_log(&logs_p2, "error", &format!("[DNSTT] {}", l));
+                }
+                Err(e) => {
+                    let _ = append_log(&logs_p2, "warn", &format!("[DNSTT] stderr read error: {}", e));
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // Health check: wait briefly to see if dnstt-client survives
+    thread::sleep(std::time::Duration::from_millis(800));
+    match dnstt_child.try_wait() {
+        Ok(Some(status)) => {
+            let _ = dnstt_stdout_thread.join();
+            let _ = dnstt_stderr_thread.join();
+            let err_msg = format!("dnstt-client exited immediately with {}", status);
+            let _ = append_log(&logs_path, "error", &err_msg);
+            use tauri::Emitter;
+            let _ = app.emit("vpn-disconnected", ());
+            return Err(err_msg);
+        }
+        Ok(None) => {
+            let _ = append_log(&logs_path, "info", "dnstt-client is running after health check");
+        }
+        Err(e) => {
+            let _ = append_log(&logs_path, "warn", &format!("Could not check dnstt-client status: {}", e));
+        }
+    }
+
+    let dnstt_pid = dnstt_child.id();
+    let ssh_pid_holder: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+    let sing_box_pid: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+    let is_tun_mode = mode == "tun";
+
+    // Watch dnstt-client exit in background — kill SSH and sing-box if dnstt dies
+    let app_h_dnstt = app.clone();
+    let logs_p_dnstt_exit = logs_path.clone();
+    let sb_pid_for_dnstt = Arc::clone(&sing_box_pid);
+    let ssh_pid_for_dnstt = Arc::clone(&ssh_pid_holder);
+    thread::spawn(move || {
+        let exit_status = dnstt_child.wait();
+        let _ = dnstt_stdout_thread.join();
+        let _ = dnstt_stderr_thread.join();
+        match exit_status {
+            Ok(status) => {
+                let _ = append_log(&logs_p_dnstt_exit, "warn", &format!("dnstt-client exited with {}", status));
+            }
+            Err(e) => {
+                let _ = append_log(&logs_p_dnstt_exit, "error", &format!("Failed to wait on dnstt-client: {}", e));
+            }
+        }
+        // Kill SSH tunnel
+        if let Some(sp) = *ssh_pid_for_dnstt.lock().unwrap() {
+            let _ = append_log(&logs_p_dnstt_exit, "info", &format!("dnstt-client exited — killing SSH tunnel (PID {})", sp));
+            kill_process(sp);
+        }
+        // In TUN mode, kill sing-box if it's still running
+        if is_tun_mode {
+            if let Some(sb_pid) = *sb_pid_for_dnstt.lock().unwrap() {
+                let _ = append_log(&logs_p_dnstt_exit, "info", &format!("dnstt-client exited — killing companion Sing-box (PID {})", sb_pid));
+                kill_process(sb_pid);
+            }
+        }
+        use tauri::Emitter;
+        let _ = app_h_dnstt.emit("vpn-disconnected", ());
+    });
+
+    // 5. Start SSH dynamic tunnel through the dnstt TCP tunnel
+    // ssh -D <socks_addr> -N -p <dnstt_tunnel_port> -o StrictHostKeyChecking=no <ssh_user>@127.0.0.1
+    // On Windows we use plink.exe; on Unix we use sshpass + ssh
+    let _ = append_log(&logs_path, "info", &format!("Starting SSH tunnel: {} -> 127.0.0.1:{}", ssh_socks_addr, dnstt_tunnel_port));
+
+    #[cfg(target_os = "windows")]
+    let mut ssh_child = {
+        use std::os::windows::process::CommandExt;
+        // Use plink (PuTTY) on Windows for non-interactive password auth
+        let plink_bin = resolve_tool(&resource_dir, "plink.exe");
+        let _ = append_log(&logs_path, "info", &format!("Using plink: {}", plink_bin.display()));
+
+        let mut cmd = Command::new(&plink_bin);
+        cmd.arg("-ssh")
+            .arg("-N")  // no shell
+            .arg("-D").arg(&ssh_socks_addr)
+            .arg("-P").arg(&dnstt_tunnel_port.to_string())
+            .arg("-l").arg(&ssh_user)
+            .arg("-pw").arg(&ssh_pass)
+            .arg("-batch")  // non-interactive
+            .arg("-hostkey").arg("*")  // accept any host key (internal tunnel)
+            .arg("127.0.0.1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags(0x08000000);
+        cmd.spawn().map_err(|e| {
+            let err_msg = format!("Failed to spawn plink SSH tunnel: {}", e);
+            let _ = append_log(&logs_path, "error", &err_msg);
+            kill_process(dnstt_pid);
+            err_msg
+        })?
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let mut ssh_child = {
+        // Use sshpass + ssh on Unix for non-interactive password auth
+        let mut cmd = Command::new("sshpass");
+        cmd.arg("-p").arg(&ssh_pass)
+            .arg("ssh")
+            .arg("-D").arg(&ssh_socks_addr)
+            .arg("-N")  // no shell
+            .arg("-p").arg(&dnstt_tunnel_port.to_string())
+            .arg("-o").arg("StrictHostKeyChecking=no")
+            .arg("-o").arg("UserKnownHostsFile=/dev/null")
+            .arg("-o").arg("ServerAliveInterval=30")
+            .arg("-o").arg("ServerAliveCountMax=3")
+            .arg(&format!("{}@127.0.0.1", ssh_user))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd.spawn().map_err(|e| {
+            let err_msg = format!("Failed to spawn SSH tunnel (sshpass): {}", e);
+            let _ = append_log(&logs_path, "error", &err_msg);
+            kill_process(dnstt_pid);
+            err_msg
+        })?
+    };
+
+    let _ = append_log(&logs_path, "info", &format!("SSH tunnel spawned (PID: {})", ssh_child.id()));
+    *ssh_pid_holder.lock().unwrap() = Some(ssh_child.id());
+
+    // Log SSH output
+    let ssh_stdout = ssh_child.stdout.take().unwrap();
+    let ssh_stderr = ssh_child.stderr.take().unwrap();
+
+    let logs_ssh1 = logs_path.clone();
+    let ssh_stdout_thread = thread::spawn(move || {
+        let reader = BufReader::new(ssh_stdout);
+        for line in reader.lines() {
+            match line {
+                Ok(l) if !l.trim().is_empty() => {
+                    let _ = append_log(&logs_ssh1, "info", &format!("[SSH] {}", l));
+                }
+                Err(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    let logs_ssh2 = logs_path.clone();
+    let ssh_stderr_thread = thread::spawn(move || {
+        let reader = BufReader::new(ssh_stderr);
+        for line in reader.lines() {
+            match line {
+                Ok(l) if !l.trim().is_empty() => {
+                    let _ = append_log(&logs_ssh2, "error", &format!("[SSH] {}", l));
+                }
+                Err(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    // SSH health check
+    thread::sleep(std::time::Duration::from_millis(1500));
+    match ssh_child.try_wait() {
+        Ok(Some(status)) => {
+            let _ = ssh_stdout_thread.join();
+            let _ = ssh_stderr_thread.join();
+            let err_msg = format!("SSH tunnel exited immediately with {}", status);
+            let _ = append_log(&logs_path, "error", &err_msg);
+            kill_process(dnstt_pid);
+            use tauri::Emitter;
+            let _ = app.emit("vpn-disconnected", ());
+            return Err(err_msg);
+        }
+        Ok(None) => {
+            let _ = append_log(&logs_path, "info", "SSH tunnel is running after health check");
+        }
+        Err(e) => {
+            let _ = append_log(&logs_path, "warn", &format!("Could not check SSH tunnel status: {}", e));
+        }
+    }
+
+    let ssh_pid = ssh_child.id();
+
+    // Watch SSH exit in background — kill dnstt-client and sing-box if SSH dies
+    let app_h_ssh = app.clone();
+    let logs_p_ssh = logs_path.clone();
+    let dnstt_pid_for_ssh = dnstt_pid;
+    let sb_pid_for_ssh = Arc::clone(&sing_box_pid);
+    thread::spawn(move || {
+        let exit_status = ssh_child.wait();
+        let _ = ssh_stdout_thread.join();
+        let _ = ssh_stderr_thread.join();
+        match exit_status {
+            Ok(status) => {
+                let _ = append_log(&logs_p_ssh, "warn", &format!("SSH tunnel exited with {}", status));
+            }
+            Err(e) => {
+                let _ = append_log(&logs_p_ssh, "error", &format!("Failed to wait on SSH tunnel: {}", e));
+            }
+        }
+        let _ = append_log(&logs_p_ssh, "info", &format!("SSH exited — killing dnstt-client (PID {})", dnstt_pid_for_ssh));
+        kill_process(dnstt_pid_for_ssh);
+        if let Some(sb_pid) = *sb_pid_for_ssh.lock().unwrap() {
+            let _ = append_log(&logs_p_ssh, "info", &format!("SSH exited — killing Sing-box (PID {})", sb_pid));
+            kill_process(sb_pid);
+        }
+        use tauri::Emitter;
+        let _ = app_h_ssh.emit("vpn-disconnected", ());
+    });
+
+    // 6. If TUN mode, also start Sing-box bound to the SSH SOCKS proxy
+    if mode == "tun" {
+        let _ = append_log(&logs_path, "info", "DNSTT TUN mode: starting Sing-box routing engine...");
+
+        // Generate sing-box config using dnstt's local proxy as outbound
+        // We override proxy_host/proxy_port in the settings temporarily for config generation
+        let settings_path = app_data_dir.join("settings.json");
+        let original_settings = fs::read_to_string(&settings_path).unwrap_or_default();
+        
+        // Patch settings to point sing-box at SSH's SOCKS proxy
+        if let Ok(mut settings_json) = serde_json::from_str::<serde_json::Value>(&original_settings) {
+            settings_json["proxyHost"] = serde_json::Value::String(proxy_host.clone());
+            settings_json["proxyPort"] = serde_json::Value::Number(serde_json::Number::from(proxy_port));
+            let _ = fs::write(&settings_path, serde_json::to_string_pretty(&settings_json).unwrap_or_default());
+        }
+
+        let sb_config = generate_sing_box_config(app.clone(), server_ip).await?;
+
+        // Restore original settings
+        let _ = fs::write(&settings_path, &original_settings);
+
+        let sb_config_path = app_data_dir.join("sing_box_config.json");
+        fs::write(&sb_config_path, &sb_config).map_err(|e| e.to_string())?;
+
+        let _ = append_log(&logs_path, "info", &format!("Starting Sing-box TUN engine: {}", sing_box_bin.display()));
+
+        let mut sb_cmd = Command::new(&sing_box_bin);
+        sb_cmd
+            .arg("run")
+            .arg("-c")
+            .arg(&sb_config_path)
+            .env("ENABLE_DEPRECATED_SPECIAL_OUTBOUNDS", "true")
+            .env("ENABLE_DEPRECATED_TUN_ADDRESS_X", "true")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            sb_cmd.creation_flags(0x08000000);
+        }
+
+        let mut sb_child = match sb_cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                let err_msg = format!("CRITICAL: Failed to spawn Sing-box for DNSTT TUN: {}", e);
+                let _ = append_log(&logs_path, "error", &err_msg);
+                let _ = append_log(&logs_path, "info", &format!("Killing dnstt-client (PID {}) because Sing-box failed", dnstt_pid));
+                kill_process(dnstt_pid);
+                use tauri::Emitter;
+                let _ = app.emit("vpn-disconnected", ());
+                return Err(err_msg);
+            }
+        };
+
+        let _ = append_log(&logs_path, "info", &format!("Sing-box TUN spawned (PID: {}) for DNSTT", sb_child.id()));
+
+        let sb_stdout = sb_child.stdout.take().unwrap();
+        let sb_stderr = sb_child.stderr.take().unwrap();
+
+        let logs_sb1 = logs_path.clone();
+        let sb_stdout_thread = thread::spawn(move || {
+            let reader = BufReader::new(sb_stdout);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) if !l.trim().is_empty() => {
+                        let _ = append_log(&logs_sb1, "info", &format!("[Sing-box/DNSTT] {}", l));
+                    }
+                    Err(e) => {
+                        let _ = append_log(&logs_sb1, "warn", &format!("[Sing-box/DNSTT] stdout error: {}", e));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let logs_sb2 = logs_path.clone();
+        let sb_stderr_thread = thread::spawn(move || {
+            let reader = BufReader::new(sb_stderr);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) if !l.trim().is_empty() => {
+                        let _ = append_log(&logs_sb2, "error", &format!("[Sing-box/DNSTT] {}", l));
+                    }
+                    Err(e) => {
+                        let _ = append_log(&logs_sb2, "warn", &format!("[Sing-box/DNSTT] stderr error: {}", e));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        // Health check for sing-box
+        thread::sleep(std::time::Duration::from_millis(500));
+        match sb_child.try_wait() {
+            Ok(Some(status)) => {
+                let _ = sb_stdout_thread.join();
+                let _ = sb_stderr_thread.join();
+                let err_msg = format!("Sing-box (DNSTT TUN) exited immediately with {}", status);
+                let _ = append_log(&logs_path, "error", &err_msg);
+                let _ = append_log(&logs_path, "info", &format!("Killing dnstt-client (PID {}) because Sing-box failed", dnstt_pid));
+                kill_process(dnstt_pid);
+                use tauri::Emitter;
+                let _ = app.emit("vpn-disconnected", ());
+                return Err(err_msg);
+            }
+            Ok(None) => {
+                let _ = append_log(&logs_path, "info", "Sing-box (DNSTT TUN) is running after health check");
+            }
+            Err(e) => {
+                let _ = append_log(&logs_path, "warn", &format!("Could not check Sing-box status: {}", e));
+            }
+        }
+
+        *sing_box_pid.lock().unwrap() = Some(sb_child.id());
+
+        // Watch sing-box exit — kill dnstt-client if sing-box dies
+        let app_h_sb = app.clone();
+        let logs_p_sb = logs_path.clone();
+        let dnstt_pid_for_sb = dnstt_pid;
+        thread::spawn(move || {
+            let exit_status = sb_child.wait();
+            let _ = sb_stdout_thread.join();
+            let _ = sb_stderr_thread.join();
+            match exit_status {
+                Ok(status) => {
+                    let _ = append_log(&logs_p_sb, "warn", &format!("Sing-box (DNSTT TUN) exited with {}", status));
+                }
+                Err(e) => {
+                    let _ = append_log(&logs_p_sb, "error", &format!("Failed to wait on Sing-box: {}", e));
+                }
+            }
+            let _ = append_log(&logs_p_sb, "info", &format!("Sing-box exited — killing dnstt-client (PID {})", dnstt_pid_for_sb));
+            kill_process(dnstt_pid_for_sb);
+            use tauri::Emitter;
+            let _ = app_h_sb.emit("vpn-disconnected", ());
+        });
+    }
+
+    let _ = append_log(&logs_path, "info", &format!("DNSTT connection established in {} mode", mode));
+    Ok(())
+}
+
 #[tauri::command]
 async fn stop_vpn() -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         use std::process::Command;
-        let _ = Command::new("taskkill").args(&["/F", "/IM", "xray.exe", "/T"]).spawn();
-        let _ = Command::new("taskkill").args(&["/F", "/IM", "sing-box.exe", "/T"]).spawn();
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("taskkill").args(&["/F", "/IM", "xray.exe", "/T"]).creation_flags(0x08000000).spawn();
+        let _ = Command::new("taskkill").args(&["/F", "/IM", "sing-box.exe", "/T"]).creation_flags(0x08000000).spawn();
+        let _ = Command::new("taskkill").args(&["/F", "/IM", "dnstt-client.exe", "/T"]).creation_flags(0x08000000).spawn();
+        let _ = Command::new("taskkill").args(&["/F", "/IM", "plink.exe", "/T"]).creation_flags(0x08000000).spawn();
     }
     #[cfg(not(target_os = "windows"))]
     {
         use std::process::Command;
         let _ = Command::new("pkill").arg("-9").arg("-x").arg("xray").spawn();
         let _ = Command::new("pkill").arg("-9").arg("-x").arg("sing-box").spawn();
+        let _ = Command::new("pkill").arg("-9").arg("-x").arg("dnstt-client").spawn();
+        let _ = Command::new("pkill").arg("-9").arg("-f").arg("sshpass.*ssh.*-D").spawn();
     }
     Ok(())
 }
@@ -583,7 +1069,9 @@ fn init_app_files(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             "primaryDns": "8.8.8.8",
             "secondaryDns": "1.1.1.1",
             "customDirectDomains": [],
-            "customBlockDomains": []
+            "customBlockDomains": [],
+            "dnsttResolver": "auto",
+            "dnsttProxyPort": 7070
         });
         fs::write(&settings_path, serde_json::to_string_pretty(&default_settings)?)?;
         log::info!("Created default settings.json");
@@ -675,6 +1163,22 @@ async fn check_system_executables(app: tauri::AppHandle) -> Result<Vec<String>, 
     for (name, path) in tools {
         if !resolve_tool_check(&app_dir, path) {
             missing.push(name.to_string());
+        }
+    }
+
+    // Check for SSH tool needed by DNSTT: plink on Windows, sshpass on Unix
+    #[cfg(target_os = "windows")]
+    {
+        if !resolve_tool_check(&app_dir, "plink.exe") {
+            missing.push("plink".to_string());
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::process::Command;
+        let sshpass_check = Command::new("which").arg("sshpass").output();
+        if sshpass_check.is_err() || !sshpass_check.unwrap().status.success() {
+            missing.push("sshpass".to_string());
         }
     }
 
@@ -798,7 +1302,7 @@ pub fn run() {
 
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![measure_latency, check_system_executables, is_admin, restart_as_admin, generate_sing_box_config, start_vpn, stop_vpn, write_log])
+    .invoke_handler(tauri::generate_handler![measure_latency, check_system_executables, is_admin, restart_as_admin, generate_sing_box_config, start_vpn, start_dnstt, stop_vpn, write_log])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app_handle, event| match event {

@@ -121,6 +121,8 @@ export interface Settings {
   dnsLeakProtection?: boolean;
   splitTunneling?: boolean;
   simulateTraffic?: boolean;
+  dnsttResolver?: string; // 'auto' | 'udp-google' | 'udp-cloudflare' | 'udp-quad9' | 'dot-google' | 'dot-cloudflare' | 'dot-quad9' | 'doh-google' | 'doh-cloudflare' | 'doh-quad9'
+  dnsttProxyPort?: number; // local SOCKS proxy port for dnstt-client (default 7070)
 }
 
 export interface VPNConfig {
@@ -171,6 +173,8 @@ let _settings: Settings = {
   killSwitch: false,
   dnsLeakProtection: true,
   splitTunneling: false,
+  dnsttResolver: 'auto',
+  dnsttProxyPort: 7070,
 };
 
 let _logs: Array<{ timestamp: string; level: string; message: string }> = [
@@ -544,36 +548,115 @@ export const GetV2RaySubProtocols = async (): Promise<V2RaySubProtocol[]> => {
 export const ConnectToConfig = async (configId: string): Promise<void> => {
   addLog('info', `Connecting via config ${configId}...`);
   try {
-    // 1. Fetch full configuration from the server
-    const configData = await apiRequest<any>('GET', `/configs/${encodeURIComponent(configId)}`);
-    if (!configData || !configData.config_json) {
-      throw new Error('Server returned invalid or empty configuration');
-    }
-
     const { invoke } = await import('@tauri-apps/api/core');
 
-    // 2. Prepare connection mode — reload latest settings to ensure we use the current proxyMode
+    // 1. Prepare connection mode — reload latest settings to ensure we use the current proxyMode
     const currentSettings = await LoadSettings();
     const mode = currentSettings.proxyMode === 'tun' ? 'tun' : 'proxy';
     addLog('info', `Engine mode: ${mode.toUpperCase()}`);
 
-    // 3. Start the engine in the background via Rust
-    // The Rust command saves the file and spawns the process
-    // Ensure config_json is a JSON string — avoid double-serialization
-    const configJsonStr = typeof configData.config_json === 'string'
-      ? configData.config_json
-      : JSON.stringify(configData.config_json);
-    await invoke('start_vpn', {
-      configJson: configJsonStr,
-      mode: mode,
-    });
+    // 2. Check if this is a DNSTT config
+    const isDnstt = configId.toLowerCase().startsWith('dnstt');
 
-    // 3.5 Log connection to server
+    if (isDnstt) {
+      // ── DNSTT Connection Flow ──
+      // Fetch the DNSTT config from the server (contains extraData with domain, public_key, etc.)
+      // First try configs list to get extraData, then fall back to individual config endpoint
+      let dnsttExtra: Record<string, any> | null = null;
+      let serverIp = _serverInfo?.ip || '0.0.0.0';
+
+      // Try to find config in cached configs
+      const cachedConfig = _cachedConfigs.find(c => c.id === configId);
+      if (cachedConfig?.extraData) {
+        dnsttExtra = cachedConfig.extraData;
+        serverIp = cachedConfig.address || serverIp;
+      }
+
+      // If not cached, fetch from server
+      if (!dnsttExtra) {
+        try {
+          const configData = await apiRequest<any>('GET', `/configs/${encodeURIComponent(configId)}`);
+          dnsttExtra = configData?.extra_data || configData?.extraData || configData;
+          serverIp = configData?.server || configData?.address || serverIp;
+        } catch {
+          // Last resort: try the full configs list
+          const allConfigs = await LoadConfigs();
+          const found = allConfigs.find(c => c.id === configId);
+          if (found?.extraData) {
+            dnsttExtra = found.extraData;
+            serverIp = found.address || serverIp;
+          }
+        }
+      }
+
+      if (!dnsttExtra) {
+        throw new Error('Could not retrieve DNSTT configuration data from server');
+      }
+
+      const domain = dnsttExtra.domain;
+      const publicKey = dnsttExtra.public_key;
+      const sshUser = dnsttExtra.ssh_username;
+      const sshPass = dnsttExtra.ssh_password;
+
+      if (!domain || !publicKey) {
+        throw new Error('DNSTT config missing required fields: domain or public_key');
+      }
+      if (!sshUser || !sshPass) {
+        throw new Error('DNSTT config missing SSH credentials (ssh_username / ssh_password)');
+      }
+
+      const resolver = currentSettings.dnsttResolver || 'auto';
+
+      // In proxy mode: SSH SOCKS proxy listens on the user-configured proxy address/port
+      // In TUN mode: SSH SOCKS proxy listens on an internal port; sing-box handles the user-facing proxy
+      const proxyHost = mode === 'proxy'
+        ? (currentSettings.proxyHost || currentSettings.proxyAddress || '127.0.0.1')
+        : '127.0.0.1';
+      const proxyPort = mode === 'proxy'
+        ? (currentSettings.proxyPort || 1080)
+        : (currentSettings.dnsttProxyPort || 7070);
+
+      addLog('info', `DNSTT: domain=${domain}, resolver=${resolver}, sshUser=${sshUser}, socks=${proxyHost}:${proxyPort}, mode=${mode}`);
+
+      // Call the Rust start_dnstt command
+      // Flow: dnstt-client (TCP tunnel) → SSH -D (SOCKS proxy) → [sing-box TUN if tun mode]
+      await invoke('start_dnstt', {
+        domain: domain,
+        publicKey: publicKey,
+        resolver: resolver,
+        mode: mode,
+        proxyHost: proxyHost,
+        proxyPort: proxyPort,
+        serverIp: serverIp,
+        sshUser: sshUser,
+        sshPass: sshPass,
+      });
+
+    } else {
+      // ── Standard (Xray) Connection Flow ──
+      // Fetch full configuration from the server
+      const configData = await apiRequest<any>('GET', `/configs/${encodeURIComponent(configId)}`);
+      if (!configData || !configData.config_json) {
+        throw new Error('Server returned invalid or empty configuration');
+      }
+
+      // Start the engine in the background via Rust
+      // Ensure config_json is a JSON string — avoid double-serialization
+      const configJsonStr = typeof configData.config_json === 'string'
+        ? configData.config_json
+        : JSON.stringify(configData.config_json);
+      await invoke('start_vpn', {
+        configJson: configJsonStr,
+        mode: mode,
+      });
+    }
+
+    // 3. Log connection to server
     try {
       await apiRequest('POST', '/connect', {
         protocol: configId,
         event: 'connect',
-        ip: configData.server || '0.0.0.0'
+        ip: _serverInfo?.ip || '0.0.0.0'
       });
     } catch { }
 

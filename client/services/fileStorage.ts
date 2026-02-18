@@ -137,6 +137,8 @@ export async function resetSettings(): Promise<void> {
     killSwitch: false,
     dnsLeakProtection: true,
     splitTunneling: false,
+    dnsttResolver: 'auto',
+    dnsttProxyPort: 7070,
   };
   await writeSettings(defaults);
 }

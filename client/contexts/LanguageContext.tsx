@@ -141,6 +141,11 @@ const translations: Record<Language, Record<string, string>> = {
     autoPilot: 'Auto Pilot',
     autoPilotDesc: 'Automatically switch to the best connection',
     findBestConnection: '🔍 Find Best Connection',
+    dnsttResolver: 'DNSTT Resolver',
+    dnsttResolverDesc: 'DNS resolver used by DNSTT client for tunneling',
+    dnsttResolverAuto: 'Auto (System Default)',
+    dnsttProxyPort: 'DNSTT Proxy Port',
+    dnsttProxyPortDesc: 'Local SOCKS proxy port for DNSTT tunnel',
   },
   fa: {
     settings: 'تنظیمات',
@@ -262,6 +267,11 @@ const translations: Record<Language, Record<string, string>> = {
     autoPilot: 'خلبان خودکار',
     autoPilotDesc: 'تغییر خودکار به بهترین اتصال',
     findBestConnection: '🔍 یافتن بهترین اتصال',
+    dnsttResolver: 'ریزالور DNSTT',
+    dnsttResolverDesc: 'ریزالور DNS برای تونل DNSTT',
+    dnsttResolverAuto: 'خودکار (پیش‌فرض سیستم)',
+    dnsttProxyPort: 'پورت پروکسی DNSTT',
+    dnsttProxyPortDesc: 'پورت پروکسی SOCKS محلی برای تونل DNSTT',
   },
   ru: {
     settings: 'Настройки',
@@ -383,6 +393,11 @@ const translations: Record<Language, Record<string, string>> = {
     autoPilot: 'Автопилот',
     autoPilotDesc: 'Автоматическое переключение на лучшее соединение',
     findBestConnection: '🔍 Найти лучшее соединение',
+    dnsttResolver: 'DNSTT Резолвер',
+    dnsttResolverDesc: 'DNS-резолвер для туннелирования DNSTT',
+    dnsttResolverAuto: 'Авто (системный)',
+    dnsttProxyPort: 'Порт прокси DNSTT',
+    dnsttProxyPortDesc: 'Локальный SOCKS-прокси порт для туннеля DNSTT',
   },
   zh: {
     settings: '设置',
@@ -504,6 +519,11 @@ const translations: Record<Language, Record<string, string>> = {
     autoPilot: '自动驾驶',
     autoPilotDesc: '自动切换到最佳连接',
     findBestConnection: '🔍 寻找最佳连接',
+    dnsttResolver: 'DNSTT 解析器',
+    dnsttResolverDesc: 'DNSTT客户端使用的DNS解析器',
+    dnsttResolverAuto: '自动 (系统默认)',
+    dnsttProxyPort: 'DNSTT 代理端口',
+    dnsttProxyPortDesc: 'DNSTT隧道的本地SOCKS代理端口',
   },
 };
 
