@@ -219,6 +219,49 @@ const SettingsPage: React.FC<SettingsPageProps> = ({ onBack }) => {
         </div>
       </div>
 
+      {/* L2TP / IKEv2 Settings */}
+      <div className="space-y-3">
+        <h3 className="text-sm font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">{t('l2tpIkev2Settings')}</h3>
+        <div className="bg-white dark:bg-slate-800 rounded-xl p-4 shadow-sm border border-slate-200/50 dark:border-slate-700/50 space-y-4">
+          {/* L2TP Pre-Shared Key */}
+          <div className={`flex items-start ${isRTL ? 'flex-row-reverse space-x-reverse space-x-3' : 'space-x-3'}`}>
+            <div className="text-slate-600 dark:text-slate-400 flex-shrink-0 mt-0.5">
+              <ShieldIcon className="w-5 h-5" />
+            </div>
+            <div className="flex-1 space-y-1.5">
+              <p className="font-medium text-slate-800 dark:text-slate-200 text-sm">{t('l2tpPsk')}</p>
+              <p className="text-xs text-slate-500 dark:text-slate-400">{t('l2tpPskDesc')}</p>
+              <input
+                type="password"
+                value={settings?.l2tpPsk || ''}
+                onChange={(e) => handleTextChange('l2tpPsk', e.target.value)}
+                placeholder="••••••••"
+                className="w-full bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-orange-500/50 transition-all"
+              />
+            </div>
+          </div>
+
+          {/* IKEv2 Auth Method */}
+          <div className={`flex items-start ${isRTL ? 'flex-row-reverse space-x-reverse space-x-3' : 'space-x-3'}`}>
+            <div className="text-slate-600 dark:text-slate-400 flex-shrink-0 mt-0.5">
+              <ShieldIcon className="w-5 h-5" />
+            </div>
+            <div className="flex-1 space-y-1.5">
+              <p className="font-medium text-slate-800 dark:text-slate-200 text-sm">{t('ikev2AuthMethod')}</p>
+              <p className="text-xs text-slate-500 dark:text-slate-400">{t('ikev2AuthMethodDesc')}</p>
+              <select
+                value={settings?.ikev2AuthMethod || 'eap'}
+                onChange={(e) => handleTextChange('ikev2AuthMethod', e.target.value)}
+                className="w-full bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-orange-500/50 transition-all"
+              >
+                <option value="eap">{t('ikev2Eap')}</option>
+                <option value="cert">{t('ikev2Certificate')}</option>
+              </select>
+            </div>
+          </div>
+        </div>
+      </div>
+
       {/* DNS Settings */}
       <div className="space-y-3">
         <h3 className="text-sm font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">DNS Settings</h3>

@@ -123,6 +123,8 @@ export interface Settings {
   simulateTraffic?: boolean;
   dnsttResolver?: string; // 'auto' | 'udp-google' | 'udp-cloudflare' | 'udp-quad9' | 'dot-google' | 'dot-cloudflare' | 'dot-quad9' | 'doh-google' | 'doh-cloudflare' | 'doh-quad9'
   dnsttProxyPort?: number; // local SOCKS proxy port for dnstt-client (default 7070)
+  l2tpPsk?: string; // L2TP/IPSec pre-shared key (override server-provided value)
+  ikev2AuthMethod?: string; // 'eap' | 'cert' — IKEv2 authentication method
 }
 
 export interface VPNConfig {
@@ -175,6 +177,8 @@ let _settings: Settings = {
   splitTunneling: false,
   dnsttResolver: 'auto',
   dnsttProxyPort: 7070,
+  l2tpPsk: '',
+  ikev2AuthMethod: 'eap',
 };
 
 let _logs: Array<{ timestamp: string; level: string; message: string }> = [
@@ -555,8 +559,11 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
     const mode = currentSettings.proxyMode === 'tun' ? 'tun' : 'proxy';
     addLog('info', `Engine mode: ${mode.toUpperCase()}`);
 
-    // 2. Check if this is a DNSTT config
+    // 2. Check protocol type from config ID
     const isDnstt = configId.toLowerCase().startsWith('dnstt');
+    const isL2tp = configId.toLowerCase().startsWith('l2tp');
+    const isIkev2 = configId.toLowerCase().startsWith('ikev2');
+    const isWireguard = configId.toLowerCase().startsWith('wireguard');
 
     if (isDnstt) {
       // ── DNSTT Connection Flow ──
@@ -630,6 +637,138 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
         serverIp: serverIp,
         sshUser: sshUser,
         sshPass: sshPass,
+      });
+
+    } else if (isL2tp || isIkev2) {
+      // ── L2TP / IKEv2 Native VPN Connection Flow ──
+      // These protocols use the OS-native VPN stack (rasdial on Windows, nmcli on Linux, networksetup on macOS)
+      let nativeExtra: Record<string, any> | null = null;
+      let serverIp = _serverInfo?.ip || '0.0.0.0';
+
+      // Try to find config in cached configs
+      const cachedConfig = _cachedConfigs.find(c => c.id === configId);
+      if (cachedConfig?.extraData) {
+        nativeExtra = cachedConfig.extraData;
+        serverIp = cachedConfig.address || serverIp;
+      }
+
+      // If not cached, fetch from server
+      if (!nativeExtra) {
+        try {
+          const configData = await apiRequest<any>('GET', `/configs/${encodeURIComponent(configId)}`);
+          nativeExtra = configData?.extra_data || configData?.extraData || configData;
+          serverIp = configData?.server || configData?.address || serverIp;
+        } catch {
+          const allConfigs = await LoadConfigs();
+          const found = allConfigs.find(c => c.id === configId);
+          if (found?.extraData) {
+            nativeExtra = found.extraData;
+            serverIp = found.address || serverIp;
+          }
+        }
+      }
+
+      const vpnUsername = nativeExtra?.username || _account?.username || '';
+      // For L2TP, password comes from the account credentials (same as login password)
+      const savedCreds = LoadSavedCredentials();
+      const vpnPassword = savedCreds?.password || '';
+
+      if (!vpnUsername) {
+        throw new Error(`${isL2tp ? 'L2TP' : 'IKEv2'} config missing username`);
+      }
+
+      const protocol = isL2tp ? 'l2tp' : 'ikev2';
+
+      if (isL2tp) {
+        // L2TP needs a pre-shared key — use settings override, then server-provided, then empty
+        const psk = currentSettings.l2tpPsk || nativeExtra?.psk || '';
+        const port = nativeExtra?.port || cachedConfig?.port || 1701;
+
+        addLog('info', `L2TP: server=${serverIp}, port=${port}, user=${vpnUsername}, psk=${psk ? '***' : '(empty)'}`);
+
+        await invoke('start_native_vpn', {
+          protocol: protocol,
+          server: serverIp,
+          port: port,
+          username: vpnUsername,
+          password: vpnPassword,
+          psk: psk,
+          authMethod: 'psk',
+        });
+      } else {
+        // IKEv2
+        const port = nativeExtra?.port || cachedConfig?.port || 500;
+        const authMethod = currentSettings.ikev2AuthMethod || 'eap';
+
+        addLog('info', `IKEv2: server=${serverIp}, port=${port}, user=${vpnUsername}, auth=${authMethod}`);
+
+        await invoke('start_native_vpn', {
+          protocol: protocol,
+          server: serverIp,
+          port: port,
+          username: vpnUsername,
+          password: vpnPassword,
+          psk: '',
+          authMethod: authMethod,
+        });
+      }
+
+    } else if (isWireguard) {
+      // ── WireGuard Connection Flow (via sing-box TUN) ──
+      let wgExtra: Record<string, any> | null = null;
+      let serverIp = _serverInfo?.ip || '0.0.0.0';
+
+      // Try to find config in cached configs
+      const cachedConfig = _cachedConfigs.find(c => c.id === configId);
+      if (cachedConfig?.extraData) {
+        wgExtra = cachedConfig.extraData;
+        serverIp = cachedConfig.address || serverIp;
+      }
+
+      // If not cached, fetch from server
+      if (!wgExtra) {
+        try {
+          const configData = await apiRequest<any>('GET', `/configs/${encodeURIComponent(configId)}`);
+          wgExtra = configData?.extra_data || configData?.extraData || configData;
+          serverIp = configData?.server || configData?.address || serverIp;
+        } catch {
+          const allConfigs = await LoadConfigs();
+          const found = allConfigs.find(c => c.id === configId);
+          if (found?.extraData) {
+            wgExtra = found.extraData;
+            serverIp = found.address || serverIp;
+          }
+        }
+      }
+
+      if (!wgExtra) {
+        throw new Error('Could not retrieve WireGuard configuration data from server');
+      }
+
+      const privateKey = wgExtra.private_key || wgExtra.privateKey || '';
+      const peerPublicKey = wgExtra.peer_public_key || wgExtra.peerPublicKey || wgExtra.public_key || wgExtra.publicKey || '';
+      const preSharedKey = wgExtra.pre_shared_key || wgExtra.preSharedKey || '';
+      const wgPort = wgExtra.port || cachedConfig?.port || 51820;
+      const localAddresses = wgExtra.local_addresses || wgExtra.addresses || wgExtra.address
+        ? (Array.isArray(wgExtra.local_addresses || wgExtra.addresses || wgExtra.address)
+          ? (wgExtra.local_addresses || wgExtra.addresses || wgExtra.address)
+          : [(wgExtra.local_addresses || wgExtra.addresses || wgExtra.address)])
+        : ['10.0.0.2/32'];
+
+      if (!privateKey || !peerPublicKey) {
+        throw new Error('WireGuard config missing required keys (private_key / peer_public_key)');
+      }
+
+      addLog('info', `WireGuard: server=${serverIp}, port=${wgPort}, addresses=${localAddresses.join(',')}`);
+
+      await invoke('start_wireguard', {
+        server: serverIp,
+        port: wgPort,
+        privateKey: privateKey,
+        peerPublicKey: peerPublicKey,
+        preSharedKey: preSharedKey,
+        localAddresses: localAddresses,
+        mode: mode,
       });
 
     } else {

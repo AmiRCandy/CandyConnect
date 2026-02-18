@@ -1,3 +1,5 @@
+mod sing_box_helper;
+
 use std::fs;
 use std::sync::{Arc, Mutex};
 use tauri::{
@@ -6,105 +8,10 @@ use tauri::{
     Manager,
 };
 
-const SING_BOX_TUN_JSON: &str = r#"{
-  "log": {
-    "level": "info",
-    "timestamp": true
-  },
-  "dns": {
-    "servers": [
-      {
-        "tag": "dns-remote",
-        "address": "{{primary_dns}}",
-        "address_resolver": "dns-local",
-        "strategy": "prefer_ipv4",
-        "detour": "socks-out"
-      },
-      {
-        "tag": "dns-local",
-        "address": "{{secondary_dns}}",
-        "detour": "direct-out"
-      },
-      {
-        "tag": "dns-block",
-        "address": "rcode://success"
-      }
-    ],
-    "final": "dns-remote",
-    "strategy": "prefer_ipv4",
-    "disable_cache": false,
-    "disable_expire": false
-  },
-  "inbounds": [
-    {
-      "type": "tun",
-      "tag": "tun-in",
-      "interface_name": "CandyConnect",
-      "inet4_address": "{{inet4_address}}",
-      "inet6_address": "{{inet6_address}}",
-      "mtu": {{mtu}},
-      "auto_route": true,
-      "strict_route": false,
-      "sniff": true,
-      "sniff_override_destination": false,
-      "stack": "gvisor",
-      "endpoint_independent_nat": true,
-      "platform": {
-        "http_proxy": {
-          "enabled": true,
-          "server": "127.0.0.1",
-          "server_port": 2080
-        }
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "socks",
-      "tag": "socks-out",
-      "server": "{{proxy_host}}",
-      "server_port": {{proxy_port}}
-    },
-    {
-      "type": "direct",
-      "tag": "direct-out"
-    },
-    {
-      "type": "dns",
-      "tag": "dns-out"
-    },
-    {
-      "type": "block",
-      "tag": "block-out"
-    }
-  ],
-  "route": {
-    "rules": [
-      {
-        "protocol": "dns",
-        "outbound": "dns-out"
-      },
-      {
-        "ip_cidr": [
-          "{{server_ip}}/32"
-        ],
-        "outbound": "direct-out"
-      },
-      {
-        "domain": [
-          "{{server_domain}}"
-        ],
-        "outbound": "direct-out"
-      },
-      {{custom_rules}}
-    ],
-    "final": "socks-out",
-    "auto_detect_interface": true
-  }
-}"#;
-
 #[tauri::command]
 async fn generate_sing_box_config(app: tauri::AppHandle, server_address: String) -> Result<String, String> {
+    use crate::sing_box_helper::{Config, RouteRule};
+    
     let app_data_dir = app.path().app_data_dir().expect("Failed to get app data directory");
     let settings_path = app_data_dir.join("settings.json");
     
@@ -115,48 +22,66 @@ async fn generate_sing_box_config(app: tauri::AppHandle, server_address: String)
     let settings_content = fs::read_to_string(settings_path).map_err(|e| e.to_string())?;
     let settings: serde_json::Value = serde_json::from_str(&settings_content).map_err(|e| e.to_string())?;
 
-    let mut config = SING_BOX_TUN_JSON.to_string();
-    
-    // Determine if server_address is IP or domain for routing
-    let mut server_ip = "127.0.0.1".to_string();
-    let mut server_domain = "localhost".to_string();
-    
+    // Extract settings with defaults
+    let primary_dns = settings["primaryDns"].as_str().unwrap_or("8.8.8.8");
+    let secondary_dns = settings["secondaryDns"].as_str().unwrap_or("1.1.1.1");
+    let inet4 = settings["tunInet4CIDR"].as_str().unwrap_or("172.19.0.1/30");
+    let inet6 = settings["tunInet6CIDR"].as_str().unwrap_or("fdfe:dcba:9876::1/126");
+    let mtu = settings["mtu"].as_u64().unwrap_or(9000) as u32;
+    let proxy_host = settings["proxyHost"].as_str().unwrap_or("127.0.0.1");
+    let proxy_port = settings["proxyPort"].as_u64().unwrap_or(10808) as u16;
+
+    // Collect custom domains
+    let mut direct_domains = Vec::new();
+    if let Some(arr) = settings["customDirectDomains"].as_array() {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                direct_domains.push(s.to_string());
+            }
+        }
+    }
+
+    let mut block_domains = Vec::new();
+    if let Some(arr) = settings["customBlockDomains"].as_array() {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                block_domains.push(s.to_string());
+            }
+        }
+    }
+
+    // Initialize config using helper
+    let mut config = Config::mode_tun_socks(
+        proxy_host,
+        proxy_port,
+        primary_dns,
+        secondary_dns,
+        inet4,
+        inet6,
+        mtu,
+        direct_domains,
+        block_domains,
+    );
+
+    // Add server bypass rule (IP or Domain)
     if server_address.parse::<std::net::IpAddr>().is_ok() {
-        server_ip = server_address.clone();
+        config.route.rules.push(RouteRule {
+            protocol: None,
+            outbound: Some("direct-out".into()),
+            ip_cidr: Some(vec![format!("{}/32", server_address)]),
+            domain: None,
+        });
     } else {
-        server_domain = server_address.clone();
-        // We'd ideally resolve IP here too, but for routing, domain might suffice if sing-box handles it
+        config.route.rules.push(RouteRule {
+            protocol: None,
+            outbound: Some("direct-out".into()),
+            ip_cidr: None,
+            domain: Some(vec![server_address]),
+        });
     }
 
-    // Handle Custom Rules
-    let mut custom_rules = Vec::new();
-    if let Some(direct_domains) = settings["customDirectDomains"].as_array() {
-        if !direct_domains.is_empty() {
-             let domains: Vec<String> = direct_domains.iter().filter_map(|v| v.as_str().map(|s| format!("\"{}\"", s))).collect();
-             custom_rules.push(format!("{{ \"domain\": [{}], \"outbound\": \"direct-out\" }}", domains.join(",")));
-        }
-    }
-    if let Some(block_domains) = settings["customBlockDomains"].as_array() {
-        if !block_domains.is_empty() {
-             let domains: Vec<String> = block_domains.iter().filter_map(|v| v.as_str().map(|s| format!("\"{}\"", s))).collect();
-             custom_rules.push(format!("{{ \"domain\": [{}], \"outbound\": \"block-out\" }}", domains.join(",")));
-        }
-    }
-    let custom_rules_str = if custom_rules.is_empty() { "".to_string() } else { format!("{},", custom_rules.join(",")) };
-
-    // Replace placeholders
-    config = config.replace("{{primary_dns}}", settings["primaryDns"].as_str().unwrap_or("8.8.8.8"));
-    config = config.replace("{{secondary_dns}}", settings["secondaryDns"].as_str().unwrap_or("1.1.1.1"));
-    config = config.replace("{{inet4_address}}", settings["tunInet4CIDR"].as_str().unwrap_or("172.19.0.1/30"));
-    config = config.replace("{{inet6_address}}", settings["tunInet6CIDR"].as_str().unwrap_or("fdfe:dcba:9876::1/126"));
-    config = config.replace("{{mtu}}", &settings["mtu"].as_u64().unwrap_or(9000).to_string());
-    config = config.replace("{{proxy_host}}", settings["proxyHost"].as_str().unwrap_or("127.0.0.1"));
-    config = config.replace("{{proxy_port}}", &settings["proxyPort"].as_u64().unwrap_or(10808).to_string());
-    config = config.replace("{{server_ip}}", &server_ip);
-    config = config.replace("{{server_domain}}", &server_domain);
-    config = config.replace("{{custom_rules}}", &custom_rules_str);
-
-    Ok(config)
+    // Serialize
+    serde_json::to_string_pretty(&config).map_err(|e| e.to_string())
 }
 
 /// Kill a process by PID. Used to tear down the companion process in TUN mode
@@ -375,6 +300,7 @@ async fn start_vpn(
             .arg(&sb_config_path)
             .env("ENABLE_DEPRECATED_SPECIAL_OUTBOUNDS", "true")
             .env("ENABLE_DEPRECATED_TUN_ADDRESS_X", "true")
+.env("ENABLE_DEPRECATED_WIREGUARD_OUTBOUND", "true")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -574,7 +500,7 @@ async fn start_dnstt(
     dnstt_cmd
         .arg(resolver_flag)
         .arg(resolver_addr)
-        .arg("-pubkey-hex")
+        .arg("-pubkey")
         .arg(&public_key)
         .arg(&domain)
         .arg(&dnstt_listen_addr)
@@ -804,7 +730,7 @@ async fn start_dnstt(
         }
     }
 
-    let ssh_pid = ssh_child.id();
+    let _ssh_pid = ssh_child.id();
 
     // Watch SSH exit in background — kill dnstt-client and sing-box if SSH dies
     let app_h_ssh = app.clone();
@@ -866,6 +792,7 @@ async fn start_dnstt(
             .arg(&sb_config_path)
             .env("ENABLE_DEPRECATED_SPECIAL_OUTBOUNDS", "true")
             .env("ENABLE_DEPRECATED_TUN_ADDRESS_X", "true")
+.env("ENABLE_DEPRECATED_WIREGUARD_OUTBOUND", "true")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -979,6 +906,569 @@ async fn start_dnstt(
 }
 
 #[tauri::command]
+async fn start_native_vpn(
+    app: tauri::AppHandle,
+    protocol: String,
+    server: String,
+    port: u64,
+    username: String,
+    password: String,
+    psk: String,
+    auth_method: String,
+) -> Result<(), String> {
+    use std::process::Command;
+    use std::thread;
+
+    let app_data_dir = app.path().app_data_dir().expect("Failed to get app dir");
+    let logs_path = app_data_dir.join("candy.logs");
+
+    let conn_name = format!("CandyConnect-{}", if protocol == "l2tp" { "L2TP" } else { "IKEv2" });
+    let _ = append_log(&logs_path, "info", &format!("Starting native {} VPN: server={}, port={}, user={}", protocol.to_uppercase(), server, port, username));
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+
+        // 1. Remove old connection if it exists (ignore errors)
+        let _ = Command::new("rasdial")
+            .args(&[&conn_name, "/DISCONNECT"])
+            .creation_flags(0x08000000)
+            .output();
+        let _ = Command::new("powershell")
+            .args(&["-NoProfile", "-Command", &format!("Remove-VpnConnection -Name '{}' -Force -ErrorAction SilentlyContinue", conn_name)])
+            .creation_flags(0x08000000)
+            .output();
+
+        // 2. Create VPN connection profile
+        let create_cmd = if protocol == "l2tp" {
+            format!(
+                "Add-VpnConnection -Name '{}' -ServerAddress '{}' -TunnelType L2tp -L2tpPsk '{}' -AuthenticationMethod MSChapv2 -EncryptionLevel Optional -Force -RememberCredential",
+                conn_name, server, psk
+            )
+        } else {
+            // IKEv2
+            format!(
+                "Add-VpnConnection -Name '{}' -ServerAddress '{}' -TunnelType Ikev2 -AuthenticationMethod {} -EncryptionLevel Required -Force -RememberCredential",
+                conn_name, server, if auth_method == "cert" { "MachineCertificate" } else { "EAP" }
+            )
+        };
+
+        let _ = append_log(&logs_path, "info", &format!("Creating VPN profile: {}", conn_name));
+        let create_output = Command::new("powershell")
+            .args(&["-NoProfile", "-Command", &create_cmd])
+            .creation_flags(0x08000000)
+            .output()
+            .map_err(|e| {
+                let msg = format!("Failed to create VPN profile: {}", e);
+                let _ = append_log(&logs_path, "error", &msg);
+                msg
+            })?;
+
+        if !create_output.status.success() {
+            let stderr = String::from_utf8_lossy(&create_output.stderr);
+            let _ = append_log(&logs_path, "warn", &format!("VPN profile creation output: {}", stderr));
+            // Non-fatal: profile might already exist
+        }
+
+        // For L2TP, also set the PSK in the phonebook if needed
+        if protocol == "l2tp" && !psk.is_empty() {
+            let set_psk_cmd = format!(
+                "Set-VpnConnectionIPsecConfiguration -ConnectionName '{}' -AuthenticationTransformConstants SHA256128 -CipherTransformConstants AES128 -DHGroup Group14 -EncryptionMethod AES128 -IntegrityCheckMethod SHA256 -PfsGroup None -Force -ErrorAction SilentlyContinue",
+                conn_name
+            );
+            let _ = Command::new("powershell")
+                .args(&["-NoProfile", "-Command", &set_psk_cmd])
+                .creation_flags(0x08000000)
+                .output();
+        }
+
+        // 3. Connect using rasdial
+        let _ = append_log(&logs_path, "info", &format!("Connecting via rasdial: {} ...", conn_name));
+        let connect_output = Command::new("rasdial")
+            .args(&[&conn_name, &username, &password])
+            .creation_flags(0x08000000)
+            .output()
+            .map_err(|e| {
+                let msg = format!("rasdial failed to execute: {}", e);
+                let _ = append_log(&logs_path, "error", &msg);
+                msg
+            })?;
+
+        if !connect_output.status.success() {
+            let stderr = String::from_utf8_lossy(&connect_output.stderr);
+            let stdout = String::from_utf8_lossy(&connect_output.stdout);
+            let err_msg = format!("{} connection failed: {} {}", protocol.to_uppercase(), stdout.trim(), stderr.trim());
+            let _ = append_log(&logs_path, "error", &err_msg);
+            // Clean up the profile on failure
+            let _ = Command::new("powershell")
+                .args(&["-NoProfile", "-Command", &format!("Remove-VpnConnection -Name '{}' -Force -ErrorAction SilentlyContinue", conn_name)])
+                .creation_flags(0x08000000)
+                .output();
+            return Err(err_msg);
+        }
+
+        let _ = append_log(&logs_path, "info", &format!("{} connected successfully via rasdial", protocol.to_uppercase()));
+
+        // 4. Monitor the connection in background — emit vpn-disconnected when it drops
+        let app_h = app.clone();
+        let logs_p = logs_path.clone();
+        let conn_name_monitor = conn_name.clone();
+        thread::spawn(move || {
+            loop {
+                thread::sleep(std::time::Duration::from_secs(3));
+                let output = Command::new("rasdial")
+                    .creation_flags(0x08000000)
+                    .output();
+                match output {
+                    Ok(o) => {
+                        let stdout = String::from_utf8_lossy(&o.stdout);
+                        if !stdout.contains(&conn_name_monitor) {
+                            let _ = append_log(&logs_p, "warn", &format!("{} connection dropped", conn_name_monitor));
+                            use tauri::Emitter;
+                            let _ = app_h.emit("vpn-disconnected", ());
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        // Can't check — assume still connected
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Use nmcli (NetworkManager) for native VPN connections
+        // 1. Delete old connection if exists
+        let _ = Command::new("nmcli")
+            .args(&["connection", "delete", &conn_name])
+            .output();
+
+        // 2. Create connection
+        if protocol == "l2tp" {
+            let add_output = Command::new("nmcli")
+                .args(&[
+                    "connection", "add",
+                    "con-name", &conn_name,
+                    "type", "vpn",
+                    "vpn-type", "l2tp",
+                    "ifname", "--",
+                    &format!("vpn.data"), &format!("gateway={}, ipsec-enabled=yes, ipsec-psk={}, user={}", server, psk, username),
+                    &format!("vpn.secrets"), &format!("password={}", password),
+                ])
+                .output()
+                .map_err(|e| {
+                    let msg = format!("nmcli failed: {}. Is NetworkManager-l2tp installed?", e);
+                    let _ = append_log(&logs_path, "error", &msg);
+                    msg
+                })?;
+
+            if !add_output.status.success() {
+                // Fallback: try xl2tpd + ipsec directly
+                let _ = append_log(&logs_path, "warn", "nmcli l2tp failed, trying xl2tpd fallback...");
+
+                // Write xl2tpd client config
+                let l2tp_conf = format!(
+                    "[lac candyconnect]\nlns = {}\nppp debug = yes\npppoptfile = /tmp/cc-l2tp-options.txt\nlength bit = yes\n",
+                    server
+                );
+                let ppp_opts = format!(
+                    "ipcp-accept-local\nipcp-accept-remote\nrefuse-eap\nrequire-mschap-v2\nnoccp\nnoauth\nmtu 1400\nmru 1400\nnodefaultroute\nusepeerdns\nname {}\npassword {}\n",
+                    username, password
+                );
+                std::fs::write("/tmp/cc-l2tp-lac.conf", &l2tp_conf).map_err(|e| e.to_string())?;
+                std::fs::write("/tmp/cc-l2tp-options.txt", &ppp_opts).map_err(|e| e.to_string())?;
+
+                // Start IPSec
+                if !psk.is_empty() {
+                    let ipsec_secrets = format!("{} %any : PSK \"{}\"\n", server, psk);
+                    std::fs::write("/tmp/cc-ipsec.secrets", &ipsec_secrets).map_err(|e| e.to_string())?;
+                    let _ = Command::new("sudo").args(&["ipsec", "restart"]).output();
+                }
+
+                let _ = Command::new("sudo")
+                    .args(&["xl2tpd", "-c", "/tmp/cc-l2tp-lac.conf", "-D"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .map_err(|e| format!("Failed to start xl2tpd: {}", e))?;
+
+                thread::sleep(std::time::Duration::from_secs(1));
+                let _ = Command::new("sudo")
+                    .args(&["bash", "-c", "echo 'c candyconnect' > /var/run/xl2tpd/l2tp-control"])
+                    .output();
+            }
+        } else {
+            // IKEv2 via nmcli + strongswan
+            let add_output = Command::new("nmcli")
+                .args(&[
+                    "connection", "add",
+                    "con-name", &conn_name,
+                    "type", "vpn",
+                    "vpn-type", "strongswan",
+                    "ifname", "--",
+                    &format!("vpn.data"), &format!("address={}, certificate=ignore, encap=no, esp=aes128-sha256, ike=aes256-sha256-modp2048, ipcomp=no, method={}, proposal=yes, virtual=yes",
+                        server, if auth_method == "cert" { "cert" } else { "eap" }),
+                    &format!("vpn.secrets"), &format!("password={}", password),
+                    &format!("vpn.user-name"), &username,
+                ])
+                .output()
+                .map_err(|e| {
+                    let msg = format!("nmcli failed: {}. Is NetworkManager-strongswan installed?", e);
+                    let _ = append_log(&logs_path, "error", &msg);
+                    msg
+                })?;
+
+            if !add_output.status.success() {
+                let stderr = String::from_utf8_lossy(&add_output.stderr);
+                let err_msg = format!("IKEv2 connection creation failed: {}", stderr.trim());
+                let _ = append_log(&logs_path, "error", &err_msg);
+                return Err(err_msg);
+            }
+        }
+
+        // 3. Activate the connection
+        let up_output = Command::new("nmcli")
+            .args(&["connection", "up", &conn_name])
+            .output()
+            .map_err(|e| format!("nmcli connection up failed: {}", e))?;
+
+        if !up_output.status.success() {
+            let stderr = String::from_utf8_lossy(&up_output.stderr);
+            let err_msg = format!("{} connection failed: {}", protocol.to_uppercase(), stderr.trim());
+            let _ = append_log(&logs_path, "error", &err_msg);
+            let _ = Command::new("nmcli").args(&["connection", "delete", &conn_name]).output();
+            return Err(err_msg);
+        }
+
+        let _ = append_log(&logs_path, "info", &format!("{} connected successfully via nmcli", protocol.to_uppercase()));
+
+        // Monitor connection in background
+        let app_h = app.clone();
+        let logs_p = logs_path.clone();
+        let conn_name_monitor = conn_name.clone();
+        thread::spawn(move || {
+            loop {
+                thread::sleep(std::time::Duration::from_secs(3));
+                let output = Command::new("nmcli")
+                    .args(&["-t", "-f", "NAME,TYPE", "connection", "show", "--active"])
+                    .output();
+                match output {
+                    Ok(o) => {
+                        let stdout = String::from_utf8_lossy(&o.stdout);
+                        if !stdout.contains(&conn_name_monitor) {
+                            let _ = append_log(&logs_p, "warn", &format!("{} connection dropped", conn_name_monitor));
+                            use tauri::Emitter;
+                            let _ = app_h.emit("vpn-disconnected", ());
+                            break;
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // macOS: use scutil / networksetup for native VPN
+        if protocol == "l2tp" {
+            // Create L2TP VPN service
+            let create_output = Command::new("networksetup")
+                .args(&["-createnetworkservice", &conn_name, "L2TP"])
+                .output()
+                .map_err(|e| format!("networksetup failed: {}", e))?;
+
+            // Configure the VPN
+            let _ = Command::new("networksetup")
+                .args(&["-setpppoeserveraddress", &conn_name, &server])
+                .output();
+            let _ = Command::new("networksetup")
+                .args(&["-setpppoeaccountname", &conn_name, &username])
+                .output();
+
+            // Set shared secret via security command
+            if !psk.is_empty() {
+                let _ = Command::new("security")
+                    .args(&["add-generic-password", "-a", &conn_name, "-s", "com.apple.net.racoon", "-w", &psk, "-T", "/usr/sbin/racoon"])
+                    .output();
+            }
+
+            // Connect
+            let connect_output = Command::new("networksetup")
+                .args(&["-connectpppoeservice", &conn_name])
+                .output()
+                .map_err(|e| format!("L2TP connect failed: {}", e))?;
+
+            if !connect_output.status.success() {
+                let stderr = String::from_utf8_lossy(&connect_output.stderr);
+                let err_msg = format!("L2TP connection failed: {}", stderr.trim());
+                let _ = append_log(&logs_path, "error", &err_msg);
+                return Err(err_msg);
+            }
+        } else {
+            // IKEv2 via scutil profiles
+            let _ = append_log(&logs_path, "info", "macOS IKEv2: creating VPN profile via scutil...");
+            
+            let profile_plist = format!(r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>PayloadContent</key>
+    <array>
+        <dict>
+            <key>IKEv2</key>
+            <dict>
+                <key>RemoteAddress</key>
+                <string>{}</string>
+                <key>AuthenticationMethod</key>
+                <string>{}</string>
+                <key>ExtendedAuthEnabled</key>
+                <true/>
+                <key>AuthName</key>
+                <string>{}</string>
+                <key>AuthPassword</key>
+                <string>{}</string>
+            </dict>
+            <key>PayloadType</key>
+            <string>com.apple.vpn.managed</string>
+            <key>VPNType</key>
+            <string>IKEv2</string>
+        </dict>
+    </array>
+    <key>PayloadDisplayName</key>
+    <string>{}</string>
+    <key>PayloadType</key>
+    <string>Configuration</string>
+</dict>
+</plist>"#, server, if auth_method == "cert" { "Certificate" } else { "None" }, username, password, conn_name);
+
+            let profile_path = app_data_dir.join("ikev2_profile.mobileconfig");
+            std::fs::write(&profile_path, &profile_plist).map_err(|e| e.to_string())?;
+
+            let install = Command::new("open")
+                .arg(&profile_path)
+                .output()
+                .map_err(|e| format!("Failed to install IKEv2 profile: {}", e))?;
+
+            let _ = append_log(&logs_path, "info", "IKEv2 profile opened for installation. User needs to approve in System Preferences.");
+        }
+
+        // Monitor for macOS
+        let app_h = app.clone();
+        let logs_p = logs_path.clone();
+        let conn_name_monitor = conn_name.clone();
+        thread::spawn(move || {
+            loop {
+                thread::sleep(std::time::Duration::from_secs(3));
+                let output = Command::new("scutil")
+                    .args(&["--nc", "list"])
+                    .output();
+                match output {
+                    Ok(o) => {
+                        let stdout = String::from_utf8_lossy(&o.stdout);
+                        // Check if our connection is listed and connected
+                        let is_connected = stdout.lines().any(|line| {
+                            line.contains(&conn_name_monitor) && line.contains("Connected")
+                        });
+                        if !is_connected {
+                            // Check if it was ever there (might still be connecting)
+                            let exists = stdout.contains(&conn_name_monitor);
+                            if exists {
+                                let _ = append_log(&logs_p, "warn", &format!("{} connection dropped", conn_name_monitor));
+                                use tauri::Emitter;
+                                let _ = app_h.emit("vpn-disconnected", ());
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn start_wireguard(
+    app: tauri::AppHandle,
+    server: String,
+    port: u64,
+    private_key: String,
+    peer_public_key: String,
+    pre_shared_key: String,
+    local_addresses: Vec<String>,
+    mode: String,
+) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    use std::io::{BufRead, BufReader};
+    use std::thread;
+
+    let app_data_dir = app.path().app_data_dir().expect("Failed to get app dir");
+    let resource_dir = app.path().resource_dir().unwrap_or_else(|_| std::env::current_dir().unwrap());
+    let logs_path = app_data_dir.join("candy.logs");
+
+    let _ = append_log(&logs_path, "info", &format!("Starting WireGuard via sing-box: server={}, port={}, mode={}", server, port, mode));
+
+    // Read settings for DNS
+    let settings_path = app_data_dir.join("settings.json");
+    let settings: serde_json::Value = if settings_path.exists() {
+        let content = fs::read_to_string(&settings_path).unwrap_or_default();
+        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    let primary_dns = settings["primaryDns"].as_str().unwrap_or("8.8.8.8");
+    let secondary_dns = settings["secondaryDns"].as_str().unwrap_or("1.1.1.1");
+    let wg_mtu = settings["mtu"].as_u64().unwrap_or(1280) as u16;
+
+    let psk_opt = if pre_shared_key.is_empty() { None } else { Some(pre_shared_key.as_str()) };
+
+    // Use the sing-box helper to generate config
+    let sb_config = sing_box_helper::Config::mode_wireguard_tun_full(
+        &server,
+        port as u16,
+        &private_key,
+        &peer_public_key,
+        psk_opt,
+        local_addresses,
+        None, // reserved
+        Some(wg_mtu),
+        primary_dns,
+        secondary_dns,
+    );
+
+    let config_json = serde_json::to_string_pretty(&sb_config)
+        .map_err(|e| format!("Failed to serialize sing-box config: {}", e))?;
+
+    let sb_config_path = app_data_dir.join("sing_box_wg_config.json");
+    fs::write(&sb_config_path, &config_json).map_err(|e| e.to_string())?;
+
+    let config_preview: String = config_json.chars().take(300).collect();
+    let _ = append_log(&logs_path, "info", &format!("WireGuard sing-box config written ({} bytes): {}...", config_json.len(), config_preview));
+
+    // Resolve sing-box binary
+    let resolve_tool = |base: &std::path::Path, rel_path: &str| -> std::path::PathBuf {
+        let p1 = base.join(rel_path);
+        if p1.exists() { return p1; }
+        let p2 = base.join("resources").join(rel_path);
+        if p2.exists() { return p2; }
+        p1
+    };
+    let sing_box_bin = resolve_tool(&resource_dir, if cfg!(target_os = "windows") { "sing-box/sing-box.exe" } else { "sing-box/sing-box" });
+
+    let _ = append_log(&logs_path, "info", &format!("Starting sing-box for WireGuard: {}", sing_box_bin.display()));
+
+    let mut sb_cmd = Command::new(&sing_box_bin);
+    sb_cmd
+        .arg("run")
+        .arg("-c")
+        .arg(&sb_config_path)
+        .env("ENABLE_DEPRECATED_SPECIAL_OUTBOUNDS", "true")
+        .env("ENABLE_DEPRECATED_TUN_ADDRESS_X", "true")
+.env("ENABLE_DEPRECATED_WIREGUARD_OUTBOUND", "true")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        sb_cmd.creation_flags(0x08000000);
+    }
+
+    let mut sb_child = sb_cmd.spawn().map_err(|e| {
+        let err_msg = format!("CRITICAL: Failed to spawn sing-box for WireGuard: {}", e);
+        let _ = append_log(&logs_path, "error", &err_msg);
+        err_msg
+    })?;
+
+    let _ = append_log(&logs_path, "info", &format!("sing-box WireGuard spawned (PID: {})", sb_child.id()));
+
+    let sb_stdout = sb_child.stdout.take().unwrap();
+    let sb_stderr = sb_child.stderr.take().unwrap();
+
+    let logs_p1 = logs_path.clone();
+    let sb_stdout_thread = thread::spawn(move || {
+        let reader = BufReader::new(sb_stdout);
+        for line in reader.lines() {
+            match line {
+                Ok(l) if !l.trim().is_empty() => {
+                    let _ = append_log(&logs_p1, "info", &format!("[Sing-box/WG] {}", l));
+                }
+                Err(e) => {
+                    let _ = append_log(&logs_p1, "warn", &format!("[Sing-box/WG] stdout error: {}", e));
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let logs_p2 = logs_path.clone();
+    let sb_stderr_thread = thread::spawn(move || {
+        let reader = BufReader::new(sb_stderr);
+        for line in reader.lines() {
+            match line {
+                Ok(l) if !l.trim().is_empty() => {
+                    let _ = append_log(&logs_p2, "error", &format!("[Sing-box/WG] {}", l));
+                }
+                Err(e) => {
+                    let _ = append_log(&logs_p2, "warn", &format!("[Sing-box/WG] stderr error: {}", e));
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    // Health check
+    thread::sleep(std::time::Duration::from_millis(800));
+    match sb_child.try_wait() {
+        Ok(Some(status)) => {
+            let _ = sb_stdout_thread.join();
+            let _ = sb_stderr_thread.join();
+            let err_msg = format!("sing-box WireGuard exited immediately with {}", status);
+            let _ = append_log(&logs_path, "error", &err_msg);
+            use tauri::Emitter;
+            let _ = app.emit("vpn-disconnected", ());
+            return Err(err_msg);
+        }
+        Ok(None) => {
+            let _ = append_log(&logs_path, "info", "sing-box WireGuard is running after health check");
+        }
+        Err(e) => {
+            let _ = append_log(&logs_path, "warn", &format!("Could not check sing-box WireGuard status: {}", e));
+        }
+    }
+
+    // Watch sing-box exit in background
+    let app_h = app.clone();
+    let logs_p_exit = logs_path.clone();
+    thread::spawn(move || {
+        let exit_status = sb_child.wait();
+        let _ = sb_stdout_thread.join();
+        let _ = sb_stderr_thread.join();
+        match exit_status {
+            Ok(status) => {
+                let _ = append_log(&logs_p_exit, "warn", &format!("sing-box WireGuard exited with {}", status));
+            }
+            Err(e) => {
+                let _ = append_log(&logs_p_exit, "error", &format!("Failed to wait on sing-box WireGuard: {}", e));
+            }
+        }
+        use tauri::Emitter;
+        let _ = app_h.emit("vpn-disconnected", ());
+    });
+
+    let _ = append_log(&logs_path, "info", "WireGuard connection established via sing-box TUN");
+    Ok(())
+}
+
+#[tauri::command]
 async fn stop_vpn() -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
@@ -988,14 +1478,37 @@ async fn stop_vpn() -> Result<(), String> {
         let _ = Command::new("taskkill").args(&["/F", "/IM", "sing-box.exe", "/T"]).creation_flags(0x08000000).spawn();
         let _ = Command::new("taskkill").args(&["/F", "/IM", "dnstt-client.exe", "/T"]).creation_flags(0x08000000).spawn();
         let _ = Command::new("taskkill").args(&["/F", "/IM", "plink.exe", "/T"]).creation_flags(0x08000000).spawn();
+        // Disconnect native L2TP/IKEv2 VPN connections
+        let _ = Command::new("rasdial").args(&["CandyConnect-L2TP", "/DISCONNECT"]).creation_flags(0x08000000).output();
+        let _ = Command::new("rasdial").args(&["CandyConnect-IKEv2", "/DISCONNECT"]).creation_flags(0x08000000).output();
+        let _ = Command::new("powershell").args(&["-NoProfile", "-Command", "Remove-VpnConnection -Name 'CandyConnect-L2TP' -Force -ErrorAction SilentlyContinue"]).creation_flags(0x08000000).output();
+        let _ = Command::new("powershell").args(&["-NoProfile", "-Command", "Remove-VpnConnection -Name 'CandyConnect-IKEv2' -Force -ErrorAction SilentlyContinue"]).creation_flags(0x08000000).output();
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
     {
         use std::process::Command;
         let _ = Command::new("pkill").arg("-9").arg("-x").arg("xray").spawn();
         let _ = Command::new("pkill").arg("-9").arg("-x").arg("sing-box").spawn();
         let _ = Command::new("pkill").arg("-9").arg("-x").arg("dnstt-client").spawn();
         let _ = Command::new("pkill").arg("-9").arg("-f").arg("sshpass.*ssh.*-D").spawn();
+        // Disconnect native L2TP/IKEv2 VPN connections
+        let _ = Command::new("nmcli").args(&["connection", "down", "CandyConnect-L2TP"]).output();
+        let _ = Command::new("nmcli").args(&["connection", "down", "CandyConnect-IKEv2"]).output();
+        let _ = Command::new("nmcli").args(&["connection", "delete", "CandyConnect-L2TP"]).output();
+        let _ = Command::new("nmcli").args(&["connection", "delete", "CandyConnect-IKEv2"]).output();
+        // Also kill xl2tpd if running as fallback
+        let _ = Command::new("pkill").arg("-9").arg("-x").arg("xl2tpd").spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        let _ = Command::new("pkill").arg("-9").arg("-x").arg("xray").spawn();
+        let _ = Command::new("pkill").arg("-9").arg("-x").arg("sing-box").spawn();
+        let _ = Command::new("pkill").arg("-9").arg("-x").arg("dnstt-client").spawn();
+        let _ = Command::new("pkill").arg("-9").arg("-f").arg("sshpass.*ssh.*-D").spawn();
+        // Disconnect native VPN
+        let _ = Command::new("networksetup").args(&["-disconnectpppoeservice", "CandyConnect-L2TP"]).output();
+        let _ = Command::new("scutil").args(&["--nc", "stop", "CandyConnect-IKEv2"]).output();
     }
     Ok(())
 }
@@ -1071,7 +1584,9 @@ fn init_app_files(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             "customDirectDomains": [],
             "customBlockDomains": [],
             "dnsttResolver": "auto",
-            "dnsttProxyPort": 7070
+            "dnsttProxyPort": 7070,
+            "l2tpPsk": "",
+            "ikev2AuthMethod": "eap"
         });
         fs::write(&settings_path, serde_json::to_string_pretty(&default_settings)?)?;
         log::info!("Created default settings.json");
@@ -1302,7 +1817,7 @@ pub fn run() {
 
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![measure_latency, check_system_executables, is_admin, restart_as_admin, generate_sing_box_config, start_vpn, start_dnstt, stop_vpn, write_log])
+    .invoke_handler(tauri::generate_handler![measure_latency, check_system_executables, is_admin, restart_as_admin, generate_sing_box_config, start_vpn, start_dnstt, start_native_vpn, start_wireguard, stop_vpn, write_log])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app_handle, event| match event {
