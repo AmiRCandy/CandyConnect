@@ -215,7 +215,7 @@ class OpenVPNProtocol(BaseProtocol):
             check=False,
         )
 
-    async def get_client_config(self, username: str, server_ip: str, protocol_data: dict) -> dict:
+    async def get_client_config(self, username: str, server_ip: str, protocol_data: dict, config_id: str = None) -> dict:
         config = await get_core_config("openvpn")
         if not config:
             return {}

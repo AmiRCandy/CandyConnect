@@ -1,4 +1,5 @@
 use std::fs;
+use std::sync::{Arc, Mutex};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{TrayIconBuilder, TrayIconEvent},
@@ -91,8 +92,7 @@ const SING_BOX_TUN_JSON: &str = r#"{
       },
       {
         "domain": [
-          "{{server_domain}}",
-          "gm.litelag.ir"
+          "{{server_domain}}"
         ],
         "outbound": "direct-out"
       },
@@ -159,6 +159,25 @@ async fn generate_sing_box_config(app: tauri::AppHandle, server_address: String)
     Ok(config)
 }
 
+/// Kill a process by PID. Used to tear down the companion process in TUN mode
+/// (e.g. kill sing-box when xray exits, or vice versa).
+fn kill_process(pid: u32) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("taskkill")
+            .args(&["/F", "/PID", &pid.to_string(), "/T"])
+            .creation_flags(0x08000000)
+            .spawn();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::process::Command;
+        let _ = Command::new("kill").args(&["-9", &pid.to_string()]).spawn();
+    }
+}
+
 #[tauri::command]
 async fn start_vpn(
     app: tauri::AppHandle,
@@ -173,9 +192,23 @@ async fn start_vpn(
     let resource_dir = app.path().resource_dir().unwrap_or_else(|_| std::env::current_dir().unwrap());
     let logs_path = app_data_dir.join("candy.logs");
 
-    // 1. Save Xray config
+    // 1. Validate and save Xray config
     let xray_config_path = app_data_dir.join("xray_config.json");
-    fs::write(&xray_config_path, &config_json).map_err(|e| e.to_string())?;
+
+    // Validate that config_json is valid JSON before writing
+    let parsed: serde_json::Value = serde_json::from_str(&config_json).map_err(|e| {
+        let err_msg = format!("Invalid Xray config JSON: {}. First 200 chars: {}", e, config_json.chars().take(200).collect::<String>());
+        let _ = append_log(&logs_path, "error", &err_msg);
+        err_msg
+    })?;
+
+    // Re-serialize to ensure clean formatting
+    let clean_config = serde_json::to_string_pretty(&parsed).unwrap_or(config_json.clone());
+    fs::write(&xray_config_path, &clean_config).map_err(|e| e.to_string())?;
+
+    // Log config snippet for debugging (first 200 chars)
+    let config_preview: String = clean_config.chars().take(200).collect();
+    let _ = append_log(&logs_path, "info", &format!("Xray config saved ({} bytes): {}...", clean_config.len(), config_preview));
 
     // 2. Determine paths using a more robust search
     let resolve_tool = |base: &std::path::Path, rel_path: &str| -> std::path::PathBuf {
@@ -214,34 +247,103 @@ async fn start_vpn(
             err_msg
         })?;
 
-    let _ = append_log(&logs_path, "info", "Xray process spawned successfully");
+    let _ = append_log(&logs_path, "info", &format!("Xray process spawned successfully (PID: {})", xray_child.id()));
+
+    // Log whether the binary actually exists at the resolved path
+    if xray_bin.exists() {
+        let _ = append_log(&logs_path, "info", &format!("Xray binary confirmed at: {}", xray_bin.display()));
+    } else {
+        let _ = append_log(&logs_path, "error", &format!("Xray binary NOT FOUND at: {}", xray_bin.display()));
+    }
 
     // Log Xray output to candy.logs
-    let logs_path_clone = logs_path.clone();
     let stdout = xray_child.stdout.take().unwrap();
     let stderr = xray_child.stderr.take().unwrap();
-    
-    thread::spawn(move || {
+
+    let logs_path_clone = logs_path.clone();
+    let xray_stdout_thread = thread::spawn(move || {
         let reader = BufReader::new(stdout);
-        for line in reader.lines().filter_map(Result::ok) {
-            let _ = append_log(&logs_path_clone, "info", &format!("[Xray] {}", line));
+        for line in reader.lines() {
+            match line {
+                Ok(l) if !l.trim().is_empty() => {
+                    let _ = append_log(&logs_path_clone, "info", &format!("[Xray] {}", l));
+                }
+                Err(e) => {
+                    let _ = append_log(&logs_path_clone, "warn", &format!("[Xray] stdout read error: {}", e));
+                    break;
+                }
+                _ => {}
+            }
         }
     });
 
     let logs_path_err = logs_path.clone();
-    thread::spawn(move || {
+    let xray_stderr_thread = thread::spawn(move || {
         let reader = BufReader::new(stderr);
-        for line in reader.lines().filter_map(Result::ok) {
-            let _ = append_log(&logs_path_err, "error", &format!("[Xray Error] {}", line));
+        for line in reader.lines() {
+            match line {
+                Ok(l) if !l.trim().is_empty() => {
+                    let _ = append_log(&logs_path_err, "error", &format!("[Xray] {}", l));
+                }
+                Err(e) => {
+                    let _ = append_log(&logs_path_err, "warn", &format!("[Xray] stderr read error: {}", e));
+                    break;
+                }
+                _ => {}
+            }
         }
     });
 
-    // Watch Xray exit
+    // Brief health check: wait a moment to see if xray survives startup
+    thread::sleep(std::time::Duration::from_millis(500));
+    match xray_child.try_wait() {
+        Ok(Some(status)) => {
+            // Process already exited — wait for output threads to capture everything
+            let _ = xray_stdout_thread.join();
+            let _ = xray_stderr_thread.join();
+            let err_msg = format!("Xray exited immediately with {}", status);
+            let _ = append_log(&logs_path, "error", &err_msg);
+            use tauri::Emitter;
+            let _ = app.emit("vpn-disconnected", ());
+            return Err(err_msg);
+        }
+        Ok(None) => {
+            let _ = append_log(&logs_path, "info", "Xray process is running after health check");
+        }
+        Err(e) => {
+            let _ = append_log(&logs_path, "warn", &format!("Could not check Xray status: {}", e));
+        }
+    }
+
+    // Shared PID holders for cross-process cleanup in TUN mode
+    let xray_pid = xray_child.id();
+    let sing_box_pid: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+    let is_tun_mode = mode == "tun";
+
+    // Watch Xray exit in background — wait for output threads to flush before emitting event
     let app_h_xray = app.clone();
     let logs_p_xray_exit = logs_path.clone();
+    let sing_box_pid_for_xray = Arc::clone(&sing_box_pid);
     thread::spawn(move || {
-        let _ = xray_child.wait();
-        let _ = append_log(&logs_p_xray_exit, "warn", "Xray process has exited.");
+        let exit_status = xray_child.wait();
+        // Wait for stdout/stderr reader threads to finish processing all output
+        let _ = xray_stdout_thread.join();
+        let _ = xray_stderr_thread.join();
+        match exit_status {
+            Ok(status) => {
+                let _ = append_log(&logs_p_xray_exit, "warn", &format!("Xray process exited with {}", status));
+            }
+            Err(e) => {
+                let _ = append_log(&logs_p_xray_exit, "error", &format!("Failed to wait on Xray process: {}", e));
+            }
+        }
+        // In TUN mode, kill sing-box if it's still running
+        if is_tun_mode {
+            if let Some(sb_pid) = *sing_box_pid_for_xray.lock().unwrap() {
+                let _ = append_log(&logs_p_xray_exit, "info", &format!("Xray exited — killing companion Sing-box (PID {})", sb_pid));
+                kill_process(sb_pid);
+            }
+        }
         use tauri::Emitter;
         let _ = app_h_xray.emit("vpn-disconnected", ());
     });
@@ -271,6 +373,8 @@ async fn start_vpn(
             .arg("run")
             .arg("-c")
             .arg(&sb_config_path)
+            .env("ENABLE_DEPRECATED_SPECIAL_OUTBOUNDS", "true")
+            .env("ENABLE_DEPRECATED_TUN_ADDRESS_X", "true")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -281,41 +385,110 @@ async fn start_vpn(
             sb_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         }
 
-        let mut sb_child = sb_cmd
-            .spawn()
-            .map_err(|e| {
+        let mut sb_child = match sb_cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
                 let err_msg = format!("CRITICAL: Failed to spawn Sing-box: {}", e);
                 let _ = append_log(&logs_path, "error", &err_msg);
-                err_msg
-            })?;
+                // Kill xray since TUN mode can't work without sing-box
+                let _ = append_log(&logs_path, "info", &format!("Killing Xray (PID {}) because Sing-box failed to start", xray_pid));
+                kill_process(xray_pid);
+                use tauri::Emitter;
+                let _ = app.emit("vpn-disconnected", ());
+                return Err(err_msg);
+            }
+        };
 
-        let _ = append_log(&logs_path, "info", "Sing-box TUN engine spawned successfully");
+        let _ = append_log(&logs_path, "info", &format!("Sing-box TUN engine spawned successfully (PID: {})", sb_child.id()));
 
-        let logs_path_sb = logs_path.clone();
+        if sing_box_bin.exists() {
+            let _ = append_log(&logs_path, "info", &format!("Sing-box binary confirmed at: {}", sing_box_bin.display()));
+        } else {
+            let _ = append_log(&logs_path, "error", &format!("Sing-box binary NOT FOUND at: {}", sing_box_bin.display()));
+        }
+
         let sb_stdout = sb_child.stdout.take().unwrap();
         let sb_stderr = sb_child.stderr.take().unwrap();
-        
-        thread::spawn(move || {
+
+        let logs_path_sb = logs_path.clone();
+        let sb_stdout_thread = thread::spawn(move || {
             let reader = BufReader::new(sb_stdout);
-            for line in reader.lines().filter_map(Result::ok) {
-                let _ = append_log(&logs_path_sb, "info", &format!("[Sing-box] {}", line));
+            for line in reader.lines() {
+                match line {
+                    Ok(l) if !l.trim().is_empty() => {
+                        let _ = append_log(&logs_path_sb, "info", &format!("[Sing-box] {}", l));
+                    }
+                    Err(e) => {
+                        let _ = append_log(&logs_path_sb, "warn", &format!("[Sing-box] stdout read error: {}", e));
+                        break;
+                    }
+                    _ => {}
+                }
             }
         });
 
         let logs_path_sb_err = logs_path.clone();
-        thread::spawn(move || {
+        let sb_stderr_thread = thread::spawn(move || {
             let reader = BufReader::new(sb_stderr);
-            for line in reader.lines().filter_map(Result::ok) {
-                let _ = append_log(&logs_path_sb_err, "error", &format!("[Sing-box Error] {}", line));
+            for line in reader.lines() {
+                match line {
+                    Ok(l) if !l.trim().is_empty() => {
+                        let _ = append_log(&logs_path_sb_err, "error", &format!("[Sing-box] {}", l));
+                    }
+                    Err(e) => {
+                        let _ = append_log(&logs_path_sb_err, "warn", &format!("[Sing-box] stderr read error: {}", e));
+                        break;
+                    }
+                    _ => {}
+                }
             }
         });
 
-        // Watch Sing-box exit
+        // Brief health check for sing-box
+        thread::sleep(std::time::Duration::from_millis(500));
+        match sb_child.try_wait() {
+            Ok(Some(status)) => {
+                let _ = sb_stdout_thread.join();
+                let _ = sb_stderr_thread.join();
+                let err_msg = format!("Sing-box exited immediately with {}", status);
+                let _ = append_log(&logs_path, "error", &err_msg);
+                // Kill xray since TUN mode can't work without sing-box
+                let _ = append_log(&logs_path, "info", &format!("Killing Xray (PID {}) because Sing-box failed to start", xray_pid));
+                kill_process(xray_pid);
+                use tauri::Emitter;
+                let _ = app.emit("vpn-disconnected", ());
+                return Err(err_msg);
+            }
+            Ok(None) => {
+                let _ = append_log(&logs_path, "info", "Sing-box process is running after health check");
+            }
+            Err(e) => {
+                let _ = append_log(&logs_path, "warn", &format!("Could not check Sing-box status: {}", e));
+            }
+        }
+
+        // Store sing-box PID so the xray watcher can kill it if xray exits first
+        *sing_box_pid.lock().unwrap() = Some(sb_child.id());
+
+        // Watch Sing-box exit in background — kill xray if sing-box exits first
         let app_h_sb = app.clone();
         let logs_p_sb_exit = logs_path.clone();
+        let xray_pid_for_sb = xray_pid;
         thread::spawn(move || {
-            let _ = sb_child.wait();
-            let _ = append_log(&logs_p_sb_exit, "warn", "Sing-box process has exited.");
+            let exit_status = sb_child.wait();
+            let _ = sb_stdout_thread.join();
+            let _ = sb_stderr_thread.join();
+            match exit_status {
+                Ok(status) => {
+                    let _ = append_log(&logs_p_sb_exit, "warn", &format!("Sing-box process exited with {}", status));
+                }
+                Err(e) => {
+                    let _ = append_log(&logs_p_sb_exit, "error", &format!("Failed to wait on Sing-box process: {}", e));
+                }
+            }
+            // Kill xray since sing-box (TUN routing) is dead
+            let _ = append_log(&logs_p_sb_exit, "info", &format!("Sing-box exited — killing companion Xray (PID {})", xray_pid_for_sb));
+            kill_process(xray_pid_for_sb);
             use tauri::Emitter;
             let _ = app_h_sb.emit("vpn-disconnected", ());
         });

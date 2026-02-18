@@ -110,8 +110,13 @@ class BaseProtocol:
         """Remove a client from this protocol."""
         raise NotImplementedError
 
-    async def get_client_config(self, username: str, server_ip: str, protocol_data: dict) -> dict:
-        """Get client connection config for this protocol."""
+    async def get_client_config(self, username: str, server_ip: str, protocol_data: dict, config_id: str = None) -> dict:
+        """Get client connection config for this protocol.
+        
+        Args:
+            config_id: Optional specific config/tag ID to filter to (e.g. 'vless-tcp-xtls').
+                        If None, returns all sub-protocols.
+        """
         return {}
 
     # ── Helpers ──

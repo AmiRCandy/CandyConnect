@@ -198,7 +198,7 @@ class IKEv2Protocol(BaseProtocol):
         await self._run_cmd(f"sudo rm -f {self.IPSEC_DIR}/{username}.p12", check=False)
         await self._run_cmd(f"sudo sed -i '/{username}/d' /etc/ipsec.secrets", check=False)
 
-    async def get_client_config(self, username: str, server_ip: str, protocol_data: dict) -> dict:
+    async def get_client_config(self, username: str, server_ip: str, protocol_data: dict, config_id: str = None) -> dict:
         config = await get_core_config("ikev2")
         if not config:
             return {}

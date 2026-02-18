@@ -91,10 +91,22 @@ const ProxyPage: React.FC<ProxyPageProps> = ({ onBack }) => {
     try {
       const updatedBackendSettings: Settings = {
         ...backendSettings,
+        proxyMode: newSettings.mode === 'TUN' ? 'tun' : 'proxy',
+        proxyType: newSettings.proxyType === 'HTTP' ? 'http' : 'socks',
+        proxyAddress: newSettings.ip,
         proxyHost: newSettings.ip,
         proxyPort: parseInt(newSettings.port) || 1080,
-      } as any;
-
+        proxyUsername: newSettings.username,
+        proxyPassword: newSettings.password,
+        tunInet4CIDR: newSettings.tunInet4CIDR,
+        tunInet6CIDR: newSettings.tunInet6CIDR,
+        mtu: newSettings.mtu,
+        autoRoute: newSettings.autoRoute,
+        strictRoute: newSettings.strictRoute,
+        sniff: newSettings.sniff,
+        stack: newSettings.stack,
+        dnsHijack: newSettings.dnsHijack,
+      };
 
       await SaveSettings(updatedBackendSettings);
       setBackendSettings(updatedBackendSettings);

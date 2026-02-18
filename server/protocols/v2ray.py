@@ -175,7 +175,7 @@ class V2RayProtocol(BaseProtocol):
         except json.JSONDecodeError:
             pass
 
-    async def get_client_config(self, username: str, server_ip: str, protocol_data: dict) -> dict:
+    async def get_client_config(self, username: str, server_ip: str, protocol_data: dict, config_id: str = None) -> dict:
         client_uuid = protocol_data.get("uuid") or str(uuid.uuid5(uuid.NAMESPACE_DNS, username))
         config = await get_core_config("v2ray")
         if not config:
@@ -193,6 +193,27 @@ class V2RayProtocol(BaseProtocol):
                 stream = inbound.get("streamSettings", {})
                 network = stream.get("network", "tcp")
                 security = stream.get("security", "none")
+                inbound_tag = inbound.get("tag", f"{proto}-{network}")
+
+                # If a specific config_id was requested, filter to only the matching inbound
+                if config_id:
+                    # Match by tag directly, or by constructed name patterns
+                    # e.g. config_id="vless-tcp-xtls" should match tag="vless-tcp-xtls"
+                    # also handle cases like config_id="v2ray-vless-tcp" matching tag="vless-tcp"
+                    config_id_lower = config_id.lower()
+                    tag_lower = inbound_tag.lower()
+                    
+                    # Strip "v2ray-" prefix if present in config_id
+                    normalized_id = config_id_lower
+                    if normalized_id.startswith("v2ray-"):
+                        normalized_id = normalized_id[6:]
+                    
+                    # Check if this inbound matches the requested config
+                    if (tag_lower != config_id_lower and 
+                        tag_lower != normalized_id and
+                        not config_id_lower.startswith(tag_lower) and
+                        not tag_lower.startswith(normalized_id)):
+                        continue
                 
                 # Build client outbound
                 outbound = {
@@ -205,7 +226,7 @@ class V2RayProtocol(BaseProtocol):
                         }]
                     },
                     "streamSettings": stream, # Copy stream settings (network, security, tlsSettings)
-                    "tag": f"proxy-{proto}-{port}"
+                    "tag": "proxy"
                 }
 
                 # Protocol specific adjustments
@@ -229,10 +250,19 @@ class V2RayProtocol(BaseProtocol):
                     pass
 
                 outbounds.append(outbound)
+                
+                # If filtering by config_id, we found our match — stop looking
+                if config_id:
+                    break
         except json.JSONDecodeError:
             pass
 
+        # If config_id was specified but nothing matched, return empty
+        if config_id and not outbounds:
+            return {}
+
         # Create a full Xray client config structure
+        # When a specific config is selected, use only that single outbound
         client_json = {
             "log": {"loglevel": "warning"},
             "inbounds": [

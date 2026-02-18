@@ -552,14 +552,19 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
 
     const { invoke } = await import('@tauri-apps/api/core');
 
-    // 2. Prepare connection mode
-    const mode = _settings.proxyMode === 'tun' ? 'tun' : 'proxy';
+    // 2. Prepare connection mode — reload latest settings to ensure we use the current proxyMode
+    const currentSettings = await LoadSettings();
+    const mode = currentSettings.proxyMode === 'tun' ? 'tun' : 'proxy';
     addLog('info', `Engine mode: ${mode.toUpperCase()}`);
 
     // 3. Start the engine in the background via Rust
     // The Rust command saves the file and spawns the process
+    // Ensure config_json is a JSON string — avoid double-serialization
+    const configJsonStr = typeof configData.config_json === 'string'
+      ? configData.config_json
+      : JSON.stringify(configData.config_json);
     await invoke('start_vpn', {
-      configJson: JSON.stringify(configData.config_json),
+      configJson: configJsonStr,
       mode: mode,
     });
 
@@ -582,10 +587,12 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
     addLog('info', `Connected successfully via ${configId}`);
 
   } catch (error: any) {
-    addLog('error', `Connection failed: ${error.message}`);
+    // Tauri invoke errors are strings, not Error objects
+    const errMsg = typeof error === 'string' ? error : (error?.message || String(error));
+    addLog('error', `Connection failed: ${errMsg}`);
     _isConnected = false;
     _connectedProtocol = null;
-    throw error;
+    throw new Error(errMsg);
   }
 };
 
@@ -688,10 +695,30 @@ export const PingProtocol = async (protocolId: string): Promise<PingResult> => {
   return PingConfig(protocolId);
 };
 
-export const LoadSettings = async (): Promise<Settings> => ({ ..._settings });
+export const LoadSettings = async (): Promise<Settings> => {
+  // Try to load persisted settings from file storage first
+  try {
+    const { readSettings } = await import('./fileStorage');
+    const fileSettings = await readSettings();
+    // If file has data, merge it into in-memory settings (file takes priority)
+    if (fileSettings && Object.keys(fileSettings).length > 0) {
+      _settings = { ..._settings, ...fileSettings };
+    }
+  } catch {
+    // fileStorage not available (e.g. not in Tauri environment), use in-memory
+  }
+  return { ..._settings };
+};
 
 export const SaveSettings = async (newSettings: Settings): Promise<void> => {
   _settings = { ..._settings, ...newSettings };
+  // Persist to file storage so settings survive app restarts
+  try {
+    const { writeSettings } = await import('./fileStorage');
+    await writeSettings(_settings);
+  } catch {
+    // fileStorage not available, settings stay in-memory only
+  }
 };
 
 export const GetNetworkSpeed = async (): Promise<NetworkSpeed> => {

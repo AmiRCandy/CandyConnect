@@ -111,7 +111,7 @@ class L2TPProtocol(BaseProtocol):
     async def remove_client(self, username: str, protocol_data: dict):
         await self._run_cmd(f"sudo sed -i '/^{username} /d' /etc/ppp/chap-secrets", check=False)
 
-    async def get_client_config(self, username: str, server_ip: str, protocol_data: dict) -> dict:
+    async def get_client_config(self, username: str, server_ip: str, protocol_data: dict, config_id: str = None) -> dict:
         config = await get_core_config("l2tp")
         if not config:
             return {}

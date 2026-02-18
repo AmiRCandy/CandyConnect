@@ -112,9 +112,9 @@ const LogsPage: React.FC<LogsPageProps> = ({ onBack }) => {
   };
 
   return (
-    <div className={`space-y-6 ${isRTL ? 'text-right' : 'text-left'} max-h-96 min-h-[500px] overflow-y-auto pr-4 flex flex-col`}>
+    <div className={`${isRTL ? 'text-right' : 'text-left'} flex flex-col h-full min-h-0`}>
       {/* Header */}
-      <div className={`flex items-center justify-between ${isRTL ? 'flex-row-reverse' : ''}`}>
+      <div className={`flex items-center justify-between mb-4 flex-shrink-0 ${isRTL ? 'flex-row-reverse' : ''}`}>
         <div className={`flex items-center ${isRTL ? 'flex-row-reverse space-x-reverse space-x-4' : 'space-x-4'}`}>
           <button
             onClick={onBack}
@@ -127,7 +127,7 @@ const LogsPage: React.FC<LogsPageProps> = ({ onBack }) => {
       </div>
 
       {/* Controls */}
-      <div className="bg-white dark:bg-slate-800 rounded-lg p-3 shadow-sm border border-slate-200/50 dark:border-slate-700/50">
+      <div className="bg-white dark:bg-slate-800 rounded-lg p-3 shadow-sm border border-slate-200/50 dark:border-slate-700/50 flex-shrink-0 mb-4">
         <div className={`flex items-center justify-between ${isRTL ? 'flex-row-reverse' : ''}`}>
           <div className={`flex items-center space-x-3 ${isRTL ? 'flex-row-reverse space-x-reverse' : ''}`}>
             {/* Filter */}
@@ -162,9 +162,9 @@ const LogsPage: React.FC<LogsPageProps> = ({ onBack }) => {
       </div>
 
       {/* Terminal */}
-      <div className="flex-1 bg-black rounded-lg border border-slate-700 overflow-hidden shadow-inner">
+      <div className="flex-1 min-h-0 bg-black rounded-lg border border-slate-700 overflow-hidden shadow-inner flex flex-col mb-4">
         {/* Terminal Header */}
-        <div className="bg-slate-800 px-4 py-2 border-b border-slate-700">
+        <div className="bg-slate-800 px-4 py-2 border-b border-slate-700 flex-shrink-0">
           <div className="flex items-center space-x-2">
             <div className="flex space-x-1.5">
               <div className="w-3 h-3 rounded-full bg-red-500"></div>
@@ -181,7 +181,7 @@ const LogsPage: React.FC<LogsPageProps> = ({ onBack }) => {
         {/* Terminal Content */}
         <div
           ref={terminalRef}
-          className="h-80 overflow-y-auto p-4 font-mono bg-black scrollbar-thin scrollbar-track-slate-800 scrollbar-thumb-slate-600"
+          className="flex-1 min-h-0 overflow-y-auto p-4 font-mono bg-black scrollbar-thin scrollbar-track-slate-800 scrollbar-thumb-slate-600"
         >
           {filteredLogs.length === 0 ? (
             <div className="text-slate-500 text-center py-8">
@@ -208,7 +208,7 @@ const LogsPage: React.FC<LogsPageProps> = ({ onBack }) => {
       </div>
 
       {/* Status Bar */}
-      <div className="bg-slate-800 rounded-lg px-4 py-2 text-xs text-slate-400 font-mono">
+      <div className="bg-slate-800 rounded-lg px-4 py-2 text-xs text-slate-400 font-mono flex-shrink-0">
         <div className={`flex items-center justify-between ${isRTL ? 'flex-row-reverse' : ''}`}>
           <span>{filteredLogs.length} entries</span>
           <span>Last updated: {logs.length > 0 ? formatTimestamp(logs[logs.length - 1].timestamp) : 'Never'}</span>

@@ -214,7 +214,7 @@ class WireGuardProtocol(BaseProtocol):
         name = "wg0"
         await self._run_cmd(f"sudo wg set {name} peer {pubkey} remove", check=False)
 
-    async def get_client_config(self, username: str, server_ip: str, protocol_data: dict) -> dict:
+    async def get_client_config(self, username: str, server_ip: str, protocol_data: dict, config_id: str = None) -> dict:
         config = await get_core_config("wireguard")
         if not config:
             return {}

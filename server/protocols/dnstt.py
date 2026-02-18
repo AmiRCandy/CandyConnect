@@ -225,7 +225,7 @@ class DNSTTProtocol(BaseProtocol):
         ssh_user = protocol_data.get("ssh_username") or f"dnstt_{username}"
         await self._run_cmd(f"sudo userdel -r {ssh_user} 2>/dev/null || true", check=False)
 
-    async def get_client_config(self, username: str, server_ip: str, protocol_data: dict) -> dict:
+    async def get_client_config(self, username: str, server_ip: str, protocol_data: dict, config_id: str = None) -> dict:
         config = await get_core_config("dnstt")
         if not config:
             return {}

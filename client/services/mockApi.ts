@@ -536,11 +536,28 @@ export const PingProtocol = async (protocolId: string): Promise<PingResult> => {
 };
 
 export const LoadSettings = async (): Promise<Settings> => {
+  // Try to load persisted settings from file storage first
+  try {
+    const { readSettings } = await import('./fileStorage');
+    const fileSettings = await readSettings();
+    if (fileSettings && Object.keys(fileSettings).length > 0) {
+      settings = { ...settings, ...fileSettings };
+    }
+  } catch {
+    // fileStorage not available (e.g. not in Tauri environment), use in-memory
+  }
   return { ...settings };
 };
 
 export const SaveSettings = async (newSettings: Settings): Promise<void> => {
   settings = { ...settings, ...newSettings };
+  // Persist to file storage so settings survive app restarts
+  try {
+    const { writeSettings } = await import('./fileStorage');
+    await writeSettings(settings);
+  } catch {
+    // fileStorage not available, settings stay in-memory only
+  }
 };
 
 export const GetNetworkSpeed = async (): Promise<NetworkSpeed> => {

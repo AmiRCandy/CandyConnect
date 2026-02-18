@@ -410,7 +410,10 @@ async def get_protocol_config(protocol: str, payload=Depends(auth.require_client
         raise HTTPException(status_code=404, detail=f"Protocol manager for {core_protocol} not found")
         
     pdata = (client.get("protocol_data", {}) or {}).get(core_protocol, {})
-    config = await p_mgr.get_client_config(client["username"], server_ip, pdata)
+    config = await p_mgr.get_client_config(client["username"], server_ip, pdata, config_id=protocol)
+    
+    if not config:
+        raise HTTPException(status_code=404, detail=f"No matching config found for '{protocol}'")
     
     return {"success": True, "data": config}
 
