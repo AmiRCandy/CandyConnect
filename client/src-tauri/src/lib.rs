@@ -1,7 +1,6 @@
 mod sing_box_helper;
 
 use std::fs;
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tauri::{
     menu::{Menu, MenuItem},
@@ -680,7 +679,7 @@ async fn start_openvpn(
     ));
 
     // Resolve openvpn binary: try bundled first, then system
-    let _resolve_tool = |base: &std::path::Path, rel_path: &str| -> std::path::PathBuf {
+    let resolve_tool = |base: &std::path::Path, rel_path: &str| -> std::path::PathBuf {
         let p1 = base.join(rel_path);
         if p1.exists() { return p1; }
         let p2 = base.join("resources").join(rel_path);
