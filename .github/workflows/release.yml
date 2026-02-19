@@ -26,15 +26,12 @@ jobs:
         id: get_version
         run: |
           if [ "${{ github.event_name }}" = "push" ]; then
-            # Triggered by tag push — use the tag directly
             TAG="${GITHUB_REF#refs/tags/}"
             VERSION="${TAG#v}"
           elif [ -n "${{ github.event.inputs.version }}" ]; then
-            # Manual trigger with version specified
             VERSION="${{ github.event.inputs.version }}"
             TAG="v${VERSION}"
           else
-            # Manual trigger without version — read from tauri.conf.json
             VERSION=$(grep -oP '"version":\s*"\K[^"]+' client/src-tauri/tauri.conf.json)
             TAG="v${VERSION}"
           fi
@@ -53,117 +50,170 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
-      - name: setup node
+
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: install Rust stable
+
+      - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
-      - name: install dependencies (ubuntu only)
+
+      - name: Install dependencies (Ubuntu only)
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
-      - name: install frontend dependencies
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf unzip
+
+      - name: Install frontend dependencies
         run: npm install
         working-directory: ./client
-      - name: setup go
+
+      - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: "stable"
-      - name: build dnstt
+
+      - name: Build dnstt-client
+        shell: bash
         run: |
           git clone https://www.bamsoftware.com/git/dnstt.git
           cd dnstt/dnstt-client
-          go build -ldflags="-s -w" -o ../../dnstt-client${{ matrix.platform == 'windows-latest' && '.exe' || '' }}
+          if [ "${{ matrix.platform }}" == "windows-latest" ]; then
+            go build -ldflags="-s -w" -o ../../dnstt-client.exe
+          else
+            go build -ldflags="-s -w" -o ../../dnstt-client
+          fi
+
+      - name: Download extra tools
         shell: bash
-      - name: download extra tools
         run: |
           mkdir -p extra-tools
 
-          # Fetch latest versions
-          XRAY_VERSION=$(curl -s https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep '"tag_name":' | head -n 1 | cut -d'"' -f4)
-          SING_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep '"tag_name":' | head -n 1 | cut -d'"' -f4 | sed 's/v//')
+          # Fetch latest versions from GitHub API
+          XRAY_VERSION=$(curl -sf https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep '"tag_name":' | head -n 1 | cut -d'"' -f4)
+          SING_VERSION=$(curl -sf https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep '"tag_name":' | head -n 1 | cut -d'"' -f4 | sed 's/^v//')
 
-          # Platform mapping
-          if [ "${{ matrix.platform }}" == "windows-latest" ]; then
+          echo "Xray version: $XRAY_VERSION"
+          echo "Sing-box version: $SING_VERSION"
+
+          # Platform/arch mapping
+          PLATFORM="${{ matrix.platform }}"
+          if [ "$PLATFORM" == "windows-latest" ]; then
             XRAY_OS="windows-64"
             SING_OS="windows-amd64"
             SING_EXT="zip"
-          elif [ "${{ matrix.platform }}" == "ubuntu-22.04" ]; then
+            BIN_SUFFIX=".exe"
+          elif [ "$PLATFORM" == "ubuntu-22.04" ]; then
             XRAY_OS="linux-64"
             SING_OS="linux-amd64"
             SING_EXT="tar.gz"
+            BIN_SUFFIX=""
           else
+            # macOS — runners are now ARM (M1), fall back to amd64 if arm64 not available
             XRAY_OS="macos-64"
-            SING_OS="darwin-amd64"
+            SING_OS="darwin-arm64"
             SING_EXT="tar.gz"
+            BIN_SUFFIX=""
           fi
 
-          # Download Xray
+          # ── Download Xray ──────────────────────────────────────────────────────────
           echo "Downloading Xray $XRAY_VERSION for $XRAY_OS"
-          curl -L "https://github.com/XTLS/Xray-core/releases/download/$XRAY_VERSION/Xray-$XRAY_OS.zip" -o xray.zip
-          unzip xray.zip -d extra-tools/xray
+          XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-${XRAY_OS}.zip"
+          curl -fSL "$XRAY_URL" -o xray.zip
+          mkdir -p extra-tools/xray
+          unzip -q xray.zip -d extra-tools/xray
 
-          # Download Sing-box
+          # ── Download Sing-box ──────────────────────────────────────────────────────
           echo "Downloading Sing-box $SING_VERSION for $SING_OS"
-          curl -L "https://github.com/SagerNet/sing-box/releases/download/v$SING_VERSION/sing-box-$SING_VERSION-$SING_OS.$SING_EXT" -o sing-box.$SING_EXT
-          mkdir -p sing-box-temp
+          SING_ARCHIVE="sing-box-${SING_VERSION}-${SING_OS}.${SING_EXT}"
+          SING_URL="https://github.com/SagerNet/sing-box/releases/download/v${SING_VERSION}/${SING_ARCHIVE}"
+          curl -fSL "$SING_URL" -o "sing-box.${SING_EXT}"
+
+          mkdir -p sing-box-temp extra-tools/sing-box
           if [ "$SING_EXT" == "zip" ]; then
-            unzip sing-box.$SING_EXT -d sing-box-temp
+            unzip -q "sing-box.${SING_EXT}" -d sing-box-temp
           else
-            tar -xzf sing-box.$SING_EXT -C sing-box-temp
+            tar -xzf "sing-box.${SING_EXT}" -C sing-box-temp
           fi
-          mkdir -p extra-tools/sing-box
-          mv sing-box-temp/sing-box-*/* extra-tools/sing-box/
+
+          # The archive extracts to a folder named sing-box-<version>-<os>/
+          # The binary (and LICENSE etc.) sit directly inside that folder.
+          SING_INNER=$(find sing-box-temp -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          if [ -n "$SING_INNER" ]; then
+            cp "$SING_INNER/sing-box${BIN_SUFFIX}" extra-tools/sing-box/
+          else
+            # Flat archive — binary is at root of extracted dir
+            cp "sing-box-temp/sing-box${BIN_SUFFIX}" extra-tools/sing-box/ 2>/dev/null || true
+          fi
           rm -rf sing-box-temp
 
-          # Download OpenVPN (Windows only - Using Choco for a reliable binary)
-          if [ "${{ matrix.platform }}" == "windows-latest" ]; then
+          # ── OpenVPN (Windows only) ─────────────────────────────────────────────────
+          if [ "$PLATFORM" == "windows-latest" ]; then
             echo "Installing OpenVPN via Chocolatey..."
-            choco install openvpn -y
+            choco install openvpn -y --no-progress
             mkdir -p extra-tools/openvpn
-            # Copy common binaries and drivers
-            cp "/c/Program Files/OpenVPN/bin/openvpn.exe" extra-tools/openvpn/
-            cp "/c/Program Files/OpenVPN/bin/openssl.exe" extra-tools/openvpn/ || true
+            cp "C:/Program Files/OpenVPN/bin/openvpn.exe" extra-tools/openvpn/ || true
+            cp "C:/Program Files/OpenVPN/bin/openssl.exe" extra-tools/openvpn/ || true
           fi
 
-          # Cleanup
-          rm -f xray.zip sing-box.$SING_EXT
-          cp dnstt-client${{ matrix.platform == 'windows-latest' && '.exe' || '' }} extra-tools/
-        shell: bash
-      - name: build tauri app
+          # ── dnstt-client ───────────────────────────────────────────────────────────
+          if [ "$PLATFORM" == "windows-latest" ]; then
+            cp dnstt-client.exe extra-tools/
+          else
+            cp dnstt-client extra-tools/
+          fi
+
+          # ── Cleanup ────────────────────────────────────────────────────────────────
+          rm -f xray.zip "sing-box.${SING_EXT}"
+
+          echo "extra-tools contents:"
+          find extra-tools -type f
+
+      - name: Build Tauri app (macOS universal)
+        if: matrix.platform == 'macos-latest'
+        run: npm run tauri build -- --target universal-apple-darwin
+        working-directory: ./client
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Tauri app (Linux / Windows)
+        if: matrix.platform != 'macos-latest'
         run: npm run tauri build -- --no-bundle
         working-directory: ./client
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: package release zip
+      - name: Package release zip
+        shell: bash
         run: |
           mkdir -p bundle
+
           if [ "${{ matrix.platform }}" == "windows-latest" ]; then
             APP_BIN="client/src-tauri/target/release/candy-connect.exe"
             ZIP_NAME="CandyConnect-${{ needs.prepare.outputs.tag_name }}-windows-x64.zip"
           elif [ "${{ matrix.platform }}" == "macos-latest" ]; then
-            APP_BIN="client/src-tauri/target/release/candy-connect"
-            ZIP_NAME="CandyConnect-${{ needs.prepare.outputs.tag_name }}-macos-x64.zip"
+            APP_BIN="client/src-tauri/target/universal-apple-darwin/release/candy-connect"
+            ZIP_NAME="CandyConnect-${{ needs.prepare.outputs.tag_name }}-macos-universal.zip"
           else
             APP_BIN="client/src-tauri/target/release/candy-connect"
             ZIP_NAME="CandyConnect-${{ needs.prepare.outputs.tag_name }}-linux-x64.zip"
           fi
+
           cp "$APP_BIN" bundle/
           cp -r extra-tools/* bundle/
+
           if [ "${{ matrix.platform }}" == "windows-latest" ]; then
             7z a "$ZIP_NAME" ./bundle/*
           else
             cd bundle && zip -r "../$ZIP_NAME" . && cd ..
           fi
-          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
-        shell: bash
 
-      - name: upload custom zip to release
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.tag_name }}
