@@ -22,7 +22,7 @@
 ## 📸 Screenshots
 
 <p align="center">
-  <img src="screenshots/dashboard.png" alt="Web Panel Dashboard" width="48%" />
+  <img src="screenshots/dashboard.png" alt="Web Panel Dashboard" />
   &nbsp;&nbsp;
   <img src="screenshots/client.png" alt="CandyConnect Desktop Client" width="48%" />
 </p>
