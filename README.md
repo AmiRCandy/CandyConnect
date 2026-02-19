@@ -474,6 +474,53 @@ Contributions are welcome! Please:
 
 ---
 
+---
+
+## 🙏 Acknowledgements & Credits
+
+CandyConnect would not exist without the incredible open-source projects that power it under the hood. Huge respect and gratitude to the teams and communities behind:
+
+---
+
+### ⚡ [Xray-core](https://github.com/XTLS/Xray-core)
+The heart of the V2Ray engine in CandyConnect. Xray is a powerful, high-performance proxy platform supporting VLESS, VMess, Trojan, Shadowsocks and more — with cutting-edge features like XTLS and Reality. The XTLS team has pushed the boundaries of what's possible in censorship circumvention.
+
+> *"Xray, Penetrates Everything."*
+
+---
+
+### 📦 [sing-box](https://github.com/SagerNet/sing-box)
+The universal proxy platform that powers CandyConnect's TUN mode on the desktop client. sing-box handles WireGuard-over-TUN, DNS routing, and transparent proxying with remarkable efficiency. A masterpiece of modern network engineering.
+
+> *"The universal proxy platform."*
+
+---
+
+### 🔒 [WireGuard](https://www.wireguard.com/)
+The modern VPN protocol that redefined simplicity and security. WireGuard's clean codebase (~4,000 lines vs OpenVPN's ~100,000) and state-of-the-art cryptography (ChaCha20, Poly1305, Curve25519) make it the gold standard for fast, secure tunneling.
+
+> *"WireGuard: fast, modern, secure VPN tunnel."* — Jason A. Donenfeld
+
+---
+
+### 🛡️ [OpenVPN](https://openvpn.net/)
+The battle-tested VPN solution that has been securing networks for over two decades. OpenVPN's flexibility, wide platform support, and robust PKI infrastructure make it indispensable for enterprise and personal use alike.
+
+> *"The world's most widely deployed open source VPN."*
+
+---
+
+### 🌐 [dnstt](https://www.bamsoftware.com/software/dnstt/)
+The ingenious DNS tunnel tool by Dan Ayers (bamsoftware) that makes it possible to tunnel traffic over DNS queries — one of the few techniques that bypasses even the most aggressive firewalls. A remarkable piece of engineering for those who need it most.
+
+> *"A DNS tunnel that actually works."*
+
+---
+
+*These projects are maintained by talented developers who give their time and expertise to the community for free. Please consider supporting them directly.*
+
+---
+
 <p align="center">
   Made with 🍬 by <a href="https://github.com/AmiRCandy">AmiRCandy</a>
 </p>
