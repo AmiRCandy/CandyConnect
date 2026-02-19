@@ -89,18 +89,38 @@ jobs:
 
       - name: Download extra tools
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
+
           mkdir -p extra-tools
 
-          # Fetch latest versions from GitHub API
-          XRAY_VERSION=$(curl -sf https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep '"tag_name":' | head -n 1 | cut -d'"' -f4)
-          SING_VERSION=$(curl -sf https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep '"tag_name":' | head -n 1 | cut -d'"' -f4 | sed 's/^v//')
+          PLATFORM="${{ matrix.platform }}"
 
-          echo "Xray version: $XRAY_VERSION"
+          # ── Resolve latest versions (authenticated to avoid rate-limits) ───────────
+          echo "Fetching latest Xray version..."
+          XRAY_VERSION=$(curl -sf -H "Authorization: Bearer ${GH_TOKEN}" \
+            https://api.github.com/repos/XTLS/Xray-core/releases/latest \
+            | grep '"tag_name":' | head -n 1 | cut -d'"' -f4)
+          if [ -z "$XRAY_VERSION" ]; then
+            echo "WARNING: Could not fetch Xray version from API, using fallback"
+            XRAY_VERSION="v25.1.1"
+          fi
+
+          echo "Fetching latest Sing-box version..."
+          SING_VERSION=$(curl -sf -H "Authorization: Bearer ${GH_TOKEN}" \
+            https://api.github.com/repos/SagerNet/sing-box/releases/latest \
+            | grep '"tag_name":' | head -n 1 | cut -d'"' -f4 | sed 's/^v//')
+          if [ -z "$SING_VERSION" ]; then
+            echo "WARNING: Could not fetch Sing-box version from API, using fallback"
+            SING_VERSION="1.11.0"
+          fi
+
+          echo "Xray version : $XRAY_VERSION"
           echo "Sing-box version: $SING_VERSION"
 
-          # Platform/arch mapping
-          PLATFORM="${{ matrix.platform }}"
+          # ── Platform/arch mapping ──────────────────────────────────────────────────
           if [ "$PLATFORM" == "windows-latest" ]; then
             XRAY_OS="windows-64"
             SING_OS="windows-amd64"
@@ -112,7 +132,7 @@ jobs:
             SING_EXT="tar.gz"
             BIN_SUFFIX=""
           else
-            # macOS — runners are now ARM (M1), fall back to amd64 if arm64 not available
+            # macOS runner — try arm64 first (M1/M2 runners), fall back to amd64
             XRAY_OS="macos-64"
             SING_OS="darwin-arm64"
             SING_EXT="tar.gz"
@@ -120,17 +140,37 @@ jobs:
           fi
 
           # ── Download Xray ──────────────────────────────────────────────────────────
-          echo "Downloading Xray $XRAY_VERSION for $XRAY_OS"
+          echo "Downloading Xray $XRAY_VERSION for $XRAY_OS ..."
           XRAY_URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-${XRAY_OS}.zip"
-          curl -fSL "$XRAY_URL" -o xray.zip
-          mkdir -p extra-tools/xray
-          unzip -q xray.zip -d extra-tools/xray
+          echo "URL: $XRAY_URL"
+          if curl -fSL --retry 3 --retry-delay 5 "$XRAY_URL" -o xray.zip; then
+            mkdir -p extra-tools/xray
+            unzip -q xray.zip -d extra-tools/xray
+            echo "Xray downloaded OK"
+          else
+            echo "ERROR: Failed to download Xray from $XRAY_URL"
+            exit 1
+          fi
 
           # ── Download Sing-box ──────────────────────────────────────────────────────
-          echo "Downloading Sing-box $SING_VERSION for $SING_OS"
+          echo "Downloading Sing-box $SING_VERSION for $SING_OS ..."
           SING_ARCHIVE="sing-box-${SING_VERSION}-${SING_OS}.${SING_EXT}"
           SING_URL="https://github.com/SagerNet/sing-box/releases/download/v${SING_VERSION}/${SING_ARCHIVE}"
-          curl -fSL "$SING_URL" -o "sing-box.${SING_EXT}"
+          echo "URL: $SING_URL"
+
+          # On macOS try arm64 first, fall back to amd64
+          if ! curl -fSL --retry 3 --retry-delay 5 "$SING_URL" -o "sing-box.${SING_EXT}" 2>/dev/null; then
+            if [ "$PLATFORM" == "macos-latest" ]; then
+              echo "arm64 not found, trying amd64..."
+              SING_OS="darwin-amd64"
+              SING_ARCHIVE="sing-box-${SING_VERSION}-${SING_OS}.${SING_EXT}"
+              SING_URL="https://github.com/SagerNet/sing-box/releases/download/v${SING_VERSION}/${SING_ARCHIVE}"
+              curl -fSL --retry 3 --retry-delay 5 "$SING_URL" -o "sing-box.${SING_EXT}"
+            else
+              echo "ERROR: Failed to download Sing-box from $SING_URL"
+              exit 1
+            fi
+          fi
 
           mkdir -p sing-box-temp extra-tools/sing-box
           if [ "$SING_EXT" == "zip" ]; then
@@ -139,16 +179,21 @@ jobs:
             tar -xzf "sing-box.${SING_EXT}" -C sing-box-temp
           fi
 
-          # The archive extracts to a folder named sing-box-<version>-<os>/
-          # The binary (and LICENSE etc.) sit directly inside that folder.
+          # Archive extracts to: sing-box-<version>-<os>/ with binary directly inside
           SING_INNER=$(find sing-box-temp -mindepth 1 -maxdepth 1 -type d | head -n 1)
           if [ -n "$SING_INNER" ]; then
+            echo "Extracting from inner dir: $SING_INNER"
             cp "$SING_INNER/sing-box${BIN_SUFFIX}" extra-tools/sing-box/
           else
-            # Flat archive — binary is at root of extracted dir
-            cp "sing-box-temp/sing-box${BIN_SUFFIX}" extra-tools/sing-box/ 2>/dev/null || true
+            echo "Flat archive, copying from root of extracted dir"
+            cp "sing-box-temp/sing-box${BIN_SUFFIX}" extra-tools/sing-box/ 2>/dev/null || {
+              echo "ERROR: Could not find sing-box binary in archive"
+              find sing-box-temp
+              exit 1
+            }
           fi
           rm -rf sing-box-temp
+          echo "Sing-box downloaded OK"
 
           # ── OpenVPN (Windows only) ─────────────────────────────────────────────────
           if [ "$PLATFORM" == "windows-latest" ]; then
@@ -166,10 +211,9 @@ jobs:
             cp dnstt-client extra-tools/
           fi
 
-          # ── Cleanup ────────────────────────────────────────────────────────────────
+          # ── Cleanup & summary ──────────────────────────────────────────────────────
           rm -f xray.zip "sing-box.${SING_EXT}"
-
-          echo "extra-tools contents:"
+          echo "✅ extra-tools contents:"
           find extra-tools -type f
 
       - name: Build Tauri app (macOS universal)
