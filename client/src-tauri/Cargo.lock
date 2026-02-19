@@ -314,7 +314,7 @@ dependencies = [
 
 [[package]]
 name = "candy-connect"
-version = "1.0.2"
+version = "1.1.1"
 dependencies = [
  "chrono",
  "libc",

@@ -93,11 +93,47 @@ class L2TPProtocol(BaseProtocol):
         return ""
 
     async def get_active_connections(self) -> int:
-        rc, out, _ = await self._run_cmd("ss -tnp sport = :1701 | tail -n +2 | wc -l", check=False)
+        # L2TP/IPSec uses PPP interfaces (ppp0, ppp1, ...) for each connected client.
+        # Count the number of pppX interfaces that are currently UP.
+        rc, out, _ = await self._run_cmd(
+            "ip link show | grep -c '^[0-9]*: ppp'",
+            check=False,
+        )
         try:
-            return int(out.strip())
+            count = int(out.strip())
+            return count
         except ValueError:
+            pass
+        # Fallback: count via /proc/net/dev
+        try:
+            with open("/proc/net/dev") as f:
+                content = f.read()
+            return sum(1 for line in content.splitlines() if line.strip().startswith("ppp"))
+        except Exception:
             return 0
+
+    async def get_traffic(self) -> dict:
+        """Sum RX/TX bytes across all pppX interfaces (one per L2TP client)."""
+        total_rx = 0
+        total_tx = 0
+        try:
+            with open("/proc/net/dev") as f:
+                content = f.read()
+            for line in content.splitlines():
+                line = line.strip()
+                if not line.startswith("ppp"):
+                    continue
+                iface, rest = line.split(":", 1)
+                fields = rest.split()
+                if len(fields) >= 9:
+                    try:
+                        total_rx += int(fields[0])
+                        total_tx += int(fields[8])
+                    except (ValueError, IndexError):
+                        pass
+        except Exception:
+            pass
+        return {"in": total_rx, "out": total_tx}
 
     async def add_client(self, username: str, client_data: dict) -> dict:
         password = client_data.get("password", username)

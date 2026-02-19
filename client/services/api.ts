@@ -153,6 +153,11 @@ let _sessionDownload = 0;
 let _sessionUpload = 0;
 let _cachedConfigs: VPNConfig[] = [];
 
+// Track the last reported traffic to server so we only report deltas
+let _lastReportedDownload = 0;
+let _lastReportedUpload = 0;
+let _trafficReportCounter = 0;
+
 let _settings: Settings = {
   autoConnect: false,
   launchAtStartup: false,
@@ -184,6 +189,29 @@ let _settings: Settings = {
 let _logs: Array<{ timestamp: string; level: string; message: string }> = [
   { timestamp: new Date().toISOString(), level: 'info', message: 'CandyConnect client initialized' },
 ];
+
+// ── Heartbeat ──
+let _heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+function _startHeartbeat(protocol: string) {
+  _stopHeartbeat();
+  _heartbeatTimer = setInterval(async () => {
+    if (!_isConnected || !_token) { _stopHeartbeat(); return; }
+    try {
+      await apiRequest('POST', '/heartbeat', {
+        protocol,
+        ip: _serverInfo?.ip || '0.0.0.0',
+      });
+    } catch { /* server unreachable — keep trying */ }
+  }, 60_000); // every 60 seconds
+}
+
+function _stopHeartbeat() {
+  if (_heartbeatTimer !== null) {
+    clearInterval(_heartbeatTimer);
+    _heartbeatTimer = null;
+  }
+}
 
 // ── HTTP Helper ──
 
@@ -378,9 +406,15 @@ export const DisconnectAll = async (): Promise<void> => {
     const { invoke } = await import('@tauri-apps/api/core');
     await invoke('stop_vpn');
 
-    // Optional: Notify server
+    // Notify server of disconnect so it can mark client offline immediately
     if (_connectedProtocol) {
-      await apiRequest('POST', '/disconnect', { protocol: _connectedProtocol });
+      try {
+        await apiRequest('POST', '/connect', {
+          protocol: _connectedProtocol,
+          event: 'disconnect',
+          ip: _serverInfo?.ip || '0.0.0.0',
+        });
+      } catch { }
     }
   } catch (e) {
     console.error('Disconnect error:', e);
@@ -388,6 +422,11 @@ export const DisconnectAll = async (): Promise<void> => {
   _isConnected = false;
   _connectedProtocol = null;
   _connectionStartTime = null;
+  _lastReportedDownload = 0;
+  _lastReportedUpload = 0;
+  _trafficReportCounter = 0;
+  // Stop heartbeat if running
+  _stopHeartbeat();
   addLog('info', 'All connections stopped');
 };
 
@@ -403,10 +442,22 @@ export const GetConnectionStatus = async (): Promise<ConnectionStatus> => ({
 export const handleVpnDisconnected = (): void => {
   if (_isConnected) {
     addLog('warn', 'VPN process exited unexpectedly — disconnected');
+    // Tell server client went offline
+    if (_connectedProtocol) {
+      apiRequest('POST', '/connect', {
+        protocol: _connectedProtocol,
+        event: 'disconnect',
+        ip: _serverInfo?.ip || '0.0.0.0',
+      }).catch(() => { });
+    }
   }
+  _stopHeartbeat();
   _isConnected = false;
   _connectedProtocol = null;
   _connectionStartTime = null;
+  _lastReportedDownload = 0;
+  _lastReportedUpload = 0;
+  _trafficReportCounter = 0;
 };
 
 // Sets up a Tauri event listener for vpn-disconnected and returns an unlisten function
@@ -564,6 +615,7 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
     const isL2tp = configId.toLowerCase().startsWith('l2tp');
     const isIkev2 = configId.toLowerCase().startsWith('ikev2');
     const isWireguard = configId.toLowerCase().startsWith('wireguard');
+    const isOpenvpn = configId.toLowerCase().startsWith('openvpn');
 
     if (isDnstt) {
       // ── DNSTT Connection Flow ──
@@ -714,7 +766,7 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
       }
 
     } else if (isWireguard) {
-      // ── WireGuard Connection Flow (via sing-box TUN) ──
+      // ── WireGuard Connection Flow (via sing-box) ──
       let wgExtra: Record<string, any> | null = null;
       let serverIp = _serverInfo?.ip || '0.0.0.0';
 
@@ -759,7 +811,7 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
         throw new Error('WireGuard config missing required keys (private_key / peer_public_key)');
       }
 
-      addLog('info', `WireGuard: server=${serverIp}, port=${wgPort}, addresses=${localAddresses.join(',')}`);
+      addLog('info', `WireGuard: server=${serverIp}, port=${wgPort}, mode=${mode}, addresses=${localAddresses.join(',')}`);
 
       await invoke('start_wireguard', {
         server: serverIp,
@@ -768,6 +820,56 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
         peerPublicKey: peerPublicKey,
         preSharedKey: preSharedKey,
         localAddresses: localAddresses,
+        mode: mode,
+      });
+
+    } else if (isOpenvpn) {
+      // ── OpenVPN Connection Flow ──
+      let ovpnExtra: Record<string, any> | null = null;
+      let serverIp = _serverInfo?.ip || '0.0.0.0';
+
+      // Try cached configs first
+      const cachedConfig = _cachedConfigs.find(c => c.id === configId);
+      if (cachedConfig?.extraData) {
+        ovpnExtra = cachedConfig.extraData;
+        serverIp = cachedConfig.address || serverIp;
+      }
+
+      // If not cached, fetch from server
+      if (!ovpnExtra || !ovpnExtra.ovpn_config) {
+        try {
+          const configData = await apiRequest<any>('GET', `/configs/${encodeURIComponent(configId)}`);
+          ovpnExtra = configData?.extra_data || configData?.extraData || configData;
+          serverIp = configData?.server || configData?.address || serverIp;
+        } catch {
+          const allConfigs = await LoadConfigs();
+          const found = allConfigs.find(c => c.id === configId);
+          if (found?.extraData) {
+            ovpnExtra = found.extraData;
+            serverIp = found.address || serverIp;
+          }
+        }
+      }
+
+      if (!ovpnExtra) {
+        throw new Error('Could not retrieve OpenVPN configuration data from server');
+      }
+
+      const ovpnConfig = ovpnExtra.ovpn_config || '';
+      if (!ovpnConfig) {
+        throw new Error('OpenVPN config is empty — server may not have certificates set up yet');
+      }
+
+      const savedCreds = LoadSavedCredentials();
+      const ovpnUsername = ovpnExtra.username || _account?.username || savedCreds?.username || '';
+      const ovpnPassword = savedCreds?.password || '';
+
+      addLog('info', `OpenVPN: server=${serverIp}, port=${ovpnExtra.port || 1194}, proto=${ovpnExtra.proto || 'udp'}, mode=${mode}`);
+
+      await invoke('start_openvpn', {
+        ovpnConfig: ovpnConfig,
+        username: ovpnUsername,
+        password: ovpnPassword,
         mode: mode,
       });
 
@@ -805,6 +907,18 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
     _connectionStartTime = new Date().toISOString();
     _sessionDownload = 0;
     _sessionUpload = 0;
+    _lastReportedDownload = 0;
+    _lastReportedUpload = 0;
+    _trafficReportCounter = 0;
+
+    // Reset Tauri native network session counters
+    try {
+      const { invoke } = await import('@tauri-apps/api/core');
+      await invoke('reset_network_session');
+    } catch { }
+
+    // Start periodic heartbeat so server keeps client marked online
+    _startHeartbeat(configId);
 
     addLog('info', `Connected successfully via ${configId}`);
 
@@ -948,37 +1062,84 @@ export const GetNetworkSpeed = async (): Promise<NetworkSpeed> => {
     return { countryCode: '--', downloadSpeed: 0, uploadSpeed: 0, totalDownload: _sessionDownload, totalUpload: _sessionUpload };
   }
 
-  let dl: number;
-  let ul: number;
+  let dl = 0;
+  let ul = 0;
+  let totalDl = _sessionDownload;
+  let totalUl = _sessionUpload;
+  let country = '??';
 
-  if (_settings.simulateTraffic) {
-    // 1MB/s = 1024 KB/s
-    dl = 1024;
-    ul = 256; // steady upload too
-  } else {
-    dl = Math.floor(Math.random() * 5000) + 500;
-    ul = Math.floor(Math.random() * 1000) + 100;
+  // Strategy 1: Try Tauri native OS-level network stats (real counters)
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    const stats = await invoke<{
+      downloadSpeed: number;
+      uploadSpeed: number;
+      totalDownload: number;
+      totalUpload: number;
+      countryCode: string;
+    }>('get_network_stats');
+
+    dl = stats.downloadSpeed;
+    ul = stats.uploadSpeed;
+    totalDl = stats.totalDownload;
+    totalUl = stats.totalUpload;
+    country = stats.countryCode || '??';
+
+    _sessionDownload = totalDl;
+    _sessionUpload = totalUl;
+  } catch {
+    // Strategy 2: Fall back to server-side network speed endpoint
+    try {
+      const serverStats = await apiRequest<{
+        downloadSpeed: number;
+        uploadSpeed: number;
+        totalDownload: number;
+        totalUpload: number;
+        countryCode: string;
+      }>('GET', '/network-speed');
+
+      dl = serverStats.downloadSpeed;
+      ul = serverStats.uploadSpeed;
+      totalDl = serverStats.totalDownload;
+      totalUl = serverStats.totalUpload;
+      country = serverStats.countryCode || '??';
+
+      _sessionDownload = totalDl;
+      _sessionUpload = totalUl;
+    } catch {
+      // Both failed — return zeros (no fake data)
+    }
   }
 
-  _sessionDownload += dl * 1024;
-  _sessionUpload += ul * 256;
-
-  // Report traffic to server periodically
-  if (_connectedProtocol && _token) {
-    try {
-      await apiRequest('POST', '/traffic', {
-        protocol: _connectedProtocol,
-        bytes_used: dl * 1024 + ul * 256,
-      });
-    } catch { }
+  // Report traffic to server periodically (every ~5 calls ≈ 5 seconds)
+  _trafficReportCounter++;
+  if (_connectedProtocol && _token && _trafficReportCounter >= 5) {
+    _trafficReportCounter = 0;
+    const dlDelta = _sessionDownload - _lastReportedDownload;
+    const ulDelta = _sessionUpload - _lastReportedUpload;
+    if (dlDelta > 0 || ulDelta > 0) {
+      try {
+        // Normalize protocol ID: strip trailing "-N" suffix (e.g. "wireguard-1" → "wireguard")
+        // so the server stores it under the canonical protocol key in Redis.
+        const normalizedProtocol = _connectedProtocol.replace(/-\d+$/, '');
+        await apiRequest('POST', '/traffic', {
+          protocol: normalizedProtocol,
+          bytes_sent: ulDelta,
+          bytes_received: dlDelta,
+          bytes_used: dlDelta + ulDelta,
+        });
+        _lastReportedDownload = _sessionDownload;
+        _lastReportedUpload = _sessionUpload;
+      } catch { }
+    }
   }
 
   return {
-    countryCode: 'DE',
+    countryCode: country,
     downloadSpeed: dl,
     uploadSpeed: ul,
-    totalDownload: _sessionDownload,
-    totalUpload: _sessionUpload,
+    totalDownload: totalDl,
+    totalUpload: totalUl,
   };
 };
 

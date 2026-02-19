@@ -54,6 +54,7 @@ K_LOGS = "cc:logs"                 # list (newest first)
 K_CORE_STATUS = "cc:core_status"   # hash: core_id -> json
 K_TRAFFIC = "cc:traffic"           # hash: client_id:protocol -> bytes
 K_LAST_SYNC = "cc:last_sync"
+K_HEARTBEATS = "cc:heartbeats"     # hash: client_id -> last_heartbeat_unix_ts
 
 
 def _gen_id() -> str:
@@ -431,34 +432,88 @@ async def verify_client(username: str, password: str) -> Optional[dict]:
 
 
 async def add_connection_history(client_id: str, protocol: str, event: str, ip: str):
-    """Record a connection event (connect/disconnect)."""
+    """Record a connection event (connect/disconnect/heartbeat)."""
     r = await get_redis()
     raw = await r.hget(K_CLIENTS, client_id)
     if not raw:
         return
     client = json.loads(raw)
     now = time.strftime("%Y-%m-%d %H:%M:%S")
-    
+    now_ts = int(time.time())
+
     if event == "connect":
         client["last_connected_ip"] = ip
         client["last_connected_time"] = now
         client["is_online"] = True
+        # Record heartbeat timestamp so stale-check knows the client is alive
+        await r.hset(K_HEARTBEATS, client_id, str(now_ts))
     elif event == "disconnect":
         client["is_online"] = False
-    
-    # Also handle heartbeats or just direct status
-    if event == "heartbeat":
+        # Remove heartbeat entry so status_checker won't try to revive it
+        await r.hdel(K_HEARTBEATS, client_id)
+    elif event == "heartbeat":
         client["is_online"] = True
         client["last_connected_time"] = now
-    history = client.get("connection_history", [])
-    history.insert(0, {
-        "ip": ip,
-        "time": now,
-        "protocol": protocol,
-        "event": event,
-    })
-    client["connection_history"] = history[:50]  # Keep last 50
+        await r.hset(K_HEARTBEATS, client_id, str(now_ts))
+
+    # Only append non-heartbeat events to history (keep history meaningful)
+    if event != "heartbeat":
+        history = client.get("connection_history", [])
+        history.insert(0, {
+            "ip": ip,
+            "time": now,
+            "protocol": protocol,
+            "event": event,
+        })
+        client["connection_history"] = history[:50]  # Keep last 50
+
     await r.hset(K_CLIENTS, client_id, json.dumps(client))
+
+
+async def mark_offline_stale_clients(timeout_seconds: int = 300) -> int:
+    """
+    Mark clients as offline if they haven't sent a heartbeat or connect event
+    within *timeout_seconds*. Returns the number of clients marked offline.
+    """
+    r = await get_redis()
+    now_ts = int(time.time())
+    cutoff = now_ts - timeout_seconds
+
+    # Fetch all heartbeat timestamps
+    heartbeats = await r.hgetall(K_HEARTBEATS)  # {client_id: ts_str}
+
+    # Find all clients that are currently marked online
+    raw_clients = await r.hgetall(K_CLIENTS)
+    marked = 0
+
+    for cid, raw in raw_clients.items():
+        try:
+            client = json.loads(raw)
+        except Exception:
+            continue
+
+        if not client.get("is_online"):
+            continue  # Already offline, nothing to do
+
+        last_ts_str = heartbeats.get(cid)
+        if last_ts_str is None:
+            # No heartbeat record at all — mark offline immediately
+            client["is_online"] = False
+            await r.hset(K_CLIENTS, cid, json.dumps(client))
+            marked += 1
+        else:
+            try:
+                last_ts = int(last_ts_str)
+            except ValueError:
+                last_ts = 0
+            if last_ts < cutoff:
+                # Heartbeat is stale — mark offline
+                client["is_online"] = False
+                await r.hset(K_CLIENTS, cid, json.dumps(client))
+                await r.hdel(K_HEARTBEATS, cid)
+                marked += 1
+
+    return marked
 
 async def record_client_connection(client_id: str, ip: str, protocol: str):
     """Legacy wrapper for backward compatibility."""
@@ -650,28 +705,42 @@ async def get_client_count() -> int:
 
 
 async def get_total_traffic() -> float:
-    """Sum total traffic across all clients in GB."""
+    """Sum total traffic across all clients in GB.
+
+    Only counts client-reported keys (client_id:protocol) to avoid double-counting
+    system-level snapshot keys (system:protocol) which are absolute daemon counters.
+    """
     r = await get_redis()
     total_bytes = 0.0
-    async for _, val in r.hscan_iter(K_TRAFFIC):
+    async for key, val in r.hscan_iter(K_TRAFFIC):
+        # Skip server-measured snapshots — they would double-count client traffic
+        if key.startswith("system:"):
+            continue
         try:
             total_bytes += float(val)
-        except:
+        except Exception:
             pass
     return total_bytes / (1024 ** 3)
 
 
 async def get_total_protocol_traffic(protocol: str) -> dict:
-    """Sum traffic for all clients on a protocol. Return {in: 0, out: total_bytes}."""
+    """Sum traffic for all clients on a protocol.
+
+    Keys in K_TRAFFIC are either:
+      - "<client_id>:<protocol>"  — client-reported bytes (bytes, not GB)
+      - "system:<protocol>"       — server-measured bytes (bytes, absolute snapshot)
+
+    Returns {"in": 0, "out": gb_float} where out is the total traffic in GB.
+    The dashboard calls formatTraffic(core.total_traffic.out) which expects GB.
+    """
     r = await get_redis()
-    total = 0.0
-    # Scan K_TRAFFIC hash for keys ending with :protocol
-    # Note: For large datasets, a more optimized approach would be needed
+    total_bytes = 0.0
     all_traffic = await r.hgetall(K_TRAFFIC)
     for key, val in all_traffic.items():
         if key.endswith(f":{protocol}"):
             try:
-                total += float(val)
+                total_bytes += float(val)
             except ValueError:
                 pass
-    return {"in": 0, "out": int(total)}
+    # Convert bytes → GB for dashboard display
+    return {"in": 0, "out": round(total_bytes / (1024 ** 3), 3)}

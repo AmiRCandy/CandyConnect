@@ -239,6 +239,26 @@ const ClientsPage: React.FC = () => {
                 </div>
               ))}
             </div>
+            {/* Per-Protocol Traffic */}
+            {detailClient.protocol_traffic && Object.keys(detailClient.protocol_traffic).length > 0 && (
+              <>
+                <h4 className="text-xs font-bold text-orange-500 uppercase tracking-wider pt-2">Protocol Traffic</h4>
+                <div className="grid grid-cols-2 gap-2">
+                  {Object.entries(detailClient.protocol_traffic).map(([proto, bytes]: [string, any]) => {
+                    const gb = Number(bytes) / (1024 ** 3);
+                    const mb = Number(bytes) / (1024 ** 2);
+                    const display = gb >= 1 ? `${gb.toFixed(2)} GB` : mb >= 1 ? `${mb.toFixed(1)} MB` : `${(Number(bytes) / 1024).toFixed(1)} KB`;
+                    return (
+                      <div key={proto} className="flex items-center justify-between bg-slate-50 dark:bg-slate-700/50 rounded-lg px-2.5 py-1.5 text-xs">
+                        <span className="text-slate-500 dark:text-slate-400 font-medium flex items-center gap-1">{protocolIcon(proto)} {protocolName(proto)}</span>
+                        <span className="text-orange-500 font-bold font-mono">{display}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+
             <h4 className="text-xs font-bold text-orange-500 uppercase tracking-wider pt-2">Protocol Details</h4>
             <div className="bg-slate-50 dark:bg-slate-700/30 rounded-lg p-3 text-xs space-y-2 break-all">
               {Object.entries(detailClient.protocol_data).map(([pid, data]: [string, any]) => (

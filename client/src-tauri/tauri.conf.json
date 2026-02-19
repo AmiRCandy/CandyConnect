@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "candy-connect",
-  "version": "1.0.2",
+  "version": "1.1.1",
   "identifier": "com.candyconnect.vpn",
   "build": {
     "frontendDist": "../dist",

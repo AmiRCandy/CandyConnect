@@ -40,12 +40,18 @@ async def traffic_updater():
 
 
 async def status_checker():
-    """Periodically verify core statuses match reality."""
+    """Periodically verify core statuses match reality and mark stale clients offline."""
     while True:
         try:
             if _db_ready:
                 cores = await protocol_manager.get_all_cores_info()
                 # Status verification happens inside get_all_cores_info
+
+                # Mark clients offline if they haven't heartbeated in 5 minutes
+                from database import mark_offline_stale_clients
+                marked = await mark_offline_stale_clients(timeout_seconds=300)
+                if marked > 0:
+                    logger.info(f"Marked {marked} stale client(s) as offline")
         except Exception as e:
             logger.warning(f"Status checker error: {e}")
         await asyncio.sleep(60)

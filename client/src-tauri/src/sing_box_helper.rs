@@ -116,8 +116,8 @@ impl Config {
         cfg
     }
 
-    /// 2️⃣ socks inbound + wireguard outbound
-    /// 2️⃣ socks inbound + wireguard outbound
+    /// 2️⃣ socks inbound + wireguard outbound (simple, no keys)
+    /// 2️⃣ socks inbound + wireguard outbound (simple, no keys)
     #[allow(dead_code)]
     pub fn mode_wireguard_socks(wg_endpoint: &str, wg_port: u16) -> Self {
         let mut cfg = Self::base();
@@ -129,6 +129,52 @@ impl Config {
             Outbound::dns("dns-out"),
             Outbound::block("block-out"),
         ];
+
+        cfg.route.final_ = "wg-out".into();
+        cfg
+    }
+
+    /// 2b️⃣ SOCKS inbound (proxy mode) + full WireGuard outbound with key material
+    /// Used when the user selects "Proxy" mode for WireGuard.
+    /// Sing-box listens as a SOCKS proxy on socks_host:socks_port and routes
+    /// all traffic through the WireGuard tunnel.
+    #[allow(dead_code)]
+    pub fn mode_wireguard_proxy(
+        wg_endpoint: &str,
+        wg_port: u16,
+        private_key: &str,
+        peer_public_key: &str,
+        pre_shared_key: Option<&str>,
+        local_addresses: Vec<String>,
+        socks_host: &str,
+        socks_port: u16,
+    ) -> Self {
+        let mut cfg = Self::base();
+
+        // DNS: route through WireGuard outbound (not socks-out which doesn't exist here)
+        cfg.dns.servers[0].detour = Some("wg-out".into());
+        cfg.dns.servers[1].detour = Some("direct-out".into());
+
+        cfg.inbounds = vec![Inbound::socks_inbound(socks_host, socks_port)];
+        cfg.outbounds = vec![
+            Outbound::wireguard_full(
+                "wg-out", wg_endpoint, wg_port,
+                private_key, peer_public_key, pre_shared_key,
+                local_addresses, None, None,
+                "1.1.1.1", "8.8.8.8",
+            ),
+            Outbound::direct("direct-out"),
+            Outbound::dns("dns-out"),
+            Outbound::block("block-out"),
+        ];
+
+        // Bypass the WireGuard server endpoint itself (route direct so we don't loop)
+        cfg.route.rules.push(RouteRule {
+            protocol: None,
+            outbound: Some("direct-out".into()),
+            ip_cidr: Some(vec![format!("{}/32", wg_endpoint)]),
+            domain: None,
+        });
 
         cfg.route.final_ = "wg-out".into();
         cfg

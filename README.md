@@ -1,16 +1,27 @@
 # 🍬 CandyConnect VPN
 
-A full-stack, multi-protocol VPN management platform with a server backend, web admin panel, and desktop client application.
+---
+
+> # ⚠️ FOR EDUCATIONAL PURPOSES ONLY
+> **This project is intended strictly for educational and research purposes. The authors do not condone or support any illegal, unauthorized, or unethical use of this software. Use it only on systems and networks you own or have explicit permission to operate. The authors bear no responsibility for any misuse.**
+
+---
+
+> ## 🚧 BETA SOFTWARE — WORK IN PROGRESS
+> This project is currently in **beta**. It is functional but **may contain bugs, incomplete features, and missing options**. Things may break between updates. Features will be added and improved over time. Use in production at your own risk and always keep backups.
+
+---
 
 ![License](https://img.shields.io/badge/license-MIT-orange)
 ![Version](https://img.shields.io/badge/version-1.4.2-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux-green)
+![Status](https://img.shields.io/badge/status-beta-yellow)
 
 ---
 
-## 📋 Overview
+## 🍭 Overview
 
-CandyConnect is an all-in-one VPN server management system that supports multiple VPN protocols from a single control plane:
+CandyConnect is an all-in-one VPN server management system that supports multiple VPN protocols from a single control plane, with a web admin panel and a cross-platform desktop client.
 
 | Protocol | Engine | Status |
 |---|---|---|
@@ -19,7 +30,7 @@ CandyConnect is an all-in-one VPN server management system that supports multipl
 | **OpenVPN** | OpenVPN + Easy-RSA PKI | ✅ Full |
 | **IKEv2/IPSec** | strongSwan | ✅ Full |
 | **L2TP/IPSec** | xl2tpd + strongSwan | ✅ Full |
-| **DNSTT** | DNS tunnel + SSH | ✅ Full |
+| **DNSTT** | DNS-over-UDP tunnel | ✅ Full |
 | **SlipStream** | — | 🔜 Planned |
 | **TrustTunnel** | — | 🔜 Planned |
 
@@ -29,25 +40,25 @@ CandyConnect is an all-in-one VPN server management system that supports multipl
 ┌─────────────────────────────────────────────────────┐
 │                  CandyConnect Server                │
 │                                                     │
-│  ┌──────────┐  ┌──────────┐  ┌──────────────────┐  │
-│  │ Panel API│  │Client API│  │ Protocol Managers │  │
-│  │  /api/*  │  │/client-  │  │  WG · V2Ray · OV │  │
-│  │          │  │  api/*   │  │  IKE · L2TP · DNS│  │
-│  └────┬─────┘  └────┬─────┘  └────────┬─────────┘  │
-│       │              │                 │            │
-│       └──────┬───────┘                 │            │
-│              │                         │            │
-│       ┌──────▼──────┐          ┌───────▼────────┐   │
-│       │  FastAPI    │          │  System Cores  │   │
-│       │  + Redis    │          │  (installed on │   │
-│       │  + JWT Auth │          │   the server)  │   │
-│       └─────────────┘          └────────────────┘   │
-└─────────────────────────────────────────────────────┘
+│  ┌───────────┐  ┌───────────┐  ┌─────────────────┐ │
+│  │ Panel API │  │Client API │  │Protocol Managers│ │
+│  │  /api/*   │  │/client-   │  │ WG · V2Ray · OV │ │
+│  │           │  │  api/*    │  │ IKE · L2TP · DNS│ │
+│  └─────┬─────┘  └─────┬─────┘  └────────┬────────┘ │
+│        │              │                  │          │
+│        └──────────────┘                  │          │
+│              │                           │          │
+│       ┌──────┴──────┐          ┌─────────┴────────┐ │
+│       │   FastAPI   │          │  System Cores    │ │
+│       │   + Redis   │          │ (installed on    │ │
+│       │   + JWT     │          │  the server)     │ │
+│       └─────────────┘          └──────────────────┘ │
+└──────────────────────────────────────────────────────┘
         │                              │
         ▼                              ▼
 ┌───────────────┐            ┌──────────────────┐
-│  Web Panel    │            │  Desktop Client  │
-│  (React+Vite) │            │  (Tauri+React)   │
+│   Web Panel   │            │  Desktop Client  │
+│ (React+Vite)  │            │ (Tauri+React)    │
 └───────────────┘            └──────────────────┘
 ```
 
@@ -86,9 +97,9 @@ The installer will:
 After installation completes, you'll see:
 
 ```
-═══════════════════════════════════════════
+✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅
   🍬 CandyConnect Installed Successfully!
-═══════════════════════════════════════════
+✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅✅
 
   Panel URL:    http://<SERVER_IP>:8443/candyconnect
   API URL:      http://<SERVER_IP>:8443/api
@@ -96,18 +107,18 @@ After installation completes, you'll see:
   Admin User:   admin
   Admin Pass:   admin123
 
-  ⚠  Change the default password immediately!
+  ⚠️  Change the default password immediately!
 ```
 
 ---
 
-## 🖥️ Web Panel
+## 🌐 Web Panel
 
 The admin web panel provides full server management:
 
-- **Dashboard** — Server resources, VPN core status, active connections, live logs
-- **Clients** — Create, edit, delete VPN users with per-protocol access control, traffic limits, and time limits
-- **Core Configs** — Configure each VPN protocol (ports, ciphers, keys, interfaces, etc.)
+- **Dashboard** — Server resources, VPN core status, active connections per protocol, real traffic stats, live logs
+- **Clients** — Create, edit, delete VPN users with per-protocol access control, traffic limits, time limits, and connection history
+- **Core Configs** — Configure each VPN protocol (ports, ciphers, keys, interfaces, DNS, etc.)
 - **Panel Configs** — Change panel port/path, admin password, view server info
 
 ### Access
@@ -120,16 +131,28 @@ Default credentials:
 
 ---
 
-## 📱 Desktop Client
+## 💻 Desktop Client
 
-The CandyConnect desktop client (built with Tauri + React) connects to the server backend.
+The CandyConnect desktop client (built with Tauri + React) connects to the server backend and provides a native VPN experience on Windows, macOS, and Linux.
+
+### Supported Client Protocols
+
+| Protocol | TUN Mode | Proxy Mode |
+|---|---|---|
+| V2Ray (VLESS/VMess/Trojan) | ✅ via sing-box | ✅ via Xray SOCKS |
+| WireGuard | ✅ via sing-box | ✅ via sing-box |
+| OpenVPN | ✅ Native | — |
+| IKEv2 | ✅ Native | — |
+| L2TP | ✅ Native | — |
+| DNSTT | ✅ via tunnel | — |
 
 ### How It Works
 
 1. User enters the server address (e.g., `http://your-server:8443`)
 2. Logs in with their client username/password (created via the web panel)
 3. The client fetches available VPN protocols and connection configs
-4. User selects a protocol and connects
+4. User selects a protocol and mode (TUN/Proxy) and connects
+5. Real-time speed and traffic stats are shown — **only VPN interface traffic is counted** (not general system traffic)
 
 ### Building the Client
 
@@ -144,7 +167,7 @@ npm run build        # Production build (Tauri)
 
 ---
 
-## 🔧 Server Management
+## 🖥 Server Management
 
 ### Service Commands
 
@@ -197,103 +220,43 @@ CC_ADMIN_PASS=admin123
 │   │   └── manager.py
 │   └── routes/      # API endpoints
 │       ├── panel_api.py    # Web panel API
-│       └── client_api.py   # Client app API
-├── web-panel/       # Built panel frontend
-├── cores/           # Installed VPN binaries
-├── backups/         # Auto-backups
-├── logs/            # Server logs
-└── .env             # Configuration
+│       └── client_api.py   # Desktop client API
+├── web-panel/       # React admin panel (built)
+└── cores/           # VPN binaries (auto-installed)
+    ├── xray/
+    └── sing-box/
 ```
 
 ---
 
-## 🌐 API Reference
+## 🔧 Troubleshooting
 
-### Panel API (`/api`)
-
-All endpoints require admin JWT token via `Authorization: Bearer <token>` header.
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/api/auth/login` | Admin login → returns JWT token |
-| `GET` | `/api/dashboard` | Server info, cores, stats, logs |
-| `GET` | `/api/clients` | List all clients |
-| `POST` | `/api/clients` | Create a new client |
-| `PUT` | `/api/clients/{id}` | Update a client |
-| `DELETE` | `/api/clients/{id}` | Delete a client |
-| `GET` | `/api/cores` | List all VPN cores with status |
-| `POST` | `/api/cores/{id}/start` | Start a VPN core |
-| `POST` | `/api/cores/{id}/stop` | Stop a VPN core |
-| `POST` | `/api/cores/{id}/restart` | Restart a VPN core |
-| `POST` | `/api/cores/{id}/install` | Install a VPN core |
-| `GET` | `/api/configs` | Get all core configurations |
-| `PUT` | `/api/configs/{section}` | Update a core configuration |
-| `GET` | `/api/logs` | Get server logs |
-| `GET` | `/api/panel` | Get panel info |
-| `PUT` | `/api/panel` | Update panel settings |
-| `PUT` | `/api/panel/password` | Change admin password |
-| `POST` | `/api/panel/restart` | Restart the panel |
-
-### Client API (`/client-api`)
-
-Client endpoints use client JWT token.
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/client-api/auth/login` | Client login → token + account info |
-| `GET` | `/client-api/account` | Get account details |
-| `GET` | `/client-api/protocols` | List available protocols |
-| `GET` | `/client-api/configs` | Get all VPN configs for user |
-| `GET` | `/client-api/configs/{protocol}` | Get specific protocol config |
-| `POST` | `/client-api/connect` | Report connection event |
-| `POST` | `/client-api/traffic` | Report traffic usage |
-| `GET` | `/client-api/server` | Get server info |
-
-### Health Check
+### Checking Protocol Status
 
 ```bash
-curl http://<SERVER_IP>:8443/health
-# {"status": "ok", "version": "1.4.2", "timestamp": 1739281218}
+# WireGuard
+sudo wg show
+
+# Xray
+sudo /opt/candyconnect/cores/xray/xray run -c /opt/candyconnect/cores/xray/config.json
+
+# IKEv2/IPSec
+sudo ipsec statusall
+sudo swanctl --list-conns
+
+# OpenVPN
+sudo tail -f /var/log/openvpn/openvpn-status.log
+
+# L2TP
+sudo journalctl -u xl2tpd -f
+
+# DNSTT
+ps aux | grep dnstt-server
 ```
 
----
-
-## 🛠️ Advanced Protocol Management
-
-While the Web Panel automates most operations, you may occasionally need to perform manual tasks or low-level troubleshooting directly on the server.
-
-### 📁 Direct Configuration Paths
-
-If you need to edit core configs manually, they are located at:
-
-| Protocol | Config File / Directory |
-|---|---|
-| **WireGuard** | `/etc/wireguard/wg0.conf` |
-| **V2Ray / Xray** | `/opt/candyconnect/cores/xray/config.json` |
-| **OpenVPN** | `/etc/openvpn/server/server.conf` |
-| **IKEv2/IPSec** | `/etc/ipsec.conf` & `/etc/ipsec.secrets` |
-| **L2TP/IPSec** | `/etc/xl2tpd/xl2tpd.conf` |
-| **DNSTT** | `/opt/candyconnect/cores/dnstt/` |
-
-### 🔍 Native CLI Tools
-
-Use these native commands to debug connections or check real-time status:
-
-- **WireGuard**: `sudo wg show` (shows active peers and handshakes)
-- **Xray**: `sudo /opt/candyconnect/cores/xray/xray run -c /opt/candyconnect/cores/xray/config.json`
-- **IKEv2/IPSec**: `sudo ipsec statusall` or `sudo swanctl --list-conns`
-- **OpenVPN**: `sudo tail -f /var/log/openvpn/status.log`
-- **L2TP**: `sudo journalctl -u xl2tpd -f`
-- **DNSTT**: `ps aux | grep dnstt-server`
-
-### ⚡ Manual Service Control
-
-You can bypass the panel and manage services directly using `systemctl`:
+### ⚙️ Manual Service Control
 
 ```bash
-# V2Ray (if using global xray)
-sudo systemctl restart xray
-
 # WireGuard interface
 sudo wg-quick down wg0
 sudo wg-quick up wg0
@@ -308,9 +271,9 @@ sudo systemctl restart xl2tpd
 sudo systemctl restart ssh
 ```
 
-### 🛑 Emergency Port Release
+### 🆘 Emergency Port Release
 
-If a protocol fails to start because "Port is already in use", identify the process:
+If a protocol fails to start because "Port is already in use":
 ```bash
 sudo lsof -i :<PORT_NUMBER>
 # or
@@ -319,7 +282,7 @@ sudo netstat -tulpn | grep :<PORT_NUMBER>
 
 ---
 
-## 🔑 VPN Protocol Setup
+## 🔒 VPN Protocol Setup
 
 After installation, VPN protocols need to be installed and started via the web panel or API:
 
@@ -336,20 +299,50 @@ After installation, VPN protocols need to be installed and started via the web p
 TOKEN="your-admin-jwt-token"
 SERVER="http://your-server:8443"
 
-# Install WireGuard
-curl -X POST "$SERVER/api/cores/wireguard/install" \
-  -H "Authorization: Bearer $TOKEN"
-
-# Start WireGuard  
-curl -X POST "$SERVER/api/cores/wireguard/start" \
-  -H "Authorization: Bearer $TOKEN"
-
 # Install & start all protocols
 for proto in v2ray wireguard openvpn ikev2 l2tp dnstt; do
   curl -X POST "$SERVER/api/cores/$proto/install" -H "Authorization: Bearer $TOKEN"
   curl -X POST "$SERVER/api/cores/$proto/start" -H "Authorization: Bearer $TOKEN"
 done
 ```
+
+---
+
+## 🌐 DNSTT Setup (DNS Tunnel)
+
+DNSTT allows VPN traffic to be tunneled over DNS queries, bypassing most firewalls. It requires you to own a domain and configure two DNS records.
+
+### DNS Records Required
+
+You must add the following records to your domain's DNS settings:
+
+| Type | Name | Value | Purpose |
+|---|---|---|---|
+| **A** | `srv.YOURDOMAIN.COM` | `YOUR_SERVER_IP` | Points to your CandyConnect server |
+| **NS** | `dns.YOURDOMAIN.COM` | `srv.YOURDOMAIN.COM` | Delegates DNS queries to your server |
+
+**Example** (domain: `example.com`, server IP: `1.2.3.4`):
+
+```
+A     srv.example.com   →   1.2.3.4
+NS    dns.example.com   →   srv.example.com
+```
+
+### How It Works
+
+1. The client sends DNS queries to `dns.YOURDOMAIN.COM`
+2. The NS record delegates those queries to `srv.YOURDOMAIN.COM` (your server)
+3. Your server's DNSTT daemon handles the queries and tunnels VPN traffic through them
+4. Traffic appears as normal DNS UDP port 53 traffic — bypasses most deep packet inspection
+
+### DNSTT Configuration in Web Panel
+
+1. Go to **Core Configs → DNSTT**
+2. Set **DNS Zone** to `dns.YOURDOMAIN.COM`
+3. Set **Listen Port** (default: `5300` for DNS; port 53 requires root)
+4. Save and start the DNSTT core
+
+> **Note:** Propagation of DNS records can take up to 24–48 hours depending on your registrar's TTL settings. Test with `dig NS dns.yourdomain.com` to confirm.
 
 ---
 
@@ -387,14 +380,15 @@ curl -X POST "$SERVER/api/clients" \
 
 - **Traffic Limits** — Per-client data caps in GB or MB
 - **Time Limits** — Expiry in days or months
-- **On Hold** — Pause a client's timer
-- **Per-Protocol Access** — Enable/disable individual VPN protocols
-- **Traffic Tracking** — Per-protocol usage tracking
+- **On Hold** — Pause a client's timer without deleting them
+- **Per-Protocol Access** — Enable/disable individual VPN protocols per client
+- **Real Traffic Tracking** — Per-protocol usage tracking (client-reported + server-measured)
+- **Active Connections** — Real-time connection count per protocol in the dashboard
 - **Connection History** — IP, protocol, duration logging
 
 ---
 
-## 🏗️ Development
+## 🛠 Development
 
 ### Project Structure
 
@@ -403,7 +397,9 @@ CandyConnect/
 ├── server/              # Python FastAPI backend
 ├── web-panel/           # React + Vite + Tailwind admin panel
 ├── client/              # Tauri + React desktop VPN client
+│   └── src-tauri/src/   # Rust backend (Tauri commands, VPN launching)
 ├── install.sh           # Deployment script
+├── menu.sh              # Interactive management menu
 └── README.md
 ```
 
@@ -442,6 +438,7 @@ npm run dev
 | **Server** | Python 3.10+, FastAPI, Redis, JWT |
 | **Web Panel** | React 18, Vite, Tailwind CSS, Lucide Icons |
 | **Client** | React 19, Tauri 2, TypeScript, Vite |
+| **Client Backend** | Rust (Tauri), sing-box, Xray |
 | **Database** | Redis |
 | **Auth** | JWT (separate admin/client tokens) |
 
@@ -455,6 +452,7 @@ npm run dev
 - Admin password is bcrypt-hashed
 - Use HTTPS in production (configure SSL in CandyConnect settings)
 - Firewall rules are auto-configured during installation
+- This software is for **educational use only** — see disclaimer at top
 
 ---
 

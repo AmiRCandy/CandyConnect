@@ -146,7 +146,13 @@ class WireGuardProtocol(BaseProtocol):
         return active
 
     async def get_traffic(self) -> dict:
-        """Get total traffic for all WireGuard interfaces."""
+        """Get total traffic for all WireGuard interfaces.
+
+        `wg show all dump` outputs two kinds of tab-separated lines:
+          interface line: <iface>  <private_key>  <public_key>  <listen_port>  <fwmark>   (5 fields)
+          peer line:      <iface>  <public_key>   <preshared>   <endpoint>     <allowed_ips>  <latest_handshake>  <rx_bytes>  <tx_bytes>  <keepalive>  (9 fields)
+        We identify peer lines by having >= 9 fields.
+        """
         total_rx = 0
         total_tx = 0
         try:
@@ -154,18 +160,18 @@ class WireGuardProtocol(BaseProtocol):
             if rc == 0 and out:
                 for line in out.strip().split("\n"):
                     parts = line.split("\t")
-                    if parts[0] == "peer":
-                        # peer public_key preshared_key endpoint allowed_ips latest_handshake transfer_rx transfer_tx persistent_keepalive
-                        if len(parts) >= 8:
+                    if len(parts) >= 9:
+                        # peer line: rx_bytes at index 6, tx_bytes at index 7
+                        try:
                             total_rx += int(parts[6])
                             total_tx += int(parts[7])
+                        except (ValueError, IndexError):
+                            continue
         except Exception:
             pass
 
-        return {
-            "in": round(total_rx / (1024 ** 3), 2),
-            "out": round(total_tx / (1024 ** 3), 2)
-        }
+        # Return raw bytes so callers can aggregate accurately
+        return {"in": total_rx, "out": total_tx}
 
     async def add_client(self, username: str, client_data: dict) -> dict:
         """Create a new WireGuard peer for a client."""

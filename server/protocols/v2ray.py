@@ -93,19 +93,71 @@ class V2RayProtocol(BaseProtocol):
         return ""
 
     async def get_active_connections(self) -> int:
-        # Xray doesn't have a simple CLI for this. Check /api/stats if enabled.
+        """Count active connections through Xray/V2Ray.
+
+        Strategy:
+        1. Try the Xray gRPC stats API (if the StatsService is enabled in config).
+        2. Fall back to counting established TCP connections to Xray's inbound ports
+           via 'ss' (avoiding the pipe-to-grep exit-code issue).
+        """
+        # Strategy 1: check xray StatsService via grpcurl / xray api (if available)
+        try:
+            config = await get_core_config("v2ray")
+            if config:
+                config_obj = json.loads(config.get("config_json", "{}"))
+                api_cfg = config_obj.get("api", {})
+                if api_cfg.get("services") and "StatsService" in api_cfg.get("services", []):
+                    api_port = None
+                    for inbound in config_obj.get("inbounds", []):
+                        if inbound.get("tag") == "api" or inbound.get("protocol") == "dokodemo-door":
+                            api_port = inbound.get("port")
+                            break
+                    if api_port:
+                        rc, out, _ = await self._run_cmd(
+                            f"xray api statsquery --server=127.0.0.1:{api_port} 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); print(sum(1 for s in d.get('stat',[]) if 'user' in s.get('name','') and 'traffic' in s.get('name','') and s.get('value',0)>0))\" 2>/dev/null",
+                            check=False,
+                        )
+                        if rc == 0 and out.strip().isdigit():
+                            return int(out.strip())
+        except Exception:
+            pass
+
+        # Strategy 2: count ESTABLISHED connections on Xray's inbound ports
+        try:
+            config = await get_core_config("v2ray")
+            inbound_ports = []
+            if config:
+                config_obj = json.loads(config.get("config_json", "{}"))
+                for inbound in config_obj.get("inbounds", []):
+                    port = inbound.get("port")
+                    if port and inbound.get("protocol") not in ("dokodemo-door",):
+                        inbound_ports.append(str(port))
+
+            if inbound_ports:
+                port_filter = " or ".join(f"sport = :{p}" for p in inbound_ports)
+                rc, out, _ = await self._run_cmd(
+                    f"ss -tn state established '( {port_filter} )' 2>/dev/null",
+                    check=False,
+                )
+                if rc == 0:
+                    lines = [l for l in out.splitlines() if l.strip() and not l.startswith("Netid")]
+                    return len(lines)
+        except Exception:
+            pass
+
+        # Strategy 3: fall back to counting via PID
         status = await get_core_status(self.PROTOCOL_ID)
         pid = status.get("pid")
         if not pid:
             return 0
         rc, out, _ = await self._run_cmd(
-            f"ss -tnp | grep 'pid={pid}' | wc -l",
+            f"ss -tnp 2>/dev/null | grep 'pid={pid}'",
             check=False,
         )
-        try:
-            return max(0, int(out.strip()) - 1)  # Subtract listening sockets
-        except ValueError:
-            return 0
+        if rc == 0 and out:
+            lines = [l for l in out.splitlines() if "ESTAB" in l]
+            return len(lines)
+        return 0
 
     async def add_client(self, username: str, client_data: dict) -> dict:
         """Add a client to V2Ray config (generates UUID for VLESS/VMess)."""

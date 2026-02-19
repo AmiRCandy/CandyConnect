@@ -159,18 +159,20 @@ class OpenVPNProtocol(BaseProtocol):
         return ""
 
     async def get_active_connections(self) -> int:
-        status_file = "/var/log/openvpn/openvpn-status.log"
-        if not os.path.exists(status_file):
-            status_file = "/etc/openvpn/server/openvpn-status.log"
-        rc, out, _ = await self._run_cmd(
-            f"grep -c 'CLIENT_LIST' {status_file} 2>/dev/null || echo 0",
-            check=False,
-        )
-        try:
-            count = int(out.strip())
-            return max(0, count - 1)  # Subtract header
-        except ValueError:
-            return 0
+        # Read the OpenVPN status file and count CLIENT_LIST entries.
+        # Avoid piping into grep -c (pipe exit-code issue).
+        for status_file in [
+            "/var/log/openvpn/openvpn-status.log",
+            "/etc/openvpn/server/openvpn-status.log",
+            "/etc/openvpn/openvpn-status.log",
+        ]:
+            rc, out, _ = await self._run_cmd(f"sudo cat {status_file} 2>/dev/null", check=False)
+            if rc == 0 and out:
+                # CLIENT_LIST lines: one header + one per connected client
+                count = sum(1 for line in out.splitlines() if line.startswith("CLIENT_LIST,") or line.startswith("CLIENT_LIST\t"))
+                # Subtract 1 for the header line ("CLIENT_LIST,Common Name,...")
+                return max(0, count - 1)
+        return 0
 
     async def get_traffic(self) -> dict:
         """Get total traffic from OpenVPN status log."""
@@ -190,10 +192,8 @@ class OpenVPNProtocol(BaseProtocol):
                         total_out = int(line.split(",")[1])
         except Exception:
             pass
-        return {
-            "in": round(total_in / (1024 ** 3), 2),
-            "out": round(total_out / (1024 ** 3), 2)
-        }
+        # Return raw bytes so callers can aggregate accurately
+        return {"in": total_in, "out": total_out}
 
     async def add_client(self, username: str, client_data: dict) -> dict:
         """Generate client certificate and return .ovpn config data."""

@@ -111,9 +111,36 @@ class ProtocolManager:
         return await proto.restart()
 
     async def update_traffic_cache(self) -> None:
-        # Optionally ask every protocol for traffic and cache per-core if desired
-        # Not strictly required for stability; keeping light-weight
-        return None
+        """Pull traffic stats from each running protocol backend and persist them
+        to the Redis traffic hash (K_TRAFFIC) under a synthetic system-level key
+        so the dashboard can show per-protocol totals even when clients don't
+        self-report (e.g. native protocols like WireGuard, IKEv2, L2TP).
+
+        The key used is  "system:<protocol>"  to distinguish server-measured
+        traffic from client-reported traffic stored as  "<client_id>:<protocol>".
+        """
+        import logging
+        logger = logging.getLogger("candyconnect")
+
+        for pid in SUPPORTED_PROTOCOLS:
+            proto = self.get_protocol(pid)
+            if not proto:
+                continue
+            try:
+                running = await proto.is_running()
+                if not running:
+                    continue
+                traffic = await proto.get_traffic()
+                # get_traffic() returns raw bytes for all protocols
+                total_bytes = float(traffic.get("out", 0)) + float(traffic.get("in", 0))
+                if total_bytes > 0:
+                    # Store as an absolute snapshot (raw bytes) under "system:<proto>".
+                    # We overwrite (hset) rather than increment so the value always
+                    # reflects the real cumulative counter read from the daemon.
+                    r = await db.get_redis()
+                    await r.hset(db.K_TRAFFIC, f"system:{pid}", total_bytes)
+            except Exception as e:
+                logger.debug(f"Traffic cache update failed for {pid}: {e}")
 
     async def get_all_cores_info(self) -> List[dict]:
         """Collect basic information for all supported protocols.

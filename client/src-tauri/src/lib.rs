@@ -423,6 +423,403 @@ async fn start_vpn(
     Ok(())
 }
 
+/// Start WireGuard via sing-box.
+/// - proxy mode: SOCKS inbound on proxyHost:proxyPort + WireGuard outbound
+/// - tun mode:   TUN inbound + WireGuard outbound (full key material)
+#[tauri::command]
+async fn start_wireguard(
+    app: tauri::AppHandle,
+    server: String,
+    port: u64,
+    private_key: String,
+    peer_public_key: String,
+    pre_shared_key: String,
+    local_addresses: Vec<String>,
+    mode: String,
+) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    use std::io::{BufRead, BufReader};
+    use std::thread;
+    use crate::sing_box_helper::Config;
+
+    let app_data_dir = app.path().app_data_dir().expect("Failed to get app dir");
+    let resource_dir = app.path().resource_dir().unwrap_or_else(|_| std::env::current_dir().unwrap());
+    let logs_path = app_data_dir.join("candy.logs");
+
+    let _ = append_log(&logs_path, "info", &format!(
+        "Starting WireGuard via sing-box: server={}:{}, mode={}", server, port, mode
+    ));
+
+    let resolve_tool = |base: &std::path::Path, rel_path: &str| -> std::path::PathBuf {
+        let p1 = base.join(rel_path);
+        if p1.exists() { return p1; }
+        let p2 = base.join("resources").join(rel_path);
+        if p2.exists() { return p2; }
+        p1
+    };
+
+    let sing_box_bin = resolve_tool(
+        &resource_dir,
+        if cfg!(target_os = "windows") { "sing-box/sing-box.exe" } else { "sing-box/sing-box" }
+    );
+
+    // Build the correct sing-box config depending on mode
+    let sb_config = if mode == "tun" {
+        // TUN mode: TUN inbound + WireGuard outbound with full key material
+        // Read TUN settings from settings file
+        let settings_path = app_data_dir.join("settings.json");
+        let (_inet4, _inet6, mtu, primary_dns, secondary_dns) = if settings_path.exists() {
+            if let Ok(content) = fs::read_to_string(&settings_path) {
+                if let Ok(s) = serde_json::from_str::<serde_json::Value>(&content) {
+                    (
+                        s["tunInet4CIDR"].as_str().unwrap_or("172.19.0.1/30").to_string(),
+                        s["tunInet6CIDR"].as_str().unwrap_or("fdfe:dcba:9876::1/126").to_string(),
+                        s["mtu"].as_u64().unwrap_or(1420) as u16,
+                        s["primaryDns"].as_str().unwrap_or("1.1.1.1").to_string(),
+                        s["secondaryDns"].as_str().unwrap_or("8.8.8.8").to_string(),
+                    )
+                } else {
+                    ("172.19.0.1/30".into(), "fdfe:dcba:9876::1/126".into(), 1420, "1.1.1.1".into(), "8.8.8.8".into())
+                }
+            } else {
+                ("172.19.0.1/30".into(), "fdfe:dcba:9876::1/126".into(), 1420, "1.1.1.1".into(), "8.8.8.8".into())
+            }
+        } else {
+            ("172.19.0.1/30".into(), "fdfe:dcba:9876::1/126".into(), 1420, "1.1.1.1".into(), "8.8.8.8".into())
+        };
+
+        let psk_opt = if pre_shared_key.is_empty() { None } else { Some(pre_shared_key.as_str()) };
+
+        let cfg = Config::mode_wireguard_tun_full(
+            &server,
+            port as u16,
+            &private_key,
+            &peer_public_key,
+            psk_opt,
+            local_addresses.clone(),
+            None,
+            Some(mtu),
+            &primary_dns,
+            &secondary_dns,
+        );
+        serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?
+    } else {
+        // Proxy mode: SOCKS inbound + WireGuard outbound
+        // Read proxy settings
+        let settings_path = app_data_dir.join("settings.json");
+        let (proxy_host, proxy_port) = if settings_path.exists() {
+            if let Ok(content) = fs::read_to_string(&settings_path) {
+                if let Ok(s) = serde_json::from_str::<serde_json::Value>(&content) {
+                    (
+                        s["proxyHost"].as_str().unwrap_or("127.0.0.1").to_string(),
+                        s["proxyPort"].as_u64().unwrap_or(1080) as u16,
+                    )
+                } else {
+                    ("127.0.0.1".into(), 1080u16)
+                }
+            } else {
+                ("127.0.0.1".into(), 1080u16)
+            }
+        } else {
+            ("127.0.0.1".into(), 1080u16)
+        };
+
+        let psk_opt = if pre_shared_key.is_empty() { None } else { Some(pre_shared_key.as_str()) };
+
+        let cfg = Config::mode_wireguard_proxy(
+            &server,
+            port as u16,
+            &private_key,
+            &peer_public_key,
+            psk_opt,
+            local_addresses.clone(),
+            &proxy_host,
+            proxy_port,
+        );
+        serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?
+    };
+
+    // Write sing-box config
+    let sb_config_path = app_data_dir.join("sing_box_config.json");
+    fs::write(&sb_config_path, &sb_config).map_err(|e| e.to_string())?;
+    let _ = append_log(&logs_path, "info", &format!(
+        "WireGuard sing-box config written ({} bytes, mode={})", sb_config.len(), mode
+    ));
+
+    // Spawn sing-box
+    let mut sb_cmd = Command::new(&sing_box_bin);
+    sb_cmd
+        .arg("run")
+        .arg("-c")
+        .arg(&sb_config_path)
+        .env("ENABLE_DEPRECATED_SPECIAL_OUTBOUNDS", "true")
+        .env("ENABLE_DEPRECATED_TUN_ADDRESS_X", "true")
+        .env("ENABLE_DEPRECATED_WIREGUARD_OUTBOUND", "true")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        sb_cmd.creation_flags(0x08000000);
+    }
+
+    let mut sb_child = sb_cmd.spawn().map_err(|e| {
+        let msg = format!("CRITICAL: Failed to spawn sing-box for WireGuard: {}", e);
+        let _ = append_log(&logs_path, "error", &msg);
+        msg
+    })?;
+
+    let _ = append_log(&logs_path, "info", &format!(
+        "WireGuard sing-box spawned (PID: {})", sb_child.id()
+    ));
+
+    let sb_stdout = sb_child.stdout.take().unwrap();
+    let sb_stderr = sb_child.stderr.take().unwrap();
+
+    let logs1 = logs_path.clone();
+    thread::spawn(move || {
+        let reader = BufReader::new(sb_stdout);
+        for line in reader.lines() {
+            match line {
+                Ok(l) if !l.trim().is_empty() => {
+                    let _ = append_log(&logs1, "info", &format!("[WG/sing-box] {}", l));
+                }
+                Err(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    let logs2 = logs_path.clone();
+    thread::spawn(move || {
+        let reader = BufReader::new(sb_stderr);
+        for line in reader.lines() {
+            match line {
+                Ok(l) if !l.trim().is_empty() => {
+                    let _ = append_log(&logs2, "error", &format!("[WG/sing-box] {}", l));
+                }
+                Err(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    // Health check
+    thread::sleep(std::time::Duration::from_millis(700));
+    match sb_child.try_wait() {
+        Ok(Some(status)) => {
+            let err_msg = format!("WireGuard sing-box exited immediately with {}", status);
+            let _ = append_log(&logs_path, "error", &err_msg);
+            use tauri::Emitter;
+            let _ = app.emit("vpn-disconnected", ());
+            return Err(err_msg);
+        }
+        Ok(None) => {
+            let _ = append_log(&logs_path, "info", "WireGuard sing-box is running");
+        }
+        Err(e) => {
+            let _ = append_log(&logs_path, "warn", &format!("Could not check WireGuard sing-box status: {}", e));
+        }
+    }
+
+    // Watch process in background
+    let app_h = app.clone();
+    let logs_exit = logs_path.clone();
+    thread::spawn(move || {
+        let _ = sb_child.wait();
+        let _ = append_log(&logs_exit, "warn", "WireGuard sing-box process exited");
+        use tauri::Emitter;
+        let _ = app_h.emit("vpn-disconnected", ());
+    });
+
+    Ok(())
+}
+
+/// Start OpenVPN as a client using a .ovpn config string.
+/// Writes the config to a temp file and spawns openvpn process.
+#[tauri::command]
+async fn start_openvpn(
+    app: tauri::AppHandle,
+    ovpn_config: String,
+    username: String,
+    password: String,
+    mode: String,
+) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    use std::io::{BufRead, BufReader, Write};
+    use std::thread;
+
+    let app_data_dir = app.path().app_data_dir().expect("Failed to get app dir");
+    let resource_dir = app.path().resource_dir().unwrap_or_else(|_| std::env::current_dir().unwrap());
+    let logs_path = app_data_dir.join("candy.logs");
+
+    let _ = append_log(&logs_path, "info", &format!(
+        "Starting OpenVPN client: user={}, mode={}", username, mode
+    ));
+
+    if ovpn_config.is_empty() {
+        return Err("OpenVPN config is empty".to_string());
+    }
+
+    // Write .ovpn config file
+    let ovpn_config_path = app_data_dir.join("client.ovpn");
+    fs::write(&ovpn_config_path, &ovpn_config).map_err(|e| e.to_string())?;
+
+    // Write auth file (username\npassword) for --auth-user-pass
+    let auth_path = app_data_dir.join("openvpn_auth.txt");
+    {
+        let mut f = std::fs::File::create(&auth_path).map_err(|e| e.to_string())?;
+        writeln!(f, "{}", username).map_err(|e| e.to_string())?;
+        writeln!(f, "{}", password).map_err(|e| e.to_string())?;
+    }
+
+    let _ = append_log(&logs_path, "info", &format!(
+        "OpenVPN config written to: {}", ovpn_config_path.display()
+    ));
+
+    // Resolve openvpn binary: try bundled first, then system
+    let resolve_tool = |base: &std::path::Path, rel_path: &str| -> std::path::PathBuf {
+        let p1 = base.join(rel_path);
+        if p1.exists() { return p1; }
+        let p2 = base.join("resources").join(rel_path);
+        if p2.exists() { return p2; }
+        p1
+    };
+
+    // On Windows try bundled openvpn.exe; on other platforms use system openvpn
+    #[cfg(target_os = "windows")]
+    let openvpn_bin = {
+        let bundled = resolve_tool(&resource_dir, "openvpn/openvpn.exe");
+        if bundled.exists() {
+            bundled
+        } else {
+            std::path::PathBuf::from("openvpn.exe")
+        }
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let openvpn_bin = std::path::PathBuf::from("openvpn");
+
+    let _ = append_log(&logs_path, "info", &format!(
+        "Using OpenVPN binary: {}", openvpn_bin.display()
+    ));
+
+    let mut ovpn_cmd = Command::new(&openvpn_bin);
+    ovpn_cmd
+        .arg("--config")
+        .arg(&ovpn_config_path)
+        .arg("--auth-user-pass")
+        .arg(&auth_path)
+        .arg("--auth-nocache")
+        .arg("--verb")
+        .arg("3")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    // On Linux/macOS we may need sudo for TUN interface creation
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Only wrap with sudo if not already root
+        // We rebuild the command with sudo prefix
+        let user = std::env::var("USER").unwrap_or_default();
+        if user != "root" {
+            ovpn_cmd = Command::new("sudo");
+            ovpn_cmd
+                .arg(openvpn_bin.to_str().unwrap_or("openvpn"))
+                .arg("--config")
+                .arg(&ovpn_config_path)
+                .arg("--auth-user-pass")
+                .arg(&auth_path)
+                .arg("--auth-nocache")
+                .arg("--verb")
+                .arg("3")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        ovpn_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    let mut ovpn_child = ovpn_cmd.spawn().map_err(|e| {
+        let msg = format!("CRITICAL: Failed to spawn OpenVPN: {}. Is openvpn installed?", e);
+        let _ = append_log(&logs_path, "error", &msg);
+        msg
+    })?;
+
+    let _ = append_log(&logs_path, "info", &format!(
+        "OpenVPN process spawned (PID: {})", ovpn_child.id()
+    ));
+
+    let ovpn_stdout = ovpn_child.stdout.take().unwrap();
+    let ovpn_stderr = ovpn_child.stderr.take().unwrap();
+
+    let logs1 = logs_path.clone();
+    thread::spawn(move || {
+        let reader = BufReader::new(ovpn_stdout);
+        for line in reader.lines() {
+            match line {
+                Ok(l) if !l.trim().is_empty() => {
+                    let _ = append_log(&logs1, "info", &format!("[OpenVPN] {}", l));
+                }
+                Err(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    let logs2 = logs_path.clone();
+    thread::spawn(move || {
+        let reader = BufReader::new(ovpn_stderr);
+        for line in reader.lines() {
+            match line {
+                Ok(l) if !l.trim().is_empty() => {
+                    let _ = append_log(&logs2, "error", &format!("[OpenVPN] {}", l));
+                }
+                Err(_) => break,
+                _ => {}
+            }
+        }
+    });
+
+    // Health check — openvpn takes a moment to establish connection
+    thread::sleep(std::time::Duration::from_millis(1500));
+    match ovpn_child.try_wait() {
+        Ok(Some(status)) => {
+            let err_msg = format!("OpenVPN exited immediately with {} — check logs for details", status);
+            let _ = append_log(&logs_path, "error", &err_msg);
+            use tauri::Emitter;
+            let _ = app.emit("vpn-disconnected", ());
+            return Err(err_msg);
+        }
+        Ok(None) => {
+            let _ = append_log(&logs_path, "info", "OpenVPN process is running after health check");
+        }
+        Err(e) => {
+            let _ = append_log(&logs_path, "warn", &format!("Could not check OpenVPN status: {}", e));
+        }
+    }
+
+    // Watch OpenVPN exit in background
+    let app_h = app.clone();
+    let logs_exit = logs_path.clone();
+    let auth_path_cleanup = auth_path.clone();
+    thread::spawn(move || {
+        let _ = ovpn_child.wait();
+        let _ = append_log(&logs_exit, "warn", "OpenVPN process exited");
+        // Clean up auth file for security
+        let _ = fs::remove_file(&auth_path_cleanup);
+        use tauri::Emitter;
+        let _ = app_h.emit("vpn-disconnected", ());
+    });
+
+    Ok(())
+}
+
 /// Resolve the DNSTT resolver setting string into command-line arguments for dnstt-client.
 /// Returns (flag, address) e.g. ("-udp", "8.8.8.8:53") or ("-doh", "https://dns.google/dns-query").
 fn resolve_dnstt_resolver(resolver: &str) -> (&'static str, &'static str) {
@@ -1293,182 +1690,6 @@ async fn start_native_vpn(
 }
 
 #[tauri::command]
-async fn start_wireguard(
-    app: tauri::AppHandle,
-    server: String,
-    port: u64,
-    private_key: String,
-    peer_public_key: String,
-    pre_shared_key: String,
-    local_addresses: Vec<String>,
-    mode: String,
-) -> Result<(), String> {
-    use std::process::{Command, Stdio};
-    use std::io::{BufRead, BufReader};
-    use std::thread;
-
-    let app_data_dir = app.path().app_data_dir().expect("Failed to get app dir");
-    let resource_dir = app.path().resource_dir().unwrap_or_else(|_| std::env::current_dir().unwrap());
-    let logs_path = app_data_dir.join("candy.logs");
-
-    let _ = append_log(&logs_path, "info", &format!("Starting WireGuard via sing-box: server={}, port={}, mode={}", server, port, mode));
-
-    // Read settings for DNS
-    let settings_path = app_data_dir.join("settings.json");
-    let settings: serde_json::Value = if settings_path.exists() {
-        let content = fs::read_to_string(&settings_path).unwrap_or_default();
-        serde_json::from_str(&content).unwrap_or(serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-
-    let primary_dns = settings["primaryDns"].as_str().unwrap_or("8.8.8.8");
-    let secondary_dns = settings["secondaryDns"].as_str().unwrap_or("1.1.1.1");
-    let wg_mtu = settings["mtu"].as_u64().unwrap_or(1280) as u16;
-
-    let psk_opt = if pre_shared_key.is_empty() { None } else { Some(pre_shared_key.as_str()) };
-
-    // Use the sing-box helper to generate config
-    let sb_config = sing_box_helper::Config::mode_wireguard_tun_full(
-        &server,
-        port as u16,
-        &private_key,
-        &peer_public_key,
-        psk_opt,
-        local_addresses,
-        None, // reserved
-        Some(wg_mtu),
-        primary_dns,
-        secondary_dns,
-    );
-
-    let config_json = serde_json::to_string_pretty(&sb_config)
-        .map_err(|e| format!("Failed to serialize sing-box config: {}", e))?;
-
-    let sb_config_path = app_data_dir.join("sing_box_wg_config.json");
-    fs::write(&sb_config_path, &config_json).map_err(|e| e.to_string())?;
-
-    let config_preview: String = config_json.chars().take(300).collect();
-    let _ = append_log(&logs_path, "info", &format!("WireGuard sing-box config written ({} bytes): {}...", config_json.len(), config_preview));
-
-    // Resolve sing-box binary
-    let resolve_tool = |base: &std::path::Path, rel_path: &str| -> std::path::PathBuf {
-        let p1 = base.join(rel_path);
-        if p1.exists() { return p1; }
-        let p2 = base.join("resources").join(rel_path);
-        if p2.exists() { return p2; }
-        p1
-    };
-    let sing_box_bin = resolve_tool(&resource_dir, if cfg!(target_os = "windows") { "sing-box/sing-box.exe" } else { "sing-box/sing-box" });
-
-    let _ = append_log(&logs_path, "info", &format!("Starting sing-box for WireGuard: {}", sing_box_bin.display()));
-
-    let mut sb_cmd = Command::new(&sing_box_bin);
-    sb_cmd
-        .arg("run")
-        .arg("-c")
-        .arg(&sb_config_path)
-        .env("ENABLE_DEPRECATED_SPECIAL_OUTBOUNDS", "true")
-        .env("ENABLE_DEPRECATED_TUN_ADDRESS_X", "true")
-.env("ENABLE_DEPRECATED_WIREGUARD_OUTBOUND", "true")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        sb_cmd.creation_flags(0x08000000);
-    }
-
-    let mut sb_child = sb_cmd.spawn().map_err(|e| {
-        let err_msg = format!("CRITICAL: Failed to spawn sing-box for WireGuard: {}", e);
-        let _ = append_log(&logs_path, "error", &err_msg);
-        err_msg
-    })?;
-
-    let _ = append_log(&logs_path, "info", &format!("sing-box WireGuard spawned (PID: {})", sb_child.id()));
-
-    let sb_stdout = sb_child.stdout.take().unwrap();
-    let sb_stderr = sb_child.stderr.take().unwrap();
-
-    let logs_p1 = logs_path.clone();
-    let sb_stdout_thread = thread::spawn(move || {
-        let reader = BufReader::new(sb_stdout);
-        for line in reader.lines() {
-            match line {
-                Ok(l) if !l.trim().is_empty() => {
-                    let _ = append_log(&logs_p1, "info", &format!("[Sing-box/WG] {}", l));
-                }
-                Err(e) => {
-                    let _ = append_log(&logs_p1, "warn", &format!("[Sing-box/WG] stdout error: {}", e));
-                    break;
-                }
-                _ => {}
-            }
-        }
-    });
-
-    let logs_p2 = logs_path.clone();
-    let sb_stderr_thread = thread::spawn(move || {
-        let reader = BufReader::new(sb_stderr);
-        for line in reader.lines() {
-            match line {
-                Ok(l) if !l.trim().is_empty() => {
-                    let _ = append_log(&logs_p2, "error", &format!("[Sing-box/WG] {}", l));
-                }
-                Err(e) => {
-                    let _ = append_log(&logs_p2, "warn", &format!("[Sing-box/WG] stderr error: {}", e));
-                    break;
-                }
-                _ => {}
-            }
-        }
-    });
-
-    // Health check
-    thread::sleep(std::time::Duration::from_millis(800));
-    match sb_child.try_wait() {
-        Ok(Some(status)) => {
-            let _ = sb_stdout_thread.join();
-            let _ = sb_stderr_thread.join();
-            let err_msg = format!("sing-box WireGuard exited immediately with {}", status);
-            let _ = append_log(&logs_path, "error", &err_msg);
-            use tauri::Emitter;
-            let _ = app.emit("vpn-disconnected", ());
-            return Err(err_msg);
-        }
-        Ok(None) => {
-            let _ = append_log(&logs_path, "info", "sing-box WireGuard is running after health check");
-        }
-        Err(e) => {
-            let _ = append_log(&logs_path, "warn", &format!("Could not check sing-box WireGuard status: {}", e));
-        }
-    }
-
-    // Watch sing-box exit in background
-    let app_h = app.clone();
-    let logs_p_exit = logs_path.clone();
-    thread::spawn(move || {
-        let exit_status = sb_child.wait();
-        let _ = sb_stdout_thread.join();
-        let _ = sb_stderr_thread.join();
-        match exit_status {
-            Ok(status) => {
-                let _ = append_log(&logs_p_exit, "warn", &format!("sing-box WireGuard exited with {}", status));
-            }
-            Err(e) => {
-                let _ = append_log(&logs_p_exit, "error", &format!("Failed to wait on sing-box WireGuard: {}", e));
-            }
-        }
-        use tauri::Emitter;
-        let _ = app_h.emit("vpn-disconnected", ());
-    });
-
-    let _ = append_log(&logs_path, "info", "WireGuard connection established via sing-box TUN");
-    Ok(())
-}
-
-#[tauri::command]
 async fn stop_vpn() -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
@@ -1681,22 +1902,6 @@ async fn check_system_executables(app: tauri::AppHandle) -> Result<Vec<String>, 
         }
     }
 
-    // Check for SSH tool needed by DNSTT: plink on Windows, sshpass on Unix
-    #[cfg(target_os = "windows")]
-    {
-        if !resolve_tool_check(&app_dir, "plink.exe") {
-            missing.push("plink".to_string());
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        use std::process::Command;
-        let sshpass_check = Command::new("which").arg("sshpass").output();
-        if sshpass_check.is_err() || !sshpass_check.unwrap().status.success() {
-            missing.push("sshpass".to_string());
-        }
-    }
-
     #[cfg(target_os = "windows")]
     {
         let ovpn_path = app_dir.join("openvpn/openvpn.exe");
@@ -1765,6 +1970,224 @@ async fn restart_as_admin(app: tauri::AppHandle) -> Result<(), String> {
     }
 }
 
+/// Snapshot of network interface byte counters at a point in time.
+struct NetSnapshot {
+    bytes_recv: u64,
+    bytes_sent: u64,
+    timestamp: std::time::Instant,
+}
+
+use std::sync::OnceLock;
+
+/// Global state for tracking network deltas between calls.
+fn net_state() -> &'static Mutex<Option<NetSnapshot>> {
+    static STATE: OnceLock<Mutex<Option<NetSnapshot>>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(None))
+}
+
+/// Session-level cumulative counters (reset when the client reconnects).
+fn net_session() -> &'static Mutex<(u64, u64)> {
+    static SESSION: OnceLock<Mutex<(u64, u64)>> = OnceLock::new();
+    SESSION.get_or_init(|| Mutex::new((0, 0)))
+}
+
+/// VPN interface prefixes we want to track. Only these carry VPN traffic.
+/// - tun*     : OpenVPN, WireGuard (wg-quick), sing-box TUN, IKEv2
+/// - wg*      : WireGuard kernel interface
+/// - utun*    : macOS VPN tunnel interfaces
+/// - ppp*     : L2TP/IPSec PPP links
+/// - sing-box : sing-box TUN interface name on some platforms
+fn is_vpn_interface(name: &str) -> bool {
+    let n = name.trim_end_matches(':');
+    n.starts_with("tun")
+        || n.starts_with("wg")
+        || n.starts_with("utun")
+        || n.starts_with("ppp")
+        || n == "sing-box"
+        || n.starts_with("candy")
+}
+
+/// Read bytes_recv and bytes_sent across VPN interfaces only.
+/// Falls back to all-interface totals if no VPN interface is found (not connected).
+/// Platform-specific implementation.
+fn read_net_counters() -> Option<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        // Read from /proc/net/dev — only sum VPN interfaces
+        if let Ok(content) = std::fs::read_to_string("/proc/net/dev") {
+            let mut vpn_recv: u64 = 0;
+            let mut vpn_sent: u64 = 0;
+            let mut found_vpn = false;
+            for line in content.lines().skip(2) {
+                let line = line.trim();
+                if let Some((iface, rest)) = line.split_once(':') {
+                    if !is_vpn_interface(iface.trim()) {
+                        continue;
+                    }
+                    let fields: Vec<&str> = rest.split_whitespace().collect();
+                    if fields.len() >= 9 {
+                        if let (Ok(r), Ok(s)) = (fields[0].parse::<u64>(), fields[8].parse::<u64>()) {
+                            vpn_recv += r;
+                            vpn_sent += s;
+                            found_vpn = true;
+                        }
+                    }
+                }
+            }
+            if found_vpn {
+                return Some((vpn_recv, vpn_sent));
+            }
+            // No VPN interface found — return zeros (not connected to VPN)
+            return Some((0, 0));
+        }
+        None
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::process::Command;
+        use std::os::windows::process::CommandExt;
+
+        // Use `netsh interface ipv4 show interfaces` to enumerate interfaces and
+        // find VPN/TAP adapters (TUN/TAP from sing-box / WireGuard / OpenVPN).
+        // These typically appear as adapters with "VPN", "tun", "wg", "TAP" in their name.
+        // We use `Get-NetAdapterStatistics` via PowerShell for precision.
+        let output = Command::new("powershell")
+            .args(&[
+                "-NoProfile", "-NonInteractive", "-Command",
+                "Get-NetAdapterStatistics | Where-Object { $_.Name -match 'tun|wg|vpn|tap|candyconnect|sing' -or (Get-NetAdapter -Name $_.Name -ErrorAction SilentlyContinue).InterfaceDescription -match 'tun|tap|wintun|wireguard|sing' } | Measure-Object -Property ReceivedBytes,SentBytes -Sum | Select-Object -Property Property,Sum | ConvertTo-Csv -NoTypeInformation",
+            ])
+            .creation_flags(0x08000000)
+            .output()
+            .ok()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut recv: u64 = 0;
+        let mut sent: u64 = 0;
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.trim_matches('"').split("\",\"").collect();
+            if parts.len() >= 2 {
+                let prop = parts[0].trim_matches('"');
+                let val: u64 = parts[1].trim_matches('"').parse().unwrap_or(0);
+                if prop == "ReceivedBytes" { recv = val; }
+                if prop == "SentBytes" { sent = val; }
+            }
+        }
+        if recv > 0 || sent > 0 {
+            return Some((recv, sent));
+        }
+        // Fallback: try reading just the WinTUN/TAP adapter via netstat -e
+        // (netstat -e gives totals for ALL adapters; not ideal but better than nothing)
+        let output2 = Command::new("netstat")
+            .args(&["-e"])
+            .creation_flags(0x08000000)
+            .output()
+            .ok()?;
+        let stdout2 = String::from_utf8_lossy(&output2.stdout);
+        for line in stdout2.lines() {
+            let line = line.trim();
+            if line.starts_with("Bytes") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 3 {
+                    if let (Ok(r), Ok(s)) = (parts[1].parse::<u64>(), parts[2].parse::<u64>()) {
+                        return Some((r, s));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        // Use netstat -ib on macOS — filter to VPN interfaces only (utun*, ppp*, tun*)
+        let output = Command::new("netstat")
+            .args(&["-ib"])
+            .output()
+            .ok()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut vpn_recv: u64 = 0;
+        let mut vpn_sent: u64 = 0;
+        let mut found_vpn = false;
+        for line in stdout.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // netstat -ib columns: Name Mtu Network Address Ipkts Ierrs Ibytes Opkts Oerrs Obytes
+            if fields.len() >= 10 && is_vpn_interface(fields[0]) {
+                if let (Ok(r), Ok(s)) = (fields[6].parse::<u64>(), fields[9].parse::<u64>()) {
+                    vpn_recv += r;
+                    vpn_sent += s;
+                    found_vpn = true;
+                }
+            }
+        }
+        if found_vpn {
+            return Some((vpn_recv, vpn_sent));
+        }
+        Some((0, 0))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+#[tauri::command]
+async fn get_network_stats() -> Result<serde_json::Value, String> {
+    let counters = read_net_counters().ok_or("Failed to read network counters")?;
+    let now = std::time::Instant::now();
+    let (bytes_recv, bytes_sent) = counters;
+
+    let mut state = net_state().lock().map_err(|e| e.to_string())?;
+    let mut session = net_session().lock().map_err(|e| e.to_string())?;
+
+    let (dl_kbps, ul_kbps) = if let Some(prev) = state.as_ref() {
+        let elapsed = now.duration_since(prev.timestamp).as_secs_f64();
+        if elapsed > 0.01 {
+            let dl_bytes = bytes_recv.saturating_sub(prev.bytes_recv);
+            let ul_bytes = bytes_sent.saturating_sub(prev.bytes_sent);
+
+            // Accumulate session totals
+            session.0 += dl_bytes;
+            session.1 += ul_bytes;
+
+            let dl = (dl_bytes as f64 / elapsed) / 1024.0;
+            let ul = (ul_bytes as f64 / elapsed) / 1024.0;
+            (dl, ul)
+        } else {
+            (0.0, 0.0)
+        }
+    } else {
+        // First call — no delta yet, just record baseline
+        (0.0, 0.0)
+    };
+
+    // Store current snapshot
+    *state = Some(NetSnapshot {
+        bytes_recv,
+        bytes_sent,
+        timestamp: now,
+    });
+
+    Ok(serde_json::json!({
+        "downloadSpeed": (dl_kbps * 10.0).round() / 10.0,
+        "uploadSpeed": (ul_kbps * 10.0).round() / 10.0,
+        "totalDownload": session.0,
+        "totalUpload": session.1,
+        "countryCode": "??",
+    }))
+}
+
+#[tauri::command]
+async fn reset_network_session() -> Result<(), String> {
+    let mut session = net_session().lock().map_err(|e| e.to_string())?;
+    *session = (0, 0);
+    // Also reset the baseline snapshot so the first read after reset shows 0 speed
+    let mut state = net_state().lock().map_err(|e| e.to_string())?;
+    *state = None;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
@@ -1817,7 +2240,7 @@ pub fn run() {
 
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![measure_latency, check_system_executables, is_admin, restart_as_admin, generate_sing_box_config, start_vpn, start_dnstt, start_native_vpn, start_wireguard, stop_vpn, write_log])
+    .invoke_handler(tauri::generate_handler![measure_latency, check_system_executables, is_admin, restart_as_admin, generate_sing_box_config, start_vpn, start_dnstt, start_native_vpn, start_wireguard, start_openvpn, stop_vpn, write_log, get_network_stats, reset_network_session])
     .build(tauri::generate_context!())
     .expect("error while building tauri application")
     .run(|app_handle, event| match event {

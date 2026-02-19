@@ -259,6 +259,23 @@ async def get_all_configs(payload=Depends(auth.require_client)):
         ovpn_cfg = await db.get_core_config("openvpn")
         port = int((ovpn_cfg or {}).get("port", 1194))
         proto = (ovpn_cfg or {}).get("protocol", "udp")
+
+        # Try to get the personalised .ovpn config (with embedded certs) for this client
+        ovpn_extra = {"proto": proto, "port": port}
+        try:
+            from protocols.manager import protocol_manager as _pm
+            p_mgr = _pm.get_protocol("openvpn")
+            if p_mgr:
+                pdata_ovpn = protocol_data.get("openvpn", {})
+                ovpn_client_cfg = await p_mgr.get_client_config(
+                    client["username"], server_ip, pdata_ovpn
+                )
+                if ovpn_client_cfg and ovpn_client_cfg.get("ovpn_config"):
+                    ovpn_extra["ovpn_config"] = ovpn_client_cfg["ovpn_config"]
+                    ovpn_extra["username"] = client["username"]
+        except Exception as _e:
+            logger.warning(f"Could not fetch OpenVPN client config: {_e}")
+
         configs.append({
             "id": "openvpn-1",
             "name": f"OpenVPN ({proto.upper()})",
@@ -269,7 +286,7 @@ async def get_all_configs(payload=Depends(auth.require_client)):
             "port": port,
             "configLink": f"openvpn://{server_ip}:{port}?proto={proto}",
             "icon": "🔒",
-            "extraData": {"proto": proto}
+            "extraData": ovpn_extra,
         })
 
     # 4. IKEv2
@@ -451,6 +468,23 @@ async def report_connection(req: ConnectionEvent, payload=Depends(auth.require_c
     return {"success": True, "message": f"Connection {req.event} logged"}
 
 
+class HeartbeatRequest(BaseModel):
+    protocol: str = ""
+    ip: str = ""
+
+
+@router.post("/heartbeat")
+async def client_heartbeat(req: HeartbeatRequest, payload=Depends(auth.require_client)):
+    """
+    Clients call this every ~60s while connected to keep their online status alive.
+    If no heartbeat is received within 5 minutes the server marks the client offline.
+    """
+    client_id = payload.get("client_id")
+    ip = req.ip or "0.0.0.0"
+    await db.add_connection_history(client_id, req.protocol or "unknown", "heartbeat", ip)
+    return {"success": True, "message": "Heartbeat received"}
+
+
 @router.get("/server")
 async def get_server_info():
     # Get panel config for IP
@@ -463,6 +497,38 @@ async def get_server_info():
             "hostname": hostname,
             "ip": ip,
             "version": "1.4.2"
+        }
+    }
+
+
+@router.get("/network-speed")
+async def get_network_speed(payload=Depends(auth.require_client)):
+    """Return real-time network I/O speed measured on the server using psutil.
+    Uses a short delta measurement (0.3s) to compute current throughput.
+    Returns speed in KB/s and cumulative totals in bytes.
+    """
+    import psutil
+
+    net1 = psutil.net_io_counters()
+    await asyncio.sleep(0.3)
+    net2 = psutil.net_io_counters()
+
+    # Calculate bytes per second, then convert to KB/s
+    elapsed = 0.3
+    dl_bytes_per_sec = (net2.bytes_recv - net1.bytes_recv) / elapsed
+    ul_bytes_per_sec = (net2.bytes_sent - net1.bytes_sent) / elapsed
+
+    dl_kbps = dl_bytes_per_sec / 1024
+    ul_kbps = ul_bytes_per_sec / 1024
+
+    return {
+        "success": True,
+        "data": {
+            "downloadSpeed": round(dl_kbps, 1),
+            "uploadSpeed": round(ul_kbps, 1),
+            "totalDownload": net2.bytes_recv,
+            "totalUpload": net2.bytes_sent,
+            "countryCode": "??",
         }
     }
 

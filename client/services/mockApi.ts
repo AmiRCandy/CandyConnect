@@ -560,15 +560,37 @@ export const SaveSettings = async (newSettings: Settings): Promise<void> => {
   }
 };
 
+// Simulated speed state for smooth mock traffic curves
+let _mockBaseDown = 0;
+let _mockBaseUp = 0;
+
 export const GetNetworkSpeed = async (): Promise<NetworkSpeed> => {
   if (!isConnected) {
+    _mockBaseDown = 0;
+    _mockBaseUp = 0;
     return { countryCode: '--', downloadSpeed: 0, uploadSpeed: 0, totalDownload: sessionTotalDownload, totalUpload: sessionTotalUpload };
   }
 
-  const dl = Math.floor(Math.random() * 5000) + 500;
-  const ul = Math.floor(Math.random() * 1000) + 100;
+  // Simulate realistic smooth speed with gradual ramp-up and random fluctuation
+  if (_mockBaseDown === 0) {
+    // First call after connect — ramp up from zero
+    _mockBaseDown = 200 + Math.random() * 300;
+    _mockBaseUp = 50 + Math.random() * 100;
+  }
+
+  // Gradual random walk (smooth, not jumpy)
+  _mockBaseDown += (Math.random() - 0.48) * 150; // slight upward bias
+  _mockBaseUp += (Math.random() - 0.48) * 40;
+
+  // Clamp to realistic ranges
+  _mockBaseDown = Math.max(100, Math.min(6000, _mockBaseDown));
+  _mockBaseUp = Math.max(20, Math.min(1500, _mockBaseUp));
+
+  const dl = Math.round(_mockBaseDown * 10) / 10;
+  const ul = Math.round(_mockBaseUp * 10) / 10;
+
   sessionTotalDownload += dl * 1024; // accumulate bytes
-  sessionTotalUpload += ul * 256;
+  sessionTotalUpload += ul * 1024;
 
   return {
     countryCode: 'DE',
