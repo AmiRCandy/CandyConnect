@@ -10,7 +10,7 @@ const coreIcons: Record<string, React.ReactNode> = {
   openvpn: <Lock className="w-4.5 h-4.5 text-green-500" strokeWidth={2} />,
   ikev2: <KeyRound className="w-4.5 h-4.5 text-purple-500" strokeWidth={2} />,
   l2tp: <Radio className="w-4.5 h-4.5 text-slate-400" strokeWidth={2} />,
-  dnstt: <Globe className="w-4.5 h-4.5 text-cyan-500" strokeWidth={2} />,
+  amnezia: <Globe className="w-4.5 h-4.5 text-cyan-500" strokeWidth={2} />,
   slipstream: <Wind className="w-4.5 h-4.5 text-teal-500" strokeWidth={2} />,
   trusttunnel: <Castle className="w-4.5 h-4.5 text-indigo-500" strokeWidth={2} />,
 };

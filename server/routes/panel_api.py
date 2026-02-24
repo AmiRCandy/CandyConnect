@@ -8,6 +8,10 @@ from pydantic import BaseModel
 import paramiko
 import time
 
+from fastapi.responses import PlainTextResponse
+import base64
+
+
 import database as db
 import auth
 from config import SUPPORTED_PROTOCOLS
@@ -142,6 +146,70 @@ async def update_client(id: str, req: UpdateClientRequest, user=Depends(auth.req
         return {"success": True, "message": "Client updated", "data": updated}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/clients/{id}/openvpn-config")
+async def download_openvpn_config(id: str, user=Depends(auth.require_admin)):
+    client = await db.get_client(id)
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    panel_cfg = await db.get_core_config("candyconnect") or {}
+    server_ip = panel_cfg.get("server_ip") or (await get_server_info()).get("ip", "")
+    p_mgr = protocol_manager.get_protocol("openvpn")
+    pdata_ovpn = (client.get("protocol_data", {}) or {}).get("openvpn", {})
+    cfg = await p_mgr.get_client_config(client["username"], server_ip, pdata_ovpn)
+    ovpn = cfg.get("ovpn_config") if isinstance(cfg, dict) else None
+    if not ovpn:
+        raise HTTPException(status_code=404, detail="OpenVPN config not found")
+    return PlainTextResponse(
+        content=ovpn,
+        headers={"Content-Disposition": f'attachment; filename="{client["username"]}.ovpn"'},
+        media_type="application/x-openvpn-profile",
+    )
+
+
+@router.post("/clients/{id}/wireguard-qr")
+async def generate_wireguard_qr(id: str, user=Depends(auth.require_admin)):
+    client = await db.get_client(id)
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+
+    panel_cfg = await db.get_core_config("candyconnect") or {}
+    server_ip = panel_cfg.get("server_ip") or (await get_server_info()).get("ip", "")
+
+    pdata = (client.get("protocol_data", {}) or {}).get("wireguard", {})
+    wg = protocol_manager.get_protocol("wireguard")
+    pdata = await wg.ensure_client_credentials(client["username"], pdata)
+    all_pd = client.get("protocol_data", {}) or {}
+    all_pd["wireguard"] = pdata
+    await db.update_client(client["id"], {"protocol_data": all_pd})
+
+    cfg = await wg.get_client_config(client["username"], server_ip, pdata)
+    wg_config = (cfg or {}).get("wg_config", "")
+    if not wg_config:
+        raise HTTPException(status_code=500, detail="Failed to generate WireGuard config")
+
+    qr_data_url = ""
+    try:
+        import qrcode
+        from io import BytesIO
+        img = qrcode.make(wg_config)
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        qr_data_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        qr_data_url = ""
+
+    return {
+        "success": True,
+        "message": "WireGuard config generated",
+        "data": {
+            "wg_config": wg_config,
+            "qr_data_url": qr_data_url,
+            "status": "ready",
+        },
+    }
+
 
 @router.delete("/clients/{id}")
 async def delete_client(id: str, user=Depends(auth.require_admin)):
@@ -330,6 +398,7 @@ async def restart_panel(user=Depends(auth.require_admin)):
     # Graceful shutdown after returning response
     def shutdown():
         import time
+
         time.sleep(1)
         os.kill(os.getpid(), signal.SIGTERM)
     

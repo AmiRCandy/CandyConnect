@@ -96,7 +96,7 @@ export async function getDashboard(limit: number = 10): Promise<DashboardData> {
 
 export interface ClientProtocols {
   v2ray: boolean; wireguard: boolean; openvpn: boolean; ikev2: boolean;
-  l2tp: boolean; dnstt: boolean; slipstream: boolean; trusttunnel: boolean;
+  l2tp: boolean; amnezia: boolean; slipstream: boolean; trusttunnel: boolean;
 }
 
 export interface ConnectionHistoryEntry {
@@ -162,6 +162,22 @@ export async function updateClient(id: string, data: UpdateClientRequest): Promi
 export async function deleteClient(id: string): Promise<void> {
   const res = await request<void>('DELETE', `/clients/${id}`);
   if (!res.success) throw new Error(res.message);
+}
+
+
+export async function downloadOpenVpnConfig(clientId: string): Promise<string> {
+  const token = sessionStorage.getItem('cc_token');
+  const headers: Record<string, string> = {};
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  const res = await fetch(`${API_BASE}/clients/${clientId}/openvpn-config`, { headers });
+  if (!res.ok) throw new Error('Failed to download OpenVPN config');
+  return res.text();
+}
+
+export async function generateWireGuardQr(clientId: string): Promise<{ wg_config: string; qr_data_url: string; status: string }> {
+  const res = await request<{ wg_config: string; qr_data_url: string; status: string }>('POST', `/clients/${clientId}/wireguard-qr`);
+  if (!res.success || !res.data) throw new Error(res.message || 'Failed to generate WireGuard QR');
+  return res.data;
 }
 
 // ── Logs ──
@@ -254,12 +270,12 @@ export interface CoreConfigs {
     port: number; ipsec_port: number; psk: string; local_ip: string; remote_range: string;
     dns: string; mtu: number; mru: number;
   };
-  dnstt: {
-    listen_port: number;
+  amnezia: {
+    port: number;
     domain: string;
+    transport: string;
+    obfuscation: string;
     public_key: string;
-    tunnel_mode: string;
-    mtu: number;
   };
   slipstream: {
     port: number; method: string; obfs: string; obfs_host: string;

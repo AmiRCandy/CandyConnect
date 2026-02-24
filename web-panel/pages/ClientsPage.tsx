@@ -1,12 +1,12 @@
 import React, { useState, useEffect } from 'react';
-import { getClients, createClient, updateClient, deleteClient as apiDeleteClient, type Client, type ClientProtocols } from '../services/api';
+import { getClients, createClient, updateClient, deleteClient as apiDeleteClient, downloadOpenVpnConfig, generateWireGuardQr, type Client, type ClientProtocols } from '../services/api';
 import { formatClientTraffic, getTrafficPercent, protocolName, protocolIcon } from '../utils/format';
 import ProgressBar from '../components/ProgressBar';
 import Modal from '../components/Modal';
 import { useNotify } from '../components/Notification';
 import { Users, Search, ClipboardList, Pencil, Trash2, CheckCircle2, XCircle, Plus, AlertTriangle, PauseCircle, Clock, ArrowDownUp, Loader2, Activity } from 'lucide-react';
 
-const ALL_PROTOCOLS = ['v2ray', 'wireguard', 'openvpn', 'ikev2', 'l2tp', 'dnstt', 'slipstream', 'trusttunnel'] as const;
+const ALL_PROTOCOLS = ['v2ray', 'wireguard', 'openvpn', 'ikev2', 'l2tp', 'amnezia', 'slipstream', 'trusttunnel'] as const;
 
 // Helper to adapt snake_case API client to display
 const fmtTimeLimit = (c: Client) => {
@@ -34,6 +34,8 @@ const ClientsPage: React.FC = () => {
   const [confirmDelete, setConfirmDelete] = useState<Client | null>(null);
   const [selectedGroup, setSelectedGroup] = useState<string>('All');
   const [saving, setSaving] = useState(false);
+  const [wgQrData, setWgQrData] = useState<{ qr_data_url: string; wg_config: string } | null>(null);
+  const [wgQrLoading, setWgQrLoading] = useState(false);
 
   // Form state
   const [fUsername, setFUsername] = useState('');
@@ -136,6 +138,42 @@ const ClientsPage: React.FC = () => {
     }
   };
 
+
+
+  const handleDownloadOpenVpn = async (client: Client) => {
+    try {
+      const content = await downloadOpenVpnConfig(client.id);
+      const blob = new Blob([content], { type: 'application/x-openvpn-profile' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${client.username}.ovpn`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      notify('OpenVPN config downloaded', 'success');
+    } catch (e: any) {
+      notify(e.message || 'Failed to download OpenVPN config', 'error');
+    }
+  };
+
+  const handleGenerateWireGuardQr = async (client: Client) => {
+    try {
+      setWgQrLoading(true);
+      const data = await generateWireGuardQr(client.id);
+      setWgQrData({ qr_data_url: data.qr_data_url, wg_config: data.wg_config });
+      await fetchClients();
+      const fresh = await getClients();
+      const updated = fresh.find(c => c.id === client.id);
+      if (updated) setDetailClient(updated);
+    } catch (e: any) {
+      notify(e.message || 'Failed to generate WireGuard QR', 'error');
+    } finally {
+      setWgQrLoading(false);
+    }
+  };
+
   const showForm = isAddMode || !!editClient;
 
   if (loading) return <div className="flex items-center justify-center py-20"><Loader2 className="w-8 h-8 animate-spin text-orange-500" /></div>;
@@ -206,7 +244,7 @@ const ClientsPage: React.FC = () => {
       </div>
 
       {/* Detail Modal */}
-      <Modal open={!!detailClient} title={<span className="flex items-center gap-2"><ClipboardList className="w-5 h-5 text-slate-500" /> {detailClient?.username || ''}</span>} onClose={() => setDetailClient(null)} wide>
+      <Modal open={!!detailClient} title={<span className="flex items-center gap-2"><ClipboardList className="w-5 h-5 text-slate-500" /> {detailClient?.username || ''}</span>} onClose={() => { setDetailClient(null); setWgQrData(null); }} wide>
         {detailClient && (
           <div className="space-y-4 text-sm">
             {[
@@ -267,14 +305,17 @@ const ClientsPage: React.FC = () => {
                     {protocolIcon(pid)} {protocolName(pid)}
                   </p>
                   {pid === 'v2ray' && <p><span className="text-slate-400">UUID:</span> <span className="text-orange-500 font-mono">{data.uuid}</span></p>}
-                  {pid === 'wireguard' && <p><span className="text-slate-400">Public Key:</span> <span className="text-orange-500 font-mono">{data.public_key}</span></p>}
-                  {pid === 'dnstt' && (
+                  {pid === 'wireguard' && (<>
+                    <p><span className="text-slate-400">Public Key:</span> <span className="text-orange-500 font-mono">{data.public_key || 'Not generated yet'}</span></p>
+                    <button onClick={() => handleGenerateWireGuardQr(detailClient)} disabled={wgQrLoading} className="mt-1 px-2 py-1 rounded-lg text-[11px] font-bold bg-orange-500 text-white hover:bg-orange-600 disabled:opacity-60">{wgQrLoading ? 'Generating...' : 'QR Code'}</button>
+                  </>)}
+                  {pid === 'amnezia' && (
                     <>
-                      <p><span className="text-slate-400">SSH User:</span> <span className="text-orange-500 font-mono">{data.ssh_username}</span></p>
-                      <p><span className="text-slate-400">SSH Pass:</span> <span className="text-orange-500 font-mono">{data.ssh_password}</span></p>
+                      <p><span className="text-slate-400">Domain:</span> <span className="text-orange-500 font-mono">{data.domain || '-'}</span></p>
+                      <p><span className="text-slate-400">Obfuscation:</span> <span className="text-orange-500 font-mono">{data.obfuscation || 'on'}</span></p>
                     </>
                   )}
-                  {pid === 'openvpn' && <p><span className="text-slate-400">Config:</span> <span className="text-orange-500 font-mono">{detailClient.username}.ovpn available</span></p>}
+                  {pid === 'openvpn' && <p><span className="text-slate-400">Config:</span> <button onClick={() => handleDownloadOpenVpn(detailClient)} className="text-orange-500 font-mono underline">{detailClient.username}.ovpn</button></p>}
                   {pid === 'ikev2' && <p><span className="text-slate-400">Auth:</span> <span className="text-green-500 font-bold">EAP-MSCHAPv2 Active</span></p>}
                   {pid === 'l2tp' && data.psk && <p><span className="text-slate-400">IPSec PSK:</span> <span className="text-orange-500 font-mono">{data.psk}</span></p>}
                   {['slipstream', 'trusttunnel'].includes(pid) && <p className="text-slate-400 italic">Experimental protocol</p>}
@@ -285,6 +326,16 @@ const ClientsPage: React.FC = () => {
           </div>
         )}
       </Modal>
+
+      <Modal open={!!wgQrData} title={<span className="flex items-center gap-2">WireGuard QR</span>} onClose={() => setWgQrData(null)}>
+        {wgQrData && (
+          <div className="space-y-3">
+            {wgQrData.qr_data_url ? <img src={wgQrData.qr_data_url} alt="WireGuard QR" className="mx-auto w-56 h-56" /> : <p className="text-xs text-slate-400">QR image unavailable. Use config text below.</p>}
+            <textarea readOnly value={wgQrData.wg_config} className="w-full h-40 p-2 text-xs rounded-lg border border-slate-300 dark:border-slate-600 bg-slate-50 dark:bg-slate-800" />
+          </div>
+        )}
+      </Modal>
+
 
       {/* Add/Edit Modal */}
       <Modal open={showForm} title={isAddMode ? <span className="flex items-center gap-2"><Plus className="w-5 h-5" /> New Client</span> : <span className="flex items-center gap-2"><Pencil className="w-4 h-4 text-orange-500" /> Edit: {editClient?.username || ''}</span>} onClose={() => { setEditClient(null); setIsAddMode(false); }} wide

@@ -18,7 +18,7 @@ export const formatClientTraffic = (usedGB: number, limit: { value: number; unit
 export const getTrafficPercent = (usedGB: number, limit: { value: number; unit: string }) =>
     limit.unit === 'MB' ? ((usedGB * 1024) / limit.value) * 100 : (usedGB / limit.value) * 100;
 
-export const protocolName = (id: string) => ({ v2ray: 'V2Ray', wireguard: 'WireGuard', openvpn: 'OpenVPN', ikev2: 'IKEv2', l2tp: 'L2TP', dnstt: 'DNSTT', slipstream: 'SlipStream', trusttunnel: 'TrustTunnel' }[id] || id);
+export const protocolName = (id: string) => ({ v2ray: 'V2Ray', wireguard: 'WireGuard', openvpn: 'OpenVPN', ikev2: 'IKEv2', l2tp: 'L2TP', amnezia: 'Amnezia', slipstream: 'SlipStream', trusttunnel: 'TrustTunnel' }[id] || id);
 
 export const protocolIcon = (id: string) => {
     const p = { size: 12, strokeWidth: 2.5 };
@@ -28,7 +28,7 @@ export const protocolIcon = (id: string) => {
         case 'openvpn': return <Lock {...p} />;
         case 'ikev2': return <KeyRound {...p} />;
         case 'l2tp': return <Radio {...p} />;
-        case 'dnstt': return <Globe {...p} />;
+        case 'amnezia': return <Globe {...p} />;
         case 'slipstream': return <Wind {...p} />;
         case 'trusttunnel': return <Castle {...p} />;
         default: return <Circle {...p} />;

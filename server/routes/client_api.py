@@ -100,7 +100,7 @@ async def get_protocols(payload=Depends(auth.require_client)):
     result = []
     icon_map = {
         "v2ray": "⚡", "wireguard": "🛡️", "openvpn": "🔒",
-        "ikev2": "🔐", "l2tp": "📡", "dnstt": "🌐",
+        "ikev2": "🔐", "l2tp": "📡", "amnezia": "🌐",
         "slipstream": "💨", "trusttunnel": "🏰",
     }
     for core in cores:
@@ -323,29 +323,26 @@ async def get_all_configs(payload=Depends(auth.require_client)):
             "extraData": {"username": client["username"]}
         })
 
-    # 6. DNSTT
-    if is_enabled("dnstt"):
-        dnstt_cfg = await db.get_core_config("dnstt")
-        port = int((dnstt_cfg or {}).get("listen_port", 5300))
-        domain = (dnstt_cfg or {}).get("domain", "dns.candyconnect.io")
-        pdata = protocol_data.get("dnstt", {})
-        ssh_user = pdata.get("ssh_username", f"dnstt_{client['username']}")
-        
+    # 6. Amnezia
+    if is_enabled("amnezia"):
+        amnezia_cfg = await db.get_core_config("amnezia")
+        port = int((amnezia_cfg or {}).get("port", 51830))
+        domain = (amnezia_cfg or {}).get("domain", f"amnezia.{server_ip}")
+
         configs.append({
-            "id": "dnstt-1",
-            "name": "DNSTT Tunnel",
-            "protocol": "DNSTT",
-            "transport": "dns",
+            "id": "amnezia-1",
+            "name": "Amnezia",
+            "protocol": "Amnezia",
+            "transport": (amnezia_cfg or {}).get("transport", "udp"),
             "security": "obfs",
             "address": server_ip,
             "port": port,
-            "configLink": f"dnstt://{ssh_user}@{domain}:{port}",
-            "icon": "🌐",
+            "configLink": f"amnezia://{domain}:{port}",
+            "icon": "🧊",
             "extraData": {
-                "ssh_username": ssh_user,
-                "ssh_password": pdata.get("ssh_password", ""),
-                "public_key": (dnstt_cfg or {}).get("public_key", ""),
-                "domain": domain
+                "domain": domain,
+                "public_key": (amnezia_cfg or {}).get("public_key", ""),
+                "obfuscation": (amnezia_cfg or {}).get("obfuscation", "on"),
             }
         })
 
@@ -401,7 +398,7 @@ async def get_protocol_config(protocol: str, payload=Depends(auth.require_client
         "vless": "v2ray", "vmess": "v2ray", "trojan": "v2ray", 
         "shadowsocks": "v2ray", "wireguard": "wireguard",
         "openvpn": "openvpn", "ikev2": "ikev2", "l2tp": "l2tp",
-        "dnstt": "dnstt", "slipstream": "slipstream",
+        "amnezia": "amnezia", "slipstream": "slipstream",
         "trusttunnel": "trusttunnel",
     }
     
@@ -567,7 +564,7 @@ async def ping_config(config_id: str, payload=Depends(auth.require_client)):
         "vless": "v2ray", "vmess": "v2ray", "trojan": "v2ray", 
         "shadowsocks": "v2ray", "wireguard": "wireguard",
         "openvpn": "openvpn", "ikev2": "ikev2", "l2tp": "l2tp",
-        "dnstt": "dnstt", "slipstream": "slipstream",
+        "amnezia": "amnezia", "slipstream": "slipstream",
         "trusttunnel": "trusttunnel",
     }
     
@@ -590,7 +587,7 @@ async def ping_config(config_id: str, payload=Depends(auth.require_client)):
             "openvpn": random.uniform(20, 80),
             "ikev2": random.uniform(15, 50),
             "l2tp": random.uniform(25, 90),
-            "dnstt": random.uniform(50, 200),
+            "amnezia": random.uniform(50, 200),
             "slipstream": random.uniform(15, 60),
             "trusttunnel": random.uniform(20, 70),
         }
@@ -644,7 +641,7 @@ async def ping_all_configs(payload=Depends(auth.require_client)):
     
     protocol_overhead = {
         "v2ray": (10, 60), "wireguard": (5, 30), "openvpn": (20, 80),
-        "ikev2": (15, 50), "l2tp": (25, 90), "dnstt": (50, 200),
+        "ikev2": (15, 50), "l2tp": (25, 90), "amnezia": (50, 200),
         "slipstream": (15, 60), "trusttunnel": (20, 70),
     }
     

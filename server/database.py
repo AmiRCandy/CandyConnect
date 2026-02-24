@@ -103,7 +103,7 @@ async def init_db():
             await r.hset(K_CONFIGS, section, json.dumps(data))
 
     # Default core statuses
-    for proto in ["v2ray", "wireguard", "openvpn", "ikev2", "l2tp", "dnstt", "slipstream", "trusttunnel"]:
+    for proto in ["v2ray", "wireguard", "openvpn", "ikev2", "l2tp", "amnezia", "slipstream", "trusttunnel"]:
         if not await r.hexists(K_CORE_STATUS, proto):
             # All protocols except slipstream and trusttunnel are running by default
             status = "running" if proto not in ["slipstream", "trusttunnel"] else "stopped"
@@ -124,7 +124,7 @@ async def init_db():
             "comment": "Default administrator client",
             "enabled": True,
             "protocols": {p: (p not in ["slipstream", "trusttunnel"]) for p in [
-                "v2ray", "wireguard", "openvpn", "ikev2", "l2tp", "dnstt", "slipstream", "trusttunnel"
+                "v2ray", "wireguard", "openvpn", "ikev2", "l2tp", "amnezia", "slipstream", "trusttunnel"
             ]}
         }
         await create_client(admin_client_data)
@@ -211,12 +211,12 @@ def _default_core_configs() -> dict:
             "remote_range": "10.20.0.10-10.20.0.250",
             "dns": "1.1.1.1", "mtu": 1400, "mru": 1400,
         },
-        "dnstt": {
-            "listen_port": 5300,
-            "domain": f"dns.{PANEL_DOMAIN}",
+        "amnezia": {
+            "port": 51830,
+            "transport": "udp",
+            "obfuscation": "on",
+            "domain": f"amnezia.{PANEL_DOMAIN}",
             "public_key": "",
-            "tunnel_mode": "ssh",
-            "mtu": 1232,
         },
         "slipstream": {
             "port": 8388, "method": "aes-256-cfb",
@@ -365,7 +365,7 @@ async def create_client(data: dict) -> dict:
         "created_at": now,
         "expires_at": _calc_expiry(now, data.get("time_limit", {"mode": "days", "value": 30})),
         "protocols": data.get("protocols", {p: True for p in [
-            "v2ray", "wireguard", "openvpn", "ikev2", "l2tp", "dnstt", "slipstream", "trusttunnel"
+            "v2ray", "wireguard", "openvpn", "ikev2", "l2tp", "amnezia", "slipstream", "trusttunnel"
         ]}),
         "protocol_data": data.get("protocol_data", {}),
         "last_connected_ip": None,
@@ -413,7 +413,7 @@ async def delete_client(client_id: str) -> bool:
     await r.hdel(K_CLIENTS, client_id)
     await r.hdel(K_CLIENT_IDX, client.get("username", ""))
     # Clean up traffic keys
-    for proto in ["v2ray", "wireguard", "openvpn", "ikev2", "l2tp", "dnstt", "slipstream", "trusttunnel"]:
+    for proto in ["v2ray", "wireguard", "openvpn", "ikev2", "l2tp", "amnezia", "slipstream", "trusttunnel"]:
         await r.hdel(K_TRAFFIC, f"{client_id}:{proto}")
     await _add_log("INFO", "System", f"Client '{client.get('username', '')}' deleted")
     return True

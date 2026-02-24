@@ -25,7 +25,7 @@ from protocols.wireguard import WireGuardProtocol
 from protocols.openvpn import OpenVPNProtocol
 from protocols.ikev2 import IKEv2Protocol
 from protocols.l2tp import L2TPProtocol
-from protocols.dnstt import DNSTTProtocol
+from protocols.amnezia import AmneziaProtocol
 from protocols.slipstream import SlipStreamProtocol
 from protocols.trusttunnel import TrustTunnelProtocol
 
@@ -39,7 +39,7 @@ class ProtocolManager:
             "openvpn": OpenVPNProtocol(),
             "ikev2": IKEv2Protocol(),
             "l2tp": L2TPProtocol(),
-            "dnstt": DNSTTProtocol(),
+            "amnezia": AmneziaProtocol(),
             "slipstream": SlipStreamProtocol(),
             "trusttunnel": TrustTunnelProtocol(),
         }
@@ -53,7 +53,7 @@ class ProtocolManager:
         logger = logging.getLogger("candyconnect")
         
         # 1. Start Protocols
-        for pid in ["v2ray", "wireguard", "openvpn", "ikev2", "l2tp", "dnstt"]:
+        for pid in ["v2ray", "wireguard", "openvpn", "ikev2", "l2tp", "amnezia"]:
             try:
                 installed = await self.install_protocol(pid)
                 started = await self.start_protocol(pid)
@@ -283,8 +283,8 @@ class ProtocolManager:
                 return int(cfg.get("port", default_port))
             elif pid == "l2tp":
                 return int(cfg.get("port", default_port))
-            elif pid == "dnstt":
-                return int(cfg.get("listen_port", default_port))
+            elif pid == "amnezia":
+                return int(cfg.get("port", default_port))
             elif pid in ("slipstream", "trusttunnel"):
                 return int(cfg.get("port", default_port))
             elif pid == "v2ray":

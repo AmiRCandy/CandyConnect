@@ -174,41 +174,67 @@ class WireGuardProtocol(BaseProtocol):
         return {"in": total_rx, "out": total_tx}
 
     async def add_client(self, username: str, client_data: dict) -> dict:
-        """Create a new WireGuard peer for a client."""
+        """Register WireGuard client placeholder.
+
+        Real keys/config are generated only on explicit request (QR/config download)
+        to support user-driven provisioning flow.
+        """
+        existing_privkey = (client_data or {}).get("private_key")
+        existing_pubkey = (client_data or {}).get("public_key")
+        existing_addr = (client_data or {}).get("address")
+        if existing_privkey and existing_pubkey and existing_addr:
+            config = await get_core_config("wireguard") or {}
+            return {
+                "private_key": existing_privkey,
+                "public_key": existing_pubkey,
+                "address": existing_addr,
+                "server_public_key": config.get("public_key", ""),
+                "generated_on_demand": True,
+            }
+
+        return {
+            "generated_on_demand": False,
+            "status": "pending_qr_generation",
+        }
+
+    async def ensure_client_credentials(self, username: str, protocol_data: dict | None = None) -> dict:
+        """Create WG keys/address lazily and return updated protocol_data."""
+        protocol_data = protocol_data or {}
+        if protocol_data.get("private_key") and protocol_data.get("public_key") and protocol_data.get("address"):
+            return protocol_data
+
         client_privkey = ""
         client_pubkey = ""
-        
-        # 1. Generate client keys
         rc, client_privkey, _ = await self._run_cmd("wg genkey")
-        if rc == 0:
-            proc = await asyncio.create_subprocess_shell(
-                "wg pubkey",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-            )
-            pub_out, _ = await proc.communicate(client_privkey.encode())
-            client_pubkey = pub_out.decode().strip()
+        if rc != 0 or not client_privkey:
+            return protocol_data
 
-        # 2. Get server config
-        config = await get_core_config("wireguard")
-        name = "wg0"
-        
-        # 3. Choose next IP (random for now within the 10.66.66.0/24 subnet)
+        proc = await asyncio.create_subprocess_shell(
+            "wg pubkey",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+        )
+        pub_out, _ = await proc.communicate(client_privkey.encode())
+        client_pubkey = pub_out.decode().strip()
+
         import random
         last_octet = random.randint(2, 254)
         client_address = f"10.66.66.{last_octet}/32"
 
-        # 4. Add peer to running interface
         await self._run_cmd(
-            f"sudo wg set {name} peer {client_pubkey} allowed-ips {client_address}",
+            f"sudo wg set wg0 peer {client_pubkey} allowed-ips {client_address}",
             check=False,
         )
-        
+
+        config = await get_core_config("wireguard") or {}
         return {
-            "private_key": client_privkey,
+            **protocol_data,
+            "private_key": client_privkey.strip(),
             "public_key": client_pubkey,
             "address": client_address,
             "server_public_key": config.get("public_key", ""),
+            "generated_on_demand": True,
+            "status": "ready",
         }
 
     async def remove_client(self, username: str, protocol_data: dict):
@@ -228,6 +254,11 @@ class WireGuardProtocol(BaseProtocol):
         # Build full WG config string for convenience
         address = protocol_data.get("address", "")
         privkey = protocol_data.get("private_key", "")
+        if not address or not privkey:
+            return {
+                "type": "wireguard",
+                "status": "pending_qr_generation",
+            }
         pubkey = config.get("public_key", "")
         port = config.get("listen_port", 51820)
 
