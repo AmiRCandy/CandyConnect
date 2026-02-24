@@ -41,7 +41,7 @@ const TABS = [
   { id: 'openvpn', name: 'OpenVPN', icon: <Lock size={14} /> },
   { id: 'ikev2', name: 'IKEv2', icon: <KeyRound size={14} /> },
   { id: 'l2tp', name: 'L2TP', icon: <Radio size={14} /> },
-  { id: 'dnstt', name: 'DNSTT', icon: <Globe size={14} /> },
+  { id: 'amnezia', name: 'Amnezia', icon: <Globe size={14} /> },
   { id: 'slipstream', name: 'SlipStream', icon: <Wind size={14} /> },
   { id: 'trusttunnel', name: 'TrustTunnel', icon: <Castle size={14} /> },
 ];
@@ -135,7 +135,7 @@ const SimpleConfigPanel: React.FC<{
   }, [cfg, sectionKey]);
 
   const core = cores.find(c => c.id === id);
-  const icons: any = { openvpn: Lock, ikev2: KeyRound, l2tp: Radio, dnstt: Globe, slipstream: Wind, trusttunnel: Castle };
+  const icons: any = { openvpn: Lock, ikev2: KeyRound, l2tp: Radio, amnezia: Globe, slipstream: Wind, trusttunnel: Castle };
   const Icon = icons[id] || Circle;
 
   return (
@@ -316,12 +316,12 @@ const CoreConfigsPage: React.FC = () => {
         { label: 'MTU', key: 'mtu', type: 'number', value: cfg.l2tp.mtu },
         { label: 'MRU', key: 'mru', type: 'number', value: cfg.l2tp.mru },
       ]);
-      case 'dnstt': return renderSimpleConfig('dnstt', 'DNSTT', [
-        { label: 'Listen Port', key: 'listen_port', type: 'number', value: cfg.dnstt.listen_port },
-        { label: 'Domain', key: 'domain', value: cfg.dnstt.domain },
-        { label: 'Tunnel Mode', key: 'tunnel_mode', options: ['ssh', 'socks'], value: cfg.dnstt.tunnel_mode },
-        { label: 'MTU', key: 'mtu', type: 'number', value: cfg.dnstt.mtu },
-        { label: 'Public Key', key: 'public_key', value: cfg.dnstt.public_key, readOnly: true },
+      case 'amnezia': return renderSimpleConfig('amnezia', 'Amnezia', [
+        { label: 'Port', key: 'port', type: 'number', value: cfg.amnezia.port },
+        { label: 'Domain', key: 'domain', value: cfg.amnezia.domain },
+        { label: 'Transport', key: 'transport', options: ['udp', 'tcp'], value: cfg.amnezia.transport },
+        { label: 'Obfuscation', key: 'obfuscation', options: ['on', 'off'], value: cfg.amnezia.obfuscation },
+        { label: 'Public Key', key: 'public_key', value: cfg.amnezia.public_key, readOnly: true },
       ]);
       case 'slipstream': return renderSimpleConfig('slipstream', 'SlipStream', [
         { label: 'Port', key: 'port', type: 'number', value: cfg.slipstream.port },

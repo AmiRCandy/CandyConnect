@@ -85,7 +85,7 @@ install_dependencies() {
         ca-certificates gnupg \
         openvpn easy-rsa \
         strongswan strongswan-pki libcharon-extra-plugins \
-        xl2tpd wireguard wireguard-tools dante-server \
+        xl2tpd wireguard wireguard-tools amneziawg-tools dante-server \
         openssh-server openssh-client
 
     # Install Node.js (proper version)
@@ -97,30 +97,9 @@ install_dependencies() {
         bash -c 'curl -sL https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh | bash -s -- install' || warn "Xray installation failed"
     fi
 
-    # Install DNSTT-server (Robust install with checksum verification)
-    info "Installing DNSTT..."
-    if [ ! -f "/usr/local/bin/dnstt-server" ]; then
-        DURL="https://dnstt.network"
-        ARCH=$(uname -m)
-        if [ "$ARCH" = "x86_64" ]; then DARCH="amd64"; elif [ "$ARCH" = "aarch64" ]; then DARCH="arm64"; else DARCH="386"; fi
-        DFILE="dnstt-server-linux-${DARCH}"
-        
-        info "Downloading DNSTT from ${DURL}/${DFILE}..."
-        curl -L -o "/tmp/${DFILE}" "${DURL}/${DFILE}"
-        curl -L -s -o "/tmp/SHA256SUMS" "${DURL}/SHA256SUMS"
-        
-        cd /tmp
-        if sha256sum -c <(grep "${DFILE}" SHA256SUMS) 2>/dev/null; then
-            mv "/tmp/${DFILE}" "/usr/local/bin/dnstt-server"
-            chmod +x "/usr/local/bin/dnstt-server"
-            info "DNSTT verified and installed"
-        else
-            warn "DNSTT checksum verification failed! Attempting insecure install..."
-            wget -qO /usr/local/bin/dnstt-server "${DURL}/${DFILE}" || warn "DNSTT download failed"
-            chmod +x /usr/local/bin/dnstt-server
-        fi
-        cd - >/dev/null
-    fi
+        info "Installing Amnezia tools..."
+    command -v amneziawg >/dev/null 2>&1 || warn "amneziawg binary not found; ensure repository package is available for your distro"
+
 
     # Enable and start Redis
     systemctl enable redis-server || true

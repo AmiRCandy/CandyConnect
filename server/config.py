@@ -60,6 +60,6 @@ DEFAULT_ADMIN_PASS = os.environ.get("CC_ADMIN_PASS", "admin123")
 
 # ── Protocols ──
 SUPPORTED_PROTOCOLS = [
-    "v2ray", "wireguard", "openvpn", "ikev2", "l2tp", "dnstt",
+    "v2ray", "wireguard", "openvpn", "ikev2", "l2tp", "amnezia",
     "slipstream", "trusttunnel",
 ]
