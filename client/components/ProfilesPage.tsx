@@ -150,7 +150,8 @@ const ProfilesPage: React.FC<ProfilesPageProps> = ({
       try {
         const result = await PingConfig(config.id);
         setPings(prev => ({ ...prev, [config.id]: { latency: result.latency, success: result.success, loading: false } }));
-        if (result.success && result.latency < bestLatency) {
+        // Only consider configs with a real measured latency (>0)
+        if (result.success && result.latency > 0 && result.latency < bestLatency) {
           bestLatency = result.latency;
           bestConfig = config.id;
         }
@@ -178,14 +179,14 @@ const ProfilesPage: React.FC<ProfilesPageProps> = ({
     // Connected config first
     if (isConnected && connectedProtocol === a.id) return -1;
     if (isConnected && connectedProtocol === b.id) return 1;
-    // Then by ping result (lower latency first)
+    // Then by ping result — only consider configs with a real measured latency (>0)
     const pingA = pings[a.id];
     const pingB = pings[b.id];
-    if (pingA?.success && pingB?.success) {
-      return pingA.latency - pingB.latency;
-    }
-    if (pingA?.success) return -1;
-    if (pingB?.success) return 1;
+    const hasRealPingA = pingA?.success && pingA.latency > 0;
+    const hasRealPingB = pingB?.success && pingB.latency > 0;
+    if (hasRealPingA && hasRealPingB) return pingA.latency - pingB.latency;
+    if (hasRealPingA) return -1;
+    if (hasRealPingB) return 1;
     return 0;
   });
 
@@ -221,7 +222,7 @@ const ProfilesPage: React.FC<ProfilesPageProps> = ({
   // Count successful pings and average latency
   const pingStats = Object.values(pings).reduce(
     (acc, p) => {
-      if (!p.loading && p.success) {
+      if (!p.loading && p.success && p.latency > 0) {
         acc.count++;
         acc.totalLatency += p.latency;
       }
@@ -428,8 +429,8 @@ const ProfilesPage: React.FC<ProfilesPageProps> = ({
 
                   {/* Right: ping + status */}
                   <div className={`flex items-center flex-shrink-0 ${isRTL ? 'flex-row-reverse space-x-reverse space-x-2' : 'space-x-2'} ml-2`}>
-                    {/* Ping display */}
-                    {ping && !ping.loading && ping.success && (
+                    {/* Ping display — only show when latency > 0 (real measurement) */}
+                    {ping && !ping.loading && ping.success && ping.latency > 0 && (
                       <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${getLatencyColor(ping.latency)}`}>
                         {ping.latency}ms
                       </span>

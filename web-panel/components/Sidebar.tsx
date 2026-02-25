@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { LayoutDashboard, Users, Settings, Wrench, LogOut, Activity, Network } from 'lucide-react';
+import { LayoutDashboard, Users, Settings, Wrench, LogOut, Activity, Network, ExternalLink } from 'lucide-react';
 import { getPanel, type PanelData } from '../services/api';
 import GreenCandy from '../assets/green-candy.svg';
 import RedCandy from '../assets/red-candy.svg';
@@ -37,6 +37,8 @@ const Sidebar: React.FC<SidebarProps> = ({ currentPage, onNavigate, onLogout, op
   const version = panelData?.config.version || '1.4.2';
   const hostname = panelData?.server.hostname || '';
   const adminUser = panelData?.admin_username || 'admin';
+
+  const userPortalUrl = `${window.location.origin}${window.location.pathname.replace(/\/?$/, '/user')}`;
 
   return (
     <>
@@ -82,6 +84,17 @@ const Sidebar: React.FC<SidebarProps> = ({ currentPage, onNavigate, onLogout, op
               </button>
             );
           })}
+
+          {/* User Portal link */}
+          <a
+            href={userPortalUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl text-left transition-all duration-150 text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-700/50 hover:text-slate-800 dark:hover:text-slate-200"
+          >
+            <ExternalLink className="w-[18px] h-[18px] text-slate-400 dark:text-slate-500" strokeWidth={1.8} />
+            <span className="text-sm font-bold">User Portal</span>
+          </a>
         </div>
 
         {/* Footer */}

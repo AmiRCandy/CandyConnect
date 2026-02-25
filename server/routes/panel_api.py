@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks
 from pydantic import BaseModel
 import paramiko
 import time
+import logging
 
 import database as db
 import auth
@@ -14,6 +15,7 @@ from config import SUPPORTED_PROTOCOLS
 from system_info import get_server_info
 from protocols.manager import protocol_manager
 
+logger = logging.getLogger("candyconnect")
 router = APIRouter(tags=["panel"])
 
 # ── Auth ──

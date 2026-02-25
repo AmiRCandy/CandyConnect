@@ -317,6 +317,13 @@ class V2RayProtocol(BaseProtocol):
         # When a specific config is selected, use only that single outbound
         client_json = {
             "log": {"loglevel": "warning"},
+            "dns": {
+                "servers": [
+                    "8.8.8.8",
+                    "1.1.1.1",
+                    "8.8.4.4"
+                ]
+            },
             "inbounds": [
                 {
                     "port": 10808,
@@ -333,10 +340,20 @@ class V2RayProtocol(BaseProtocol):
             ],
             "outbounds": outbounds + [{"protocol": "freedom", "tag": "direct"}],
             "routing": {
-                "domainStrategy": "AsIs",
+                "domainStrategy": "IPIfNonMatch",
                 "rules": [
-                    {"type": "field", "outboundTag": "direct", "domain": ["geosite:cn", "geosite:private"]},
-                    {"type": "field", "outboundTag": "direct", "ip": ["geoip:cn", "geoip:private"]}
+                    {
+                        "type": "field",
+                        "outboundTag": "direct",
+                        "ip": [
+                            "127.0.0.0/8",
+                            "10.0.0.0/8",
+                            "172.16.0.0/12",
+                            "192.168.0.0/16",
+                            "fc00::/7",
+                            "::1/128"
+                        ]
+                    }
                 ]
             }
         }

@@ -9,8 +9,12 @@ import LogsPage from './pages/LogsPage';
 import TunnelPage from './pages/TunnelPage';
 import CoreConfigsPage from './pages/CoreConfigsPage';
 import PanelConfigsPage from './pages/PanelConfigsPage';
+import UserPortalPage from './pages/UserPortalPage';
 import Sidebar from './components/Sidebar';
 import { NotificationProvider, useNotify } from './components/Notification';
+
+// Show user portal when the path contains /user
+const isUserPortal = window.location.pathname.includes('/user');
 
 const AppContent: React.FC = () => {
   const [isAuth, setIsAuth] = useState(() => sessionStorage.getItem('cc_auth') === 'true');
@@ -39,6 +43,9 @@ const AppContent: React.FC = () => {
     setCurrentPage('dashboard');
     notify('Logged out', 'info');
   };
+
+  // User portal: show without admin auth
+  if (isUserPortal) return <UserPortalPage />;
 
   if (!isAuth) return <LoginPage onLogin={handleLogin} />;
 
