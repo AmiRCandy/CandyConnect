@@ -999,27 +999,20 @@ export const PingProfile = async (name: string): Promise<PingResult> => {
 };
 
 export const PingAllProfiles = async (): Promise<PingResult[]> => {
-  // Try real backend bulk ping
-  try {
-    const results = await apiRequest<any[]>('POST', '/ping-all');
-    if (Array.isArray(results) && results.length > 0) {
-      return results.map(r => ({
-        profileName: r.protocol || r.config_id,
-        configId: r.config_id,
-        latency: r.latency || 0,
-        success: r.reachable !== false,
-      }));
-    }
-  } catch {
-    // Fallback: ping each config individually
-  }
-
   const configs = await LoadConfigs();
-  const results: PingResult[] = [];
-  for (const c of configs) {
-    const r = await PingConfig(c.id);
-    results.push(r);
-  }
+  if (configs.length === 0) return [];
+
+  // Ping all configs in parallel using real ICMP/TCP pings for accurate latency
+  const results = await Promise.all(
+    configs.map(c =>
+      PingConfig(c.id).catch(() => ({
+        profileName: c.id,
+        configId: c.id,
+        latency: 0,
+        success: false,
+      }))
+    )
+  );
   return results;
 };
 
