@@ -797,14 +797,13 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
         throw new Error('Could not retrieve WireGuard configuration data from server');
       }
 
-      const privateKey = wgExtra.private_key || wgExtra.privateKey || '';
-      const peerPublicKey = wgExtra.peer_public_key || wgExtra.peerPublicKey || wgExtra.public_key || wgExtra.publicKey || '';
+      const privateKey = wgExtra.private_key || wgExtra.privateKey || wgExtra.client_private_key || '';
+      const peerPublicKey = wgExtra.peer_public_key || wgExtra.peerPublicKey || wgExtra.public_key || wgExtra.publicKey || wgExtra.server_public_key || '';
       const preSharedKey = wgExtra.pre_shared_key || wgExtra.preSharedKey || '';
       const wgPort = wgExtra.port || cachedConfig?.port || 51820;
-      const localAddresses = wgExtra.local_addresses || wgExtra.addresses || wgExtra.address
-        ? (Array.isArray(wgExtra.local_addresses || wgExtra.addresses || wgExtra.address)
-          ? (wgExtra.local_addresses || wgExtra.addresses || wgExtra.address)
-          : [(wgExtra.local_addresses || wgExtra.addresses || wgExtra.address)])
+      const localAddressValue = wgExtra.local_addresses || wgExtra.addresses || wgExtra.address || wgExtra.client_address;
+      const localAddresses = localAddressValue
+        ? (Array.isArray(localAddressValue) ? localAddressValue : [localAddressValue])
         : ['10.0.0.2/32'];
 
       if (!privateKey || !peerPublicKey) {
@@ -864,7 +863,7 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
       const ovpnUsername = ovpnExtra.username || _account?.username || savedCreds?.username || '';
       const ovpnPassword = savedCreds?.password || '';
 
-      addLog('info', `OpenVPN: server=${serverIp}, port=${ovpnExtra.port || 1194}, proto=${ovpnExtra.proto || 'udp'}, mode=${mode}`);
+      addLog('info', `OpenVPN: server=${serverIp}, port=${ovpnExtra.port || 1194}, proto=${ovpnExtra.proto || ovpnExtra.protocol || 'udp'}, mode=${mode}`);
 
       await invoke('start_openvpn', {
         ovpnConfig: ovpnConfig,

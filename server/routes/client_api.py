@@ -94,7 +94,8 @@ async def get_protocols(payload=Depends(auth.require_client)):
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
     
-    client_protocols = client.get("protocols", {})
+    raw_protocols = client.get("protocols", {}) or {}
+    client_protocols = {str(k).lower(): v for k, v in raw_protocols.items()}
     cores = await protocol_manager.get_all_cores_info()
     
     result = []
@@ -105,7 +106,7 @@ async def get_protocols(payload=Depends(auth.require_client)):
     }
     for core in cores:
         pid = core["id"]
-        enabled_for_user = client_protocols.get(pid, False)
+        enabled_for_user = client_protocols.get(str(pid).lower(), False)
         result.append({
             "id": pid,
             "name": core["name"],
@@ -427,7 +428,8 @@ async def get_protocol_config(protocol: str, payload=Depends(auth.require_client
         raise HTTPException(status_code=404, detail=f"Protocol manager for {core_protocol} not found")
         
     pdata = (client.get("protocol_data", {}) or {}).get(core_protocol, {})
-    config = await p_mgr.get_client_config(client["username"], server_ip, pdata, config_id=protocol)
+    requested_config_id = None if (core_protocol == "v2ray" and protocol.lower() == "v2ray") else protocol
+    config = await p_mgr.get_client_config(client["username"], server_ip, pdata, config_id=requested_config_id)
     
     if not config:
         raise HTTPException(status_code=404, detail=f"No matching config found for '{protocol}'")
@@ -662,6 +664,5 @@ async def ping_all_configs(payload=Depends(auth.require_client)):
         })
     
     return {"success": True, "data": results}
-
 
 
