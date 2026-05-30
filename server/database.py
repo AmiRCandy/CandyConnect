@@ -57,6 +57,34 @@ K_LAST_SYNC = "cc:last_sync"
 K_HEARTBEATS = "cc:heartbeats"     # hash: client_id -> last_heartbeat_unix_ts
 
 
+def _hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def _verify_password(password: str, stored: str) -> bool:
+    if not stored:
+        return False
+    if stored.startswith("$2"):
+        try:
+            return bcrypt.checkpw(password.encode("utf-8"), stored.encode("utf-8"))
+        except Exception:
+            return False
+    # Legacy plaintext entry — compare once, caller may re-hash.
+    return stored == password
+
+
+def public_client(client: dict) -> dict:
+    """Remove sensitive fields from client records returned by APIs."""
+    out = dict(client)
+    out.pop("password", None)
+    out.pop("password_hash", None)
+    return out
+
+
+def _gen_l2tp_psk() -> str:
+    return secrets.token_urlsafe(24)
+
+
 def _gen_id() -> str:
     return "c" + uuid.uuid4().hex[:8]
 
@@ -65,23 +93,32 @@ def _gen_id() -> str:
 
 async def init_db():
     """Seed default data if DB is empty. Raises on connection failure."""
-    # Test Redis connectivity first
     r = await get_redis()
-    await r.ping()  # Will raise if Redis is unreachable
+    await r.ping()
 
-    # Always sync admin credentials from env vars if they exist
-    # This allows resetting the password via .env and restart
     admin_user = DEFAULT_ADMIN_USER
-    admin_pass = DEFAULT_ADMIN_PASS
-    
-    # We use direct bcrypt to avoid passlib issues in docker
-    password_hash = bcrypt.hashpw(admin_pass.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-    
-    await r.hset(K_ADMIN, mapping={
-        "username": admin_user,
-        "password_hash": password_hash,
-    })
-    logging.getLogger("candyconnect").info(f"Admin credentials synced: {admin_user}")
+    admin_exists = await r.exists(K_ADMIN)
+
+    if not admin_exists:
+        if not DEFAULT_ADMIN_PASS:
+            raise RuntimeError(
+                "CC_ADMIN_PASS must be set before first startup (no default password allowed)"
+            )
+        password_hash = _hash_password(DEFAULT_ADMIN_PASS)
+        await r.hset(K_ADMIN, mapping={
+            "username": admin_user,
+            "password_hash": password_hash,
+        })
+        logging.getLogger("candyconnect").info(f"Admin account initialized: {admin_user}")
+    elif FORCE_ADMIN_SYNC and DEFAULT_ADMIN_PASS:
+        password_hash = _hash_password(DEFAULT_ADMIN_PASS)
+        await r.hset(K_ADMIN, mapping={
+            "username": admin_user,
+            "password_hash": password_hash,
+        })
+        logging.getLogger("candyconnect").warning(
+            "Admin credentials reset from environment (CC_FORCE_ADMIN_SYNC=1)"
+        )
 
     # Panel config
     if not await r.exists(K_PANEL):
@@ -118,17 +155,22 @@ async def init_db():
 
     # Create default 'admin' client if it doesn't exist
     if not await r.hexists(K_CLIENT_IDX, admin_user):
-        admin_client_data = {
-            "username": admin_user,
-            "password": admin_pass,
-            "comment": "Default administrator client",
-            "enabled": True,
-            "protocols": {p: (p not in ["slipstream", "trusttunnel"]) for p in [
-                "v2ray", "wireguard", "openvpn", "ikev2", "l2tp", "dnstt", "slipstream", "trusttunnel"
-            ]}
-        }
-        await create_client(admin_client_data)
-        logging.getLogger("candyconnect").info(f"Default client '{admin_user}' created")
+        if not DEFAULT_ADMIN_PASS:
+            logging.getLogger("candyconnect").warning(
+                "Skipping default admin VPN client — CC_ADMIN_PASS not set"
+            )
+        else:
+            admin_client_data = {
+                "username": admin_user,
+                "password": DEFAULT_ADMIN_PASS,
+                "comment": "Default administrator client",
+                "enabled": True,
+                "protocols": {p: (p not in ["slipstream", "trusttunnel"]) for p in [
+                    "v2ray", "wireguard", "openvpn", "ikev2", "l2tp", "dnstt", "slipstream", "trusttunnel"
+                ]},
+            }
+            await create_client(admin_client_data)
+            logging.getLogger("candyconnect").info(f"Default client '{admin_user}' created")
 
 
 def _default_core_configs() -> dict:
@@ -206,7 +248,7 @@ def _default_core_configs() -> dict:
         },
         "l2tp": {
             "port": 1701, "ipsec_port": 500,
-            "psk": "CandyConnect_L2TP_PSK_2026",
+            "psk": _gen_l2tp_psk(),
             "local_ip": "10.20.0.1",
             "remote_range": "10.20.0.10-10.20.0.250",
             "dns": "1.1.1.1", "mtu": 1400, "mru": 1400,
@@ -346,15 +388,15 @@ async def get_client_by_username(username: str) -> Optional[dict]:
 
 async def create_client(data: dict) -> dict:
     r = await get_redis()
-    # Check duplicate username
     if await r.hexists(K_CLIENT_IDX, data["username"]):
         raise ValueError(f"Username '{data['username']}' already exists")
 
+    plain_password = data["password"]
     cid = _gen_id()
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     client = {
         "username": data["username"],
-        "password": data["password"],
+        "password_hash": _hash_password(plain_password),
         "comment": data.get("comment", ""),
         "enabled": data.get("enabled", True),
         "group": data.get("group", ""),
@@ -378,6 +420,8 @@ async def create_client(data: dict) -> dict:
 
     client["id"] = cid
     client["protocol_traffic"] = {}
+    # Plain password only for immediate protocol provisioning (never persisted).
+    client["password"] = plain_password
     await _add_log("INFO", "System", f"Client '{data['username']}' created")
     return client
 
@@ -389,9 +433,13 @@ async def update_client(client_id: str, updates: dict) -> Optional[dict]:
         return None
     client = json.loads(raw)
 
-    for key in ["password", "comment", "enabled", "group", "traffic_limit", "time_limit", "protocols", "protocol_data"]:
+    for key in ["comment", "enabled", "group", "traffic_limit", "time_limit", "protocols", "protocol_data"]:
         if key in updates:
             client[key] = updates[key]
+
+    if "password" in updates and updates["password"]:
+        client["password_hash"] = _hash_password(updates["password"])
+        client.pop("password", None)
 
     # Recalculate expiry if time_limit changed
     if "time_limit" in updates:
@@ -424,10 +472,21 @@ async def verify_client(username: str, password: str) -> Optional[dict]:
     client = await get_client_by_username(username)
     if not client:
         return None
-    if client.get("password") != password:
+    stored = client.get("password_hash") or client.get("password", "")
+    if not _verify_password(password, stored):
         return None
     if not client.get("enabled", False):
         return None
+
+    # Migrate legacy plaintext password to hash on successful login.
+    if client.get("password") and not client.get("password_hash"):
+        r = await get_redis()
+        client["password_hash"] = _hash_password(password)
+        client.pop("password", None)
+        await r.hset(K_CLIENTS, client["id"], json.dumps({k: v for k, v in client.items() if k not in ("protocol_traffic", "id")}))
+    elif client.get("password"):
+        client.pop("password", None)
+
     return client
 
 
@@ -522,6 +581,8 @@ async def record_client_connection(client_id: str, ip: str, protocol: str):
 
 async def update_client_traffic(client_id: str, protocol: str, bytes_used: float):
     """Update traffic usage for a client on a specific protocol."""
+    if bytes_used < 0:
+        return
     r = await get_redis()
     # Normalize protocol name to avoid mismatches (e.g. V2Ray-1 vs v2ray-1)
     proto = str(protocol).lower()
@@ -595,6 +656,10 @@ async def get_core_config(section: str) -> Optional[dict]:
 
 
 async def update_core_config(section: str, data: dict):
+    from security import sanitize_wireguard_config
+
+    if section == "wireguard":
+        data = sanitize_wireguard_config(data)
     r = await get_redis()
     await r.hset(K_CONFIGS, section, json.dumps(data))
     await _add_log("INFO", "System", f"Configuration updated: {section}")
@@ -669,7 +734,6 @@ async def add_tunnel(ip: str, port: int, name: str, username: str = "root", pass
         "ip": ip,
         "port": port,
         "username": username,
-        "ssh_password": password,
         "type": tunnel_type,
         "created_at": int(time.time()),
         "status": "pending",  # pending, installed

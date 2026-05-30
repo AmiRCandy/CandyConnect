@@ -194,52 +194,58 @@ class IKEv2Protocol(BaseProtocol):
 
     async def add_client(self, username: str, client_data: dict) -> dict:
         """Generate client certificate for IKEv2."""
+        import shlex
+        from security import validate_vpn_username, append_line_to_root_file
+
+        username = validate_vpn_username(username)
         password = client_data.get("password", username)
 
-        # Read cert_validity from config (default 3650 days)
         config = await get_core_config("ikev2") or {}
         cert_validity = config.get("cert_validity", 3650)
 
-        # Generate client key
         await self._run_cmd(
             f"ipsec pki --gen --type rsa --size 2048 --outform pem > {self.IPSEC_DIR}/private/{username}-key.pem",
             check=False,
         )
-        # Generate client cert
         await self._run_cmd(
             f"ipsec pki --pub --in {self.IPSEC_DIR}/private/{username}-key.pem --type rsa | "
             f"ipsec pki --issue --lifetime {cert_validity} "
             f"--cacert {self.IPSEC_DIR}/cacerts/ca-cert.pem "
             f"--cakey {self.IPSEC_DIR}/private/ca-key.pem "
-            f"--dn 'CN={username}' --san '{username}' "
+            f"--dn CN={username} --san {username} "
             f"--outform pem > {self.IPSEC_DIR}/certs/{username}-cert.pem",
             check=False,
         )
-        # Generate .p12 for client
         await self._run_cmd(
             f"openssl pkcs12 -export -in {self.IPSEC_DIR}/certs/{username}-cert.pem "
             f"-inkey {self.IPSEC_DIR}/private/{username}-key.pem "
             f"-certfile {self.IPSEC_DIR}/cacerts/ca-cert.pem "
-            f"-name '{username}' -out {self.IPSEC_DIR}/{username}.p12 "
-            f"-passout pass:{password}",
+            f"-name {username} -out {self.IPSEC_DIR}/{username}.p12 "
+            f"-passout pass:{shlex.quote(password)}",
             check=False,
         )
 
-        # Add/Update EAP credentials in ipsec.secrets
-        await self._run_cmd(f"sudo sed -i '/{username} : EAP/d' /etc/ipsec.secrets 2>/dev/null || true", check=False)
         await self._run_cmd(
-            f"echo '{username} : EAP \"{password}\"' | sudo tee -a /etc/ipsec.secrets",
+            f"sudo sed -i {shlex.quote('/' + username + ' : EAP/d')} /etc/ipsec.secrets 2>/dev/null || true",
             check=False,
         )
+        await append_line_to_root_file("/etc/ipsec.secrets", f'{username} : EAP "{password}"')
 
         return {"cert_generated": True, "username": username}
 
     async def remove_client(self, username: str, protocol_data: dict):
+        import shlex
+        from security import validate_vpn_username
+
+        username = validate_vpn_username(username)
         for ext in ["key.pem", "cert.pem"]:
             path = os.path.join(self.IPSEC_DIR, "private" if "key" in ext else "certs", f"{username}-{ext}")
-            await self._run_cmd(f"sudo rm -f {path}", check=False)
-        await self._run_cmd(f"sudo rm -f {self.IPSEC_DIR}/{username}.p12", check=False)
-        await self._run_cmd(f"sudo sed -i '/{username}/d' /etc/ipsec.secrets", check=False)
+            await self._run_cmd(f"sudo rm -f {shlex.quote(path)}", check=False)
+        await self._run_cmd(f"sudo rm -f {shlex.quote(self.IPSEC_DIR + '/' + username + '.p12')}", check=False)
+        await self._run_cmd(
+            f"sudo sed -i {shlex.quote('/' + username + '/d')} /etc/ipsec.secrets",
+            check=False,
+        )
 
     async def get_client_config(self, username: str, server_ip: str, protocol_data: dict, config_id: str = None) -> dict:
         config = await get_core_config("ikev2")

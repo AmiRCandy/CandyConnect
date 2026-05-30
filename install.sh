@@ -126,9 +126,9 @@ install_dependencies() {
     systemctl enable redis-server || true
     systemctl start redis-server || true
 
-    # Wipe database to ensure fresh config (per user request)
-    if command -v redis-cli &>/dev/null; then
-        log "Wiping existing Redis database..."
+    # Wipe database only when explicitly requested (destructive).
+    if [ "${CC_WIPE_REDIS:-0}" = "1" ] && command -v redis-cli &>/dev/null; then
+        warn "CC_WIPE_REDIS=1 — wiping Redis database..."
         redis-cli FLUSHALL >/dev/null 2>&1 || true
     fi
 
@@ -209,8 +209,9 @@ ask_domain() {
 generate_secrets() {
     info "Generating secrets..."
     JWT_SECRET=$(python3 -c "import secrets; print(secrets.token_urlsafe(48))")
+    REDIS_PASSWORD=$(python3 -c "import secrets; print(secrets.token_urlsafe(24))")
+    ADMIN_PASS=$(python3 -c "import secrets; print(secrets.token_urlsafe(16))")
 
-    # Write env file (only if it doesn't exist, to preserve user customizations)
     if [ -f "$CC_DIR/.env" ]; then
         warn ".env file already exists. Backing up to .env.bak"
         cp "$CC_DIR/.env" "$CC_DIR/.env.bak"
@@ -218,17 +219,39 @@ generate_secrets() {
 
     cat > "$CC_DIR/.env" << EOF
 CC_DATA_DIR=$CC_DIR
-CC_REDIS_URL=redis://127.0.0.1:6379/0
+CC_REDIS_URL=redis://:${REDIS_PASSWORD}@127.0.0.1:6379/0
+CC_REDIS_PASSWORD=${REDIS_PASSWORD}
 CC_JWT_SECRET=$JWT_SECRET
 CC_PANEL_PORT=$CC_PORT
 CC_PANEL_PATH=/candyconnect
 CC_DOMAIN=$CC_DOMAIN
 CC_ADMIN_USER=admin
-CC_ADMIN_PASS=admin123
+CC_ADMIN_PASS=${ADMIN_PASS}
 EOF
 
     chmod 600 "$CC_DIR/.env"
     log "Secrets generated"
+    GENERATED_ADMIN_PASS="$ADMIN_PASS"
+}
+
+configure_redis_auth() {
+    if [ ! -f "$CC_DIR/.env" ]; then
+        return
+    fi
+    # shellcheck disable=SC1090
+    source "$CC_DIR/.env"
+    if [ -z "${CC_REDIS_PASSWORD:-}" ]; then
+        return
+    fi
+    info "Configuring Redis authentication..."
+    redis-cli CONFIG SET requirepass "$CC_REDIS_PASSWORD" >/dev/null 2>&1 || true
+    if [ -f /etc/redis/redis.conf ]; then
+        if ! grep -q "^requirepass " /etc/redis/redis.conf; then
+            echo "requirepass $CC_REDIS_PASSWORD" >> /etc/redis/redis.conf
+        fi
+    fi
+    systemctl restart redis-server 2>/dev/null || true
+    log "Redis authentication enabled"
 }
 
 create_systemd_service() {
@@ -324,9 +347,9 @@ print_summary() {
     echo -e "  ${BOLD}API URL:${NC}      http://${SERVER_IP}:${CC_PORT}/api"
     echo -e "  ${BOLD}Client API:${NC}   http://${SERVER_IP}:${CC_PORT}/client-api"
     echo -e "  ${BOLD}Admin User:${NC}   admin"
-    echo -e "  ${BOLD}Admin Pass:${NC}   admin123"
+    echo -e "  ${BOLD}Admin Pass:${NC}   ${GENERATED_ADMIN_PASS:-see $CC_DIR/.env}"
     echo ""
-    echo -e "  ${YELLOW}⚠  Change the default password immediately!${NC}"
+    echo -e "  ${YELLOW}⚠  Save the admin password now — it is stored only in $CC_DIR/.env${NC}"
     echo ""
     echo -e "  ${CYAN}Service commands:${NC}"
     echo -e "    systemctl status ${CC_SERVICE}"
@@ -350,6 +373,7 @@ main() {
     install_panel
     ask_domain
     generate_secrets
+    configure_redis_auth
     setup_firewall
     create_systemd_service
     print_summary

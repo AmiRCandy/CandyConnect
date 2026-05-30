@@ -82,7 +82,7 @@ const ClientsPage: React.FC = () => {
 
   const openEditModal = (client: Client) => {
     setIsAddMode(false); setEditClient(client);
-    setFUsername(client.username); setFPassword(client.password); setFComment(client.comment);
+    setFUsername(client.username); setFPassword(''); setFComment(client.comment);
     setFTrafficVal(client.traffic_limit.value); setFTrafficUnit(client.traffic_limit.unit as any);
     setFTimeVal(client.time_limit.value); setFTimeMode(client.time_limit.mode as any);
     setFOnHold(client.time_limit.on_hold); setFEnabled(client.enabled); setFGroup(client.group || '');
@@ -90,7 +90,8 @@ const ClientsPage: React.FC = () => {
   };
 
   const handleSave = async () => {
-    if (!fUsername.trim() || !fPassword.trim()) { notify('Username and password required', 'error'); return; }
+    if (!fUsername.trim()) { notify('Username required', 'error'); return; }
+    if (!editClient && !fPassword.trim()) { notify('Password required for new clients', 'error'); return; }
     if (fTrafficVal <= 0 || fTimeVal <= 0) { notify('Traffic and time must be positive', 'error'); return; }
     setSaving(true);
     try {
@@ -105,7 +106,8 @@ const ClientsPage: React.FC = () => {
         notify(`Client "${fUsername}" created`, 'success');
       } else if (editClient) {
         await updateClient(editClient.id, {
-          password: fPassword.trim(), comment: fComment.trim(), enabled: fEnabled,
+          ...(fPassword.trim() ? { password: fPassword.trim() } : {}),
+          comment: fComment.trim(), enabled: fEnabled,
           group: fGroup.trim() || undefined,
           traffic_limit: { value: fTrafficVal, unit: fTrafficUnit },
           time_limit: { mode: fTimeMode, value: fTimeVal, on_hold: fOnHold },
@@ -210,7 +212,7 @@ const ClientsPage: React.FC = () => {
         {detailClient && (
           <div className="space-y-4 text-sm">
             {[
-              ['Username', detailClient.username], ['Password', detailClient.password],
+              ['Username', detailClient.username], ['Password', '•••••••• (not stored in panel)'],
               ['Status', detailClient.is_online ? <span className="flex items-center gap-1.5 align-middle text-green-600 dark:text-green-400 font-bold"><Activity className="w-3.5 h-3.5" /> Online</span> : !detailClient.enabled ? <span className="flex items-center gap-1.5 align-middle text-red-500 font-bold"><XCircle className="w-3.5 h-3.5" /> Disabled</span> : <span className="flex items-center gap-1.5 align-middle text-slate-500 font-bold"><PauseCircle className="w-3.5 h-3.5" /> Offline</span>],
               ['Group', detailClient.group || 'None'],
               ['Comment', detailClient.comment || '-'],

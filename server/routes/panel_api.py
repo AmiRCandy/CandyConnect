@@ -2,9 +2,11 @@
 CandyConnect Server - Panel API Router
 Defines all endpoints for the web management panel.
 """
+import logging
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks, Request
+from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 import paramiko
 import time
 
@@ -13,8 +15,16 @@ import auth
 from config import SUPPORTED_PROTOCOLS
 from system_info import get_server_info
 from protocols.manager import protocol_manager
+from security import (
+    login_rate_limiter,
+    validate_vpn_username,
+    sanitize_wireguard_config,
+)
 
 router = APIRouter(tags=["panel"])
+logger = logging.getLogger("candyconnect")
+
+TUNNEL_INSTALL_URL = "https://get.candyconnect.io/tunnel"
 
 # ── Auth ──
 
@@ -23,10 +33,13 @@ class LoginRequest(BaseModel):
     password: str
 
 @router.post("/auth/login")
-async def login(req: LoginRequest):
+async def login(req: LoginRequest, request: Request):
+    login_rate_limiter.check(request, "admin")
     if await db.verify_admin(req.username, req.password):
+        login_rate_limiter.reset(request, "admin")
         token = auth.create_admin_token(req.username)
         return {"success": True, "message": "Login successful", "token": token}
+    login_rate_limiter.record_failure(request, "admin")
     raise HTTPException(status_code=401, detail="Invalid username or password")
 
 # ── Dashboard ──
@@ -73,8 +86,8 @@ async def get_dashboard(limit: int = 10, user=Depends(auth.require_admin)):
 # ── Clients ──
 
 class CreateClientRequest(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=32)
+    password: str = Field(min_length=8, max_length=128)
     comment: str = ""
     enabled: bool = True
     group: Optional[str] = None
@@ -83,7 +96,7 @@ class CreateClientRequest(BaseModel):
     protocols: dict
 
 class UpdateClientRequest(BaseModel):
-    password: Optional[str] = None
+    password: Optional[str] = Field(default=None, min_length=8, max_length=128)
     comment: Optional[str] = None
     enabled: Optional[bool] = None
     group: Optional[str] = None
@@ -94,31 +107,29 @@ class UpdateClientRequest(BaseModel):
 @router.get("/clients")
 async def list_clients(user=Depends(auth.require_admin)):
     clients = await db.get_all_clients()
-    return {"success": True, "message": "Clients fetched", "data": clients}
+    return {"success": True, "message": "Clients fetched", "data": [db.public_client(c) for c in clients]}
 
 @router.get("/clients/{id}")
 async def get_client(id: str, user=Depends(auth.require_admin)):
     client = await db.get_client(id)
     if not client:
         raise HTTPException(status_code=404, detail="Client not found")
-    return {"success": True, "message": "Client fetched", "data": client}
+    return {"success": True, "message": "Client fetched", "data": db.public_client(client)}
 
 @router.post("/clients")
 async def create_client(req: CreateClientRequest, user=Depends(auth.require_admin)):
     try:
-        # Create in DB
-        client = await db.create_client(req.model_dump())
-        
-        # Add to protocol backends
+        payload = req.model_dump()
+        payload["username"] = validate_vpn_username(payload["username"])
+        client = await db.create_client(payload)
+        plain_password = client.pop("password", None)
+        client_for_proto = {**client, "password": plain_password or req.password}
         pdata = await protocol_manager.add_client_to_protocols(
-            client["username"], client, client["protocols"]
+            client["username"], client_for_proto, client["protocols"]
         )
-        
-        # Update DB with protocol-specific data (keys, etc)
         await db.update_client(client["id"], {"protocol_data": pdata})
         client["protocol_data"] = pdata
-        
-        return {"success": True, "message": "Client created", "data": client}
+        return {"success": True, "message": "Client created", "data": db.public_client(client)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -127,19 +138,20 @@ async def update_client(id: str, req: UpdateClientRequest, user=Depends(auth.req
     existing = await db.get_client(id)
     if not existing:
         raise HTTPException(status_code=404, detail="Client not found")
-    
+
     try:
-        updated = await db.update_client(id, req.model_dump(exclude_unset=True))
-        
-        # Update protocol backends
+        updates = req.model_dump(exclude_unset=True)
+        updated = await db.update_client(id, updates)
+        client_for_proto = dict(updated)
+        if updates.get("password"):
+            client_for_proto["password"] = updates["password"]
         pdata = await protocol_manager.add_client_to_protocols(
-            updated["username"], updated, updated["protocols"], 
+            updated["username"], client_for_proto, updated["protocols"],
             existing_data=updated.get("protocol_data")
         )
         await db.update_client(id, {"protocol_data": pdata})
         updated["protocol_data"] = pdata
-        
-        return {"success": True, "message": "Client updated", "data": updated}
+        return {"success": True, "message": "Client updated", "data": db.public_client(updated)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -173,7 +185,12 @@ class TunnelRequest(BaseModel):
 @router.get("/tunnels")
 async def get_tunnels(user=Depends(auth.require_admin)):
     tunnels = await db.get_tunnels()
-    return {"success": True, "data": tunnels}
+    safe = []
+    for t in tunnels:
+        item = dict(t)
+        item.pop("ssh_password", None)
+        safe.append(item)
+    return {"success": True, "data": safe}
 
 async def background_install_tunnel(tunnel_id: str, ip: str, port: int, username: str, password: str, cmd: str):
     await db.update_tunnel_status(tunnel_id, "installing")
@@ -182,9 +199,9 @@ async def background_install_tunnel(tunnel_id: str, ip: str, port: int, username
     def _sync_ssh():
         try:
             client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.load_system_host_keys()
+            client.set_missing_host_key_policy(paramiko.RejectPolicy())
             client.connect(ip, port=port, username=username, password=password, timeout=15)
-            # Execute command
             stdin, stdout, stderr = client.exec_command(cmd)
             exit_status = stdout.channel.recv_exit_status()
             out_msg = stdout.read().decode().strip()
@@ -194,7 +211,7 @@ async def background_install_tunnel(tunnel_id: str, ip: str, port: int, username
         except Exception as e:
             return False, "", str(e)
 
-    success, out, err = await auth.run_in_threadpool(_sync_ssh)
+    success, out, err = await run_in_threadpool(_sync_ssh)
     
     if success:
         await db.update_tunnel_status(tunnel_id, "installed")
@@ -213,16 +230,20 @@ async def add_tunnel(req: TunnelRequest, tasks: BackgroundTasks, user=Depends(au
     master_ip = server_info.get("ip", "YOUR_SERVER_IP")
     
     # Generates a command to run on the remote tunnel server
-    install_cmd = f"curl -fsSL https://get.candyconnect.io/tunnel | sudo bash -s -- --master {master_ip}:8443 --secret {tunnel['id']} --type {req.tunnel_type}"
+    install_cmd = (
+        f"curl -fsSL {TUNNEL_INSTALL_URL} | sudo bash -s -- "
+        f"--master {master_ip}:8443 --secret {tunnel['id']} --type {req.tunnel_type}"
+    )
     
     if req.ip and req.password:
         tasks.add_task(background_install_tunnel, tunnel['id'], req.ip, req.port, req.username, req.password, install_cmd)
     
     return {
-        "success": True, 
-        "message": "Tunnel added. installation started via SSH" if req.password else "Tunnel added. password missing for SSH install", 
-        "data": tunnel, 
-        "install_command": install_cmd
+        "success": True,
+        "message": "Tunnel added. installation started via SSH" if req.password else "Tunnel added. password missing for SSH install",
+        "data": {k: v for k, v in tunnel.items() if k != "ssh_password"},
+        "install_command": install_cmd,
+        "security_notice": "Verify tunnel installer checksum/source before remote execution.",
     }
 
 @router.delete("/tunnels/{id}")
@@ -239,6 +260,8 @@ async def get_cores(user=Depends(auth.require_admin)):
 
 @router.post("/cores/{id}/start")
 async def start_core(id: str, user=Depends(auth.require_admin)):
+    if id not in SUPPORTED_PROTOCOLS:
+        raise HTTPException(status_code=400, detail="Unsupported protocol")
     try:
         success = await protocol_manager.start_protocol(id)
         if success:
@@ -250,6 +273,8 @@ async def start_core(id: str, user=Depends(auth.require_admin)):
 
 @router.post("/cores/{id}/stop")
 async def stop_core(id: str, user=Depends(auth.require_admin)):
+    if id not in SUPPORTED_PROTOCOLS:
+        raise HTTPException(status_code=400, detail="Unsupported protocol")
     try:
         success = await protocol_manager.stop_protocol(id)
         if success:
@@ -261,6 +286,8 @@ async def stop_core(id: str, user=Depends(auth.require_admin)):
 
 @router.post("/cores/{id}/restart")
 async def restart_core(id: str, user=Depends(auth.require_admin)):
+    if id not in SUPPORTED_PROTOCOLS:
+        raise HTTPException(status_code=400, detail="Unsupported protocol")
     try:
         success = await protocol_manager.restart_protocol(id)
         if success:
@@ -279,6 +306,11 @@ async def get_configs(user=Depends(auth.require_admin)):
 
 @router.put("/configs/{section}")
 async def update_config(section: str, data: dict = Body(...), user=Depends(auth.require_admin)):
+    allowed = set(SUPPORTED_PROTOCOLS) | {"candyconnect"}
+    if section not in allowed:
+        raise HTTPException(status_code=400, detail="Invalid configuration section")
+    if section == "wireguard":
+        data = sanitize_wireguard_config(data)
     await db.update_core_config(section, data)
     return {"success": True, "message": f"Config for {section} updated"}
 

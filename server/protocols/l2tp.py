@@ -136,16 +136,28 @@ class L2TPProtocol(BaseProtocol):
         return {"in": total_rx, "out": total_tx}
 
     async def add_client(self, username: str, client_data: dict) -> dict:
+        import shlex
+        from security import validate_vpn_username, append_line_to_root_file
+
+        username = validate_vpn_username(username)
         password = client_data.get("password", username)
-        await self._run_cmd(
-            f"grep -q '{username}' /etc/ppp/chap-secrets 2>/dev/null || "
-            f"echo '{username} * {password} *' | sudo tee -a /etc/ppp/chap-secrets",
+        rc, out, _ = await self._run_cmd(
+            f"grep -qF {shlex.quote(username)} /etc/ppp/chap-secrets 2>/dev/null",
             check=False,
         )
+        if rc != 0:
+            await append_line_to_root_file("/etc/ppp/chap-secrets", f"{username}\t*\t{password}\t*")
         return {"username": username}
 
     async def remove_client(self, username: str, protocol_data: dict):
-        await self._run_cmd(f"sudo sed -i '/^{username} /d' /etc/ppp/chap-secrets", check=False)
+        import shlex
+        from security import validate_vpn_username
+
+        username = validate_vpn_username(username)
+        await self._run_cmd(
+            f"sudo sed -i {shlex.quote('/^' + username + ' /d')} /etc/ppp/chap-secrets",
+            check=False,
+        )
 
     async def get_client_config(self, username: str, server_ip: str, protocol_data: dict, config_id: str = None) -> dict:
         config = await get_core_config("l2tp")

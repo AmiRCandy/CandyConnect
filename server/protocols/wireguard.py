@@ -282,11 +282,17 @@ PersistentKeepalive = 25
         interface = config.get("bind_interface", "eth0")
         
         post_up = config.get("post_up", "")
-        if not post_up and interface:
+        if post_up:
+            from security import assert_safe_wireguard_hook
+            post_up = assert_safe_wireguard_hook(post_up, "post_up")
+        elif interface:
             post_up = f"iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o {interface} -j MASQUERADE"
-            
+
         post_down = config.get("post_down", "")
-        if not post_down and interface:
+        if post_down:
+            from security import assert_safe_wireguard_hook
+            post_down = assert_safe_wireguard_hook(post_down, "post_down")
+        elif interface:
             post_down = f"iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o {interface} -j MASQUERADE"
 
         conf = f"""[Interface]

@@ -203,27 +203,30 @@ class DNSTTProtocol(BaseProtocol):
             return 0
 
     async def add_client(self, username: str, client_data: dict) -> dict:
+        import shlex
+        from security import validate_vpn_username, chpasswd_entry
+
+        username = validate_vpn_username(username)
         ssh_user = f"dnstt_{username}"
         password = client_data.get("password", self._gen_password())
 
-        # Create system user (non-root, no shell login except through tunnel)
         await self._run_cmd(
-            f"sudo useradd -m -s /bin/false {ssh_user} 2>/dev/null || true",
+            f"sudo useradd -m -s /bin/false {shlex.quote(ssh_user)} 2>/dev/null || true",
             check=False,
         )
-        # Set password
-        proc = await asyncio.create_subprocess_shell(
-            f"echo '{ssh_user}:{password}' | sudo chpasswd",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate()
+        rc, _, err = await asyncio.to_thread(chpasswd_entry, ssh_user, password)
+        if rc != 0:
+            await add_log("ERROR", self.PROTOCOL_NAME, f"Failed to set DNSTT password: {err}")
 
         return {"ssh_username": ssh_user, "ssh_password": password}
 
     async def remove_client(self, username: str, protocol_data: dict):
+        import shlex
+        from security import validate_vpn_username
+
+        username = validate_vpn_username(username)
         ssh_user = protocol_data.get("ssh_username") or f"dnstt_{username}"
-        await self._run_cmd(f"sudo userdel -r {ssh_user} 2>/dev/null || true", check=False)
+        await self._run_cmd(f"sudo userdel -r {shlex.quote(ssh_user)} 2>/dev/null || true", check=False)
 
     async def get_client_config(self, username: str, server_ip: str, protocol_data: dict, config_id: str = None) -> dict:
         config = await get_core_config("dnstt")

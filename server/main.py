@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
-from config import PANEL_PORT, DATA_DIR, CORE_DIR, BACKUP_DIR, LOG_DIR
+from config import PANEL_PORT, DATA_DIR, CORE_DIR, BACKUP_DIR, LOG_DIR, CORS_ORIGINS, SSL_CERTFILE, SSL_KEYFILE
 from database import init_db, close_redis, add_log
 from protocols.manager import protocol_manager
 
@@ -111,12 +111,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+_cors_origins = CORS_ORIGINS or ["http://127.0.0.1:5174", "http://localhost:5174"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 
@@ -181,15 +182,18 @@ if os.path.isdir(PANEL_DIST):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.4.2", "timestamp": int(time.time())}
+    return {"status": "ok", "version": "1.4.2"}
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=PANEL_PORT,
-        log_level="info",
-        reload=False,
-    )
+    uvicorn_kwargs = {
+        "host": "0.0.0.0",
+        "port": PANEL_PORT,
+        "log_level": "info",
+        "reload": False,
+    }
+    if SSL_CERTFILE and SSL_KEYFILE:
+        uvicorn_kwargs["ssl_certfile"] = SSL_CERTFILE
+        uvicorn_kwargs["ssl_keyfile"] = SSL_KEYFILE
+    uvicorn.run("main:app", **uvicorn_kwargs)

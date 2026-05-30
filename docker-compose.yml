@@ -9,6 +9,9 @@ services:
     image: redis:7-alpine
     container_name: candyconnect-redis
     restart: unless-stopped
+    command: redis-server --requirepass ${CC_REDIS_PASSWORD:?Set CC_REDIS_PASSWORD in .env}
+    environment:
+      - REDIS_PASSWORD=${CC_REDIS_PASSWORD}
     volumes:
       - redis_data:/data
     healthcheck:
@@ -46,12 +49,16 @@ services:
       # - "9443:9443"       # TrustTunnel
     environment:
       - CC_DATA_DIR=/opt/candyconnect
-      - CC_REDIS_URL=redis://redis:6379/0
+      - CC_REDIS_URL=redis://:${CC_REDIS_PASSWORD}@redis:6379/0
+      - CC_REDIS_PASSWORD=${CC_REDIS_PASSWORD}
       - CC_JWT_SECRET=${CC_JWT_SECRET:-}
       - CC_PANEL_PORT=${CC_PANEL_PORT:-8443}
       - CC_PANEL_PATH=${CC_PANEL_PATH:-/candyconnect}
       - CC_ADMIN_USER=${CC_ADMIN_USER:-admin}
-      - CC_ADMIN_PASS=${CC_ADMIN_PASS:-admin123}
+      - CC_ADMIN_PASS=${CC_ADMIN_PASS:?Set CC_ADMIN_PASS in .env before first run}
+      - CC_CORS_ORIGINS=${CC_CORS_ORIGINS:-}
+      - CC_SSL_CERT=${CC_SSL_CERT:-}
+      - CC_SSL_KEY=${CC_SSL_KEY:-}
     volumes:
       - candyconnect_data:/opt/candyconnect/cores
       - candyconnect_backups:/opt/candyconnect/backups
