@@ -32,7 +32,15 @@ async function request<T>(
     window.location.reload();
   }
 
-  return res.json();
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = (data as { detail?: unknown; message?: string }).detail;
+    const message = typeof detail === "string"
+      ? detail
+      : (data as { message?: string }).message || `Request failed (${res.status})`;
+    throw new Error(message);
+  }
+  return data as ApiResponse<T>;
 }
 
 // ── Auth ──
