@@ -3,6 +3,10 @@ import { getPanel, updatePanel, changePassword as apiChangePassword, restartPane
 import { useNotify } from '../components/Notification';
 import { Wrench, Globe, AlertTriangle, Key, Lock, Info, Flame, Loader2 } from 'lucide-react';
 
+const Card: React.FC<{ children: React.ReactNode; danger?: boolean }> = ({ children, danger }) => (
+  <div className={`bg-white dark:bg-slate-800 rounded-xl p-5 shadow-sm border ${danger ? 'border-red-200 dark:border-red-800/50' : 'border-slate-200/50 dark:border-slate-700/50'}`}>{children}</div>
+);
+
 const PanelConfigsPage: React.FC = () => {
   const { notify } = useNotify();
   const [data, setData] = useState<PanelData | null>(null);
@@ -87,10 +91,6 @@ const PanelConfigsPage: React.FC = () => {
 
   const cfg = data.config;
   const s = data.server;
-
-  const Card: React.FC<{ children: React.ReactNode; danger?: boolean }> = ({ children, danger }) => (
-    <div className={`bg-white dark:bg-slate-800 rounded-xl p-5 shadow-sm border ${danger ? 'border-red-200 dark:border-red-800/50' : 'border-slate-200/50 dark:border-slate-700/50'}`}>{children}</div>
-  );
 
   return (
     <div className="space-y-5 animate-fade-in">

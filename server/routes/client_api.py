@@ -4,7 +4,7 @@ Endpoints used by the VPN client applications.
 """
 import time
 import asyncio
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from typing import Optional
 
@@ -13,6 +13,8 @@ import auth
 import uuid
 from system_info import get_public_ip
 from protocols.manager import protocol_manager
+from security import login_rate_limiter, validate_traffic_bytes
+
 from config import SUPPORTED_PROTOCOLS
 
 router = APIRouter(tags=["client"])
@@ -24,11 +26,14 @@ class ClientLoginRequest(BaseModel):
 
 
 @router.post("/auth/login")
-async def client_login(req: ClientLoginRequest):
+async def client_login(req: ClientLoginRequest, request: Request):
+    login_rate_limiter.check(request, "client")
     client = await db.verify_client(req.username, req.password)
     if not client:
+        login_rate_limiter.record_failure(request, "client")
         raise HTTPException(status_code=401, detail="Invalid username, password or account disabled")
-    
+
+    login_rate_limiter.reset(request, "client")
     token = auth.create_client_token(req.username, client["id"])
     
     # Get panel config for server name and IP if possible
@@ -445,10 +450,10 @@ class TrafficReport(BaseModel):
 @router.post("/traffic")
 async def report_traffic(req: TrafficReport, payload=Depends(auth.require_client)):
     client_id = payload.get("client_id")
-    total_bytes = req.bytes_used or (req.bytes_sent + req.bytes_received)
-    
-    # Update client usage in DB (id, protocol, bytes)
-    await db.update_client_traffic(client_id, req.protocol, total_bytes)
+    sent = validate_traffic_bytes(req.bytes_sent, "bytes_sent")
+    received = validate_traffic_bytes(req.bytes_received, "bytes_received")
+    used = validate_traffic_bytes(req.bytes_used or (sent + received), "bytes_used")
+    await db.update_client_traffic(client_id, req.protocol, used)
     return {"success": True, "message": "Traffic reported"}
 
 

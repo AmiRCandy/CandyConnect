@@ -197,21 +197,30 @@ class OpenVPNProtocol(BaseProtocol):
 
     async def add_client(self, username: str, client_data: dict) -> dict:
         """Generate client certificate and return .ovpn config data."""
-        # Generate client cert
+        import shlex
+        from security import validate_vpn_username
+
+        username = validate_vpn_username(username)
+        safe_user = shlex.quote(username)
         await self._run_cmd(
-            f"cd {self.EASYRSA_DIR} && EASYRSA_BATCH=1 ./easyrsa --batch build-client-full {username} nopass",
+            f"cd {shlex.quote(self.EASYRSA_DIR)} && EASYRSA_BATCH=1 ./easyrsa --batch build-client-full {safe_user} nopass",
             check=False,
             timeout=120,
         )
         return {"cert_generated": True, "username": username}
 
     async def remove_client(self, username: str, protocol_data: dict):
+        import shlex
+        from security import validate_vpn_username
+
+        username = validate_vpn_username(username)
+        safe_user = shlex.quote(username)
         await self._run_cmd(
-            f"cd {self.EASYRSA_DIR} && EASYRSA_BATCH=1 ./easyrsa --batch revoke {username}",
+            f"cd {shlex.quote(self.EASYRSA_DIR)} && EASYRSA_BATCH=1 ./easyrsa --batch revoke {safe_user}",
             check=False,
         )
         await self._run_cmd(
-            f"cd {self.EASYRSA_DIR} && EASYRSA_BATCH=1 ./easyrsa gen-crl",
+            f"cd {shlex.quote(self.EASYRSA_DIR)} && EASYRSA_BATCH=1 ./easyrsa gen-crl",
             check=False,
         )
 
