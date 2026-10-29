@@ -69,19 +69,22 @@ async def init_db():
     r = await get_redis()
     await r.ping()  # Will raise if Redis is unreachable
 
-    # Always sync admin credentials from env vars if they exist
-    # This allows resetting the password via .env and restart
+    # Apply admin credentials from env on first start, and again whenever the
+    # env values change (lets you reset the password via .env + restart).
+    # Re-applying them on *every* start would undo a password changed in the panel.
     admin_user = DEFAULT_ADMIN_USER
     admin_pass = DEFAULT_ADMIN_PASS
-    
-    # We use direct bcrypt to avoid passlib issues in docker
-    password_hash = bcrypt.hashpw(admin_pass.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-    
-    await r.hset(K_ADMIN, mapping={
-        "username": admin_user,
-        "password_hash": password_hash,
-    })
-    logging.getLogger("candyconnect").info(f"Admin credentials synced: {admin_user}")
+    env_sig = hashlib.sha256(f"{admin_user}\0{admin_pass}".encode()).hexdigest()
+    current = await r.hgetall(K_ADMIN)
+    if not current.get("password_hash") or current.get("env_sig") != env_sig:
+        # We use direct bcrypt to avoid passlib issues in docker
+        password_hash = bcrypt.hashpw(admin_pass.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        await r.hset(K_ADMIN, mapping={
+            "username": admin_user,
+            "password_hash": password_hash,
+            "env_sig": env_sig,
+        })
+        logging.getLogger("candyconnect").info(f"Admin credentials applied from environment: {admin_user}")
 
     # Panel config
     if not await r.exists(K_PANEL):
@@ -155,8 +158,9 @@ def _default_core_configs() -> dict:
             "private_key": "",
             "public_key": "",
             "mtu": 1420,
-            "post_up": "iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE",
-            "post_down": "iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE",
+            # Empty = auto-generate NAT rules for the detected outbound interface
+            "post_up": "",
+            "post_down": "",
         },
         "v2ray": {
             "config_json": json.dumps({
@@ -382,14 +386,14 @@ async def create_client(data: dict) -> dict:
     return client
 
 
-async def update_client(client_id: str, updates: dict) -> Optional[dict]:
+async def update_client(client_id: str, updates: dict, log: bool = True) -> Optional[dict]:
     r = await get_redis()
     raw = await r.hget(K_CLIENTS, client_id)
     if not raw:
         return None
     client = json.loads(raw)
 
-    for key in ["password", "comment", "enabled", "group", "traffic_limit", "time_limit", "protocols", "protocol_data"]:
+    for key in ["password", "comment", "enabled", "group", "traffic_limit", "time_limit", "protocols", "protocol_data", "suspended"]:
         if key in updates:
             client[key] = updates[key]
 
@@ -400,7 +404,8 @@ async def update_client(client_id: str, updates: dict) -> Optional[dict]:
     await r.hset(K_CLIENTS, client_id, json.dumps(client))
     client["id"] = client_id
     client["protocol_traffic"] = await _get_client_protocol_traffic(r, client_id)
-    await _add_log("INFO", "System", f"Client '{client['username']}' updated")
+    if log:
+        await _add_log("INFO", "System", f"Client '{client['username']}' updated")
     return client
 
 
@@ -417,6 +422,31 @@ async def delete_client(client_id: str) -> bool:
         await r.hdel(K_TRAFFIC, f"{client_id}:{proto}")
     await _add_log("INFO", "System", f"Client '{client.get('username', '')}' deleted")
     return True
+
+
+def client_limit_reason(client: dict) -> Optional[str]:
+    """Return why a client may not use the VPN (expired / traffic exhausted), or None.
+
+    A limit value <= 0 means unlimited; a time limit "on hold" never expires.
+    """
+    from datetime import datetime
+    tl = client.get("time_limit") or {}
+    if not tl.get("on_hold") and not tl.get("onHold") and float(tl.get("value", 0) or 0) > 0:
+        try:
+            if datetime.strptime(client.get("expires_at", ""), "%Y-%m-%d %H:%M:%S") < datetime.now():
+                return "Account expired"
+        except ValueError:
+            pass
+    lim = client.get("traffic_limit") or {}
+    try:
+        value = float(lim.get("value", 0) or 0)
+    except (TypeError, ValueError):
+        value = 0
+    if value > 0:
+        factor = {"MB": 1 / 1024, "GB": 1, "TB": 1024}.get(str(lim.get("unit", "GB")).upper(), 1)
+        if float(client.get("traffic_used", 0) or 0) >= value * factor:
+            return "Traffic limit reached"
+    return None
 
 
 async def verify_client(username: str, password: str) -> Optional[dict]:
@@ -680,7 +710,11 @@ async def add_tunnel(ip: str, port: int, name: str, username: str = "root", pass
 async def get_tunnels() -> list[dict]:
     r = await get_redis()
     raw = await r.hgetall(K_TUNNELS)
-    return [json.loads(val) for val in raw.values()]
+    tunnels = [json.loads(val) for val in raw.values()]
+    # Never send stored SSH passwords back to the browser
+    for t in tunnels:
+        t.pop("ssh_password", None)
+    return tunnels
 
 async def update_tunnel_status(tunnel_id: str, status: str) -> bool:
     r = await get_redis()
@@ -737,7 +771,7 @@ async def get_total_protocol_traffic(protocol: str) -> dict:
     total_bytes = 0.0
     all_traffic = await r.hgetall(K_TRAFFIC)
     for key, val in all_traffic.items():
-        if key.endswith(f":{protocol}"):
+        if key.endswith(f":{protocol}") and not key.startswith("system:"):
             try:
                 total_bytes += float(val)
             except ValueError:

@@ -43,6 +43,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         strongswan-pki \
         libcharon-extra-plugins \
         xl2tpd \
+        ppp \
+        easy-rsa \
+        openssl \
+        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Xray (with error handling - non-fatal if it fails)
@@ -57,7 +61,7 @@ RUN ARCH=$(uname -m) && \
     elif [ "$ARCH" = "armv7l" ]; then DNSTT_ARCH="arm"; \
     else DNSTT_ARCH="386"; fi && \
     ( curl -L --fail -o /usr/local/bin/dnstt-server \
-        https://www.bamsoftware.com/software/dnstt/dnstt-server-linux-${DNSTT_ARCH} && \
+        https://dnstt.network/dnstt-server-linux-${DNSTT_ARCH} && \
       chmod +x /usr/local/bin/dnstt-server ) \
     || echo "WARNING: DNSTT download failed. DNSTT protocol will not be available."
 

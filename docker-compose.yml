@@ -35,7 +35,8 @@ services:
       # VPN protocol ports - uncomment only the ones you need.
       # WARNING: Ports 443 and 53 often conflict with host services.
       # Only enable them if you are sure nothing else uses them.
-      # - "443:443"           # V2Ray / Xray (conflicts with web servers)
+      # - "443:443"           # V2Ray / Xray VLESS (conflicts with web servers)
+      - "8080:8080"         # V2Ray / Xray VMess-WS (default inbound)
       - "51820:51820/udp" # WireGuard
       - "1194:1194/udp" # OpenVPN
       - "500:500/udp" # IKEv2
@@ -52,16 +53,24 @@ services:
       - CC_PANEL_PATH=${CC_PANEL_PATH:-/candyconnect}
       - CC_ADMIN_USER=${CC_ADMIN_USER:-admin}
       - CC_ADMIN_PASS=${CC_ADMIN_PASS:-admin123}
+      - CC_DOMAIN=${CC_DOMAIN:-vpn.candyconnect.io}
     volumes:
       - candyconnect_data:/opt/candyconnect/cores
       - candyconnect_backups:/opt/candyconnect/backups
       - candyconnect_logs:/opt/candyconnect/logs
+      # Keep VPN keys/certificates across container re-creation
+      - candyconnect_wireguard:/etc/wireguard
+      - candyconnect_openvpn:/etc/openvpn
+      - candyconnect_ipsec:/etc/ipsec.d
+    devices:
+      - /dev/net/tun:/dev/net/tun
     # Required for VPN protocol management (iptables, network config)
     cap_add:
       - NET_ADMIN
       - SYS_MODULE
     sysctls:
       - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.src_valid_mark=1
     networks:
       - candyconnect-net
 
@@ -73,6 +82,12 @@ volumes:
   candyconnect_backups:
     driver: local
   candyconnect_logs:
+    driver: local
+  candyconnect_wireguard:
+    driver: local
+  candyconnect_openvpn:
+    driver: local
+  candyconnect_ipsec:
     driver: local
 
 networks:

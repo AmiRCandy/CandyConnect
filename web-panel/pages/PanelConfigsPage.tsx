@@ -3,6 +3,12 @@ import { getPanel, updatePanel, changePassword as apiChangePassword, restartPane
 import { useNotify } from '../components/Notification';
 import { Wrench, Globe, AlertTriangle, Key, Lock, Info, Flame, Loader2 } from 'lucide-react';
 
+// Defined at module level: defining it inside the page component made React remount
+// every card (and its inputs) on each keystroke, dropping input focus.
+const Card: React.FC<{ children: React.ReactNode; danger?: boolean }> = ({ children, danger }) => (
+  <div className={`bg-white dark:bg-slate-800 rounded-xl p-5 shadow-sm border ${danger ? 'border-red-200 dark:border-red-800/50' : 'border-slate-200/50 dark:border-slate-700/50'}`}>{children}</div>
+);
+
 const PanelConfigsPage: React.FC = () => {
   const { notify } = useNotify();
   const [data, setData] = useState<PanelData | null>(null);
@@ -88,10 +94,6 @@ const PanelConfigsPage: React.FC = () => {
   const cfg = data.config;
   const s = data.server;
 
-  const Card: React.FC<{ children: React.ReactNode; danger?: boolean }> = ({ children, danger }) => (
-    <div className={`bg-white dark:bg-slate-800 rounded-xl p-5 shadow-sm border ${danger ? 'border-red-200 dark:border-red-800/50' : 'border-slate-200/50 dark:border-slate-700/50'}`}>{children}</div>
-  );
-
   return (
     <div className="space-y-5 animate-fade-in">
       <div>
@@ -106,7 +108,7 @@ const PanelConfigsPage: React.FC = () => {
           <div>
             <label className="block text-xs font-semibold text-slate-600 dark:text-slate-400 mb-1">Panel Port</label>
             <input type="number" value={port} onChange={e => setPort(+e.target.value)} min={1} max={65535} className="w-full px-3 py-2.5 border border-slate-300 dark:border-slate-600 rounded-xl bg-slate-50 dark:bg-slate-700 text-slate-900 dark:text-slate-200 text-sm" />
-            <p className="text-[10px] text-slate-400 mt-1">https://{s.ip}:{port}{path}</p>
+            <p className="text-[10px] text-slate-400 mt-1">{window.location.protocol}//{s.ip}:{port}{path}</p>
           </div>
           <div>
             <label className="block text-xs font-semibold text-slate-600 dark:text-slate-400 mb-1">Panel Path</label>

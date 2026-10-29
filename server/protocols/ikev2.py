@@ -1,7 +1,7 @@
 """
 CandyConnect - IKEv2/IPSec Protocol Manager (strongSwan)
 """
-import os, time
+import os, time, shlex
 from protocols.base import BaseProtocol
 from database import get_core_config, get_core_status, set_core_status, add_log
 from system_info import get_public_ip
@@ -32,36 +32,50 @@ class IKEv2Protocol(BaseProtocol):
             # Read cert_validity from config (default 3650 days)
             config = await get_core_config("ikev2") or {}
             cert_validity = config.get("cert_validity", 3650)
+            pki = await self._pki_cmd()
+            server_ip = await self._server_address()
 
-            # Generate CA key and cert
-            await self._run_cmd(
-                f"ipsec pki --gen --type rsa --size 4096 --outform pem > {self.IPSEC_DIR}/private/ca-key.pem",
-                check=False,
-            )
-            await self._run_cmd(
-                f"ipsec pki --self --ca --lifetime {cert_validity} --in {self.IPSEC_DIR}/private/ca-key.pem "
-                f"--type rsa --dn 'CN=CandyConnect VPN CA' --outform pem > {self.IPSEC_DIR}/cacerts/ca-cert.pem",
-                check=False,
-            )
+            # install() runs on every server start: only create the CA / server cert once,
+            # otherwise every restart would invalidate the CA clients have imported.
+            ca_key = f"{self.IPSEC_DIR}/private/ca-key.pem"
+            ca_cert = f"{self.IPSEC_DIR}/cacerts/ca-cert.pem"
+            if not (os.path.exists(ca_key) and os.path.exists(ca_cert)):
+                await add_log("INFO", self.PROTOCOL_NAME, "Generating CA certificate...")
+                await self._run_cmd(
+                    f"{pki} --gen --type rsa --size 4096 --outform pem > {ca_key}",
+                    check=False, timeout=180,
+                )
+                await self._run_cmd(
+                    f"{pki} --self --ca --lifetime {cert_validity} --in {ca_key} "
+                    f"--type rsa --dn 'CN=CandyConnect VPN CA' --outform pem > {ca_cert}",
+                    check=False,
+                )
+                # New CA -> the old server cert is no longer valid
+                await self._run_cmd(f"rm -f {self.IPSEC_DIR}/certs/server-cert.pem", check=False)
 
-            # Generate server key and cert
-            await self._run_cmd(
-                f"ipsec pki --gen --type rsa --size 4096 --outform pem > {self.IPSEC_DIR}/private/server-key.pem",
-                check=False,
-            )
-
-            # Get server IP for SAN
-            server_ip = await get_public_ip()
-
-            await self._run_cmd(
-                f"ipsec pki --pub --in {self.IPSEC_DIR}/private/server-key.pem --type rsa | "
-                f"ipsec pki --issue --lifetime {cert_validity} --cacert {self.IPSEC_DIR}/cacerts/ca-cert.pem "
-                f"--cakey {self.IPSEC_DIR}/private/ca-key.pem "
-                f"--dn 'CN={server_ip}' --san '{server_ip}' --san '@{server_ip}' "
-                f"--flag serverAuth --flag ikeIntermediate "
-                f"--outform pem > {self.IPSEC_DIR}/certs/server-cert.pem",
-                check=False,
-            )
+            # (Re)issue the server cert if missing or issued for another address
+            server_key = f"{self.IPSEC_DIR}/private/server-key.pem"
+            server_cert = f"{self.IPSEC_DIR}/certs/server-cert.pem"
+            issued_for = ""
+            if os.path.exists(server_cert):
+                _, issued_for, _ = await self._run_cmd(f"{pki} --print --in {server_cert}", check=False)
+            if not os.path.exists(server_cert) or f"CN={server_ip}" not in issued_for:
+                if not os.path.exists(server_key):
+                    await self._run_cmd(
+                        f"{pki} --gen --type rsa --size 4096 --outform pem > {server_key}",
+                        check=False, timeout=180,
+                    )
+                san = f"--san '{server_ip}' --san '@{server_ip}'"
+                await self._run_cmd(
+                    f"{pki} --pub --in {server_key} --type rsa | "
+                    f"{pki} --issue --lifetime {cert_validity} --cacert {ca_cert} "
+                    f"--cakey {ca_key} "
+                    f"--dn 'CN={server_ip}' {san} "
+                    f"--flag serverAuth --flag ikeIntermediate "
+                    f"--outform pem > {server_cert}",
+                    check=False,
+                )
+            await self._run_cmd(f"chmod 600 {self.IPSEC_DIR}/private/*.pem", check=False)
 
             # Enable IP forwarding
             await self._run_cmd("sudo sysctl -w net.ipv4.ip_forward=1", check=False)
@@ -83,7 +97,7 @@ class IKEv2Protocol(BaseProtocol):
 
             # Try systemctl
             await self._run_cmd("sudo systemctl enable strongswan-starter", check=False)
-            rc, _, err = await self._run_cmd("sudo systemctl start strongswan-starter", check=False)
+            rc, _, err = await self._run_cmd("sudo systemctl restart strongswan-starter", check=False)
 
             if rc != 0:
                 # Docker fallback
@@ -112,8 +126,16 @@ class IKEv2Protocol(BaseProtocol):
 
     async def stop(self) -> bool:
         try:
-            await self._run_cmd("sudo systemctl stop strongswan-starter", check=False)
-            await self._run_cmd("sudo systemctl stop ipsec", check=False)
+            rc, _, _ = await self._run_cmd("pgrep xl2tpd", check=False)
+            if rc == 0:
+                # L2TP/IPSec shares strongSwan: only unload the IKEv2 connection
+                await self._run_cmd("sudo ipsec down ikev2-vpn", check=False)
+                self._write_ipsec_conf(with_ikev2=False)
+                await self._run_cmd("sudo ipsec reload", check=False)
+            else:
+                await self._run_cmd("sudo systemctl stop strongswan-starter", check=False)
+                await self._run_cmd("sudo systemctl stop ipsec", check=False)
+                await self._run_cmd("sudo ipsec stop", check=False)
 
             status = await get_core_status(self.PROTOCOL_ID)
             await set_core_status(self.PROTOCOL_ID, {
@@ -127,6 +149,12 @@ class IKEv2Protocol(BaseProtocol):
             return False
 
     async def is_running(self) -> bool:
+        try:
+            with open("/etc/ipsec.conf") as f:
+                if "conn ikev2-vpn" not in f.read():
+                    return False
+        except OSError:
+            return False
         if await self._is_service_active("strongswan-starter") or await self._is_service_active("ipsec"):
             return True
         # Strongswan process is usually 'charon'
@@ -193,44 +221,45 @@ class IKEv2Protocol(BaseProtocol):
         return {"in": total_rx, "out": total_tx}
 
     async def add_client(self, username: str, client_data: dict) -> dict:
-        """Generate client certificate for IKEv2."""
+        """Register EAP-MSCHAPv2 credentials (and a client certificate) for IKEv2."""
         password = client_data.get("password", username)
 
         # Read cert_validity from config (default 3650 days)
         config = await get_core_config("ikev2") or {}
         cert_validity = config.get("cert_validity", 3650)
+        pki = await self._pki_cmd()
+        key_path = f"{self.IPSEC_DIR}/private/{username}-key.pem"
+        cert_path = f"{self.IPSEC_DIR}/certs/{username}-cert.pem"
 
-        # Generate client key
-        await self._run_cmd(
-            f"ipsec pki --gen --type rsa --size 2048 --outform pem > {self.IPSEC_DIR}/private/{username}-key.pem",
-            check=False,
-        )
-        # Generate client cert
-        await self._run_cmd(
-            f"ipsec pki --pub --in {self.IPSEC_DIR}/private/{username}-key.pem --type rsa | "
-            f"ipsec pki --issue --lifetime {cert_validity} "
-            f"--cacert {self.IPSEC_DIR}/cacerts/ca-cert.pem "
-            f"--cakey {self.IPSEC_DIR}/private/ca-key.pem "
-            f"--dn 'CN={username}' --san '{username}' "
-            f"--outform pem > {self.IPSEC_DIR}/certs/{username}-cert.pem",
-            check=False,
-        )
-        # Generate .p12 for client
-        await self._run_cmd(
-            f"openssl pkcs12 -export -in {self.IPSEC_DIR}/certs/{username}-cert.pem "
-            f"-inkey {self.IPSEC_DIR}/private/{username}-key.pem "
-            f"-certfile {self.IPSEC_DIR}/cacerts/ca-cert.pem "
-            f"-name '{username}' -out {self.IPSEC_DIR}/{username}.p12 "
-            f"-passout pass:{password}",
-            check=False,
-        )
+        if os.path.exists(f"{self.IPSEC_DIR}/cacerts/ca-cert.pem") and not os.path.exists(cert_path):
+            # Generate client key
+            await self._run_cmd(
+                f"{pki} --gen --type rsa --size 2048 --outform pem > {key_path}",
+                check=False,
+            )
+            # Generate client cert
+            await self._run_cmd(
+                f"{pki} --pub --in {key_path} --type rsa | "
+                f"{pki} --issue --lifetime {cert_validity} "
+                f"--cacert {self.IPSEC_DIR}/cacerts/ca-cert.pem "
+                f"--cakey {self.IPSEC_DIR}/private/ca-key.pem "
+                f"--dn 'CN={username}' --san '{username}' "
+                f"--outform pem > {cert_path}",
+                check=False,
+            )
+            # Generate .p12 for client
+            await self._run_cmd(
+                f"openssl pkcs12 -export -in {cert_path} "
+                f"-inkey {key_path} "
+                f"-certfile {self.IPSEC_DIR}/cacerts/ca-cert.pem "
+                f"-name '{username}' -out {self.IPSEC_DIR}/{username}.p12 "
+                f"-passout pass:{shlex.quote(password)}",
+                check=False,
+            )
 
         # Add/Update EAP credentials in ipsec.secrets
-        await self._run_cmd(f"sudo sed -i '/{username} : EAP/d' /etc/ipsec.secrets 2>/dev/null || true", check=False)
-        await self._run_cmd(
-            f"echo '{username} : EAP \"{password}\"' | sudo tee -a /etc/ipsec.secrets",
-            check=False,
-        )
+        _set_secret_line(f"{username} : EAP ", f'{username} : EAP "{_escape_secret(password)}"')
+        await self._run_cmd("sudo ipsec rereadsecrets", check=False)
 
         return {"cert_generated": True, "username": username}
 
@@ -239,40 +268,44 @@ class IKEv2Protocol(BaseProtocol):
             path = os.path.join(self.IPSEC_DIR, "private" if "key" in ext else "certs", f"{username}-{ext}")
             await self._run_cmd(f"sudo rm -f {path}", check=False)
         await self._run_cmd(f"sudo rm -f {self.IPSEC_DIR}/{username}.p12", check=False)
-        await self._run_cmd(f"sudo sed -i '/{username}/d' /etc/ipsec.secrets", check=False)
+        _set_secret_line(f"{username} : EAP ", None)
+        await self._run_cmd("sudo ipsec rereadsecrets", check=False)
 
     async def get_client_config(self, username: str, server_ip: str, protocol_data: dict, config_id: str = None) -> dict:
         config = await get_core_config("ikev2")
         if not config:
             return {}
+        ca_cert = ""
+        try:
+            with open(f"{self.IPSEC_DIR}/cacerts/ca-cert.pem") as f:
+                ca_cert = f.read()
+        except OSError:
+            pass
         return {
             "type": "ikev2",
             "server": server_ip,
             "port": config.get("port", 500),
             "username": username,
-            "ca_cert_available": os.path.exists(f"{self.IPSEC_DIR}/cacerts/ca-cert.pem"),
+            "remote_id": server_ip,
+            "auth": "eap-mschapv2",
+            "ca_cert_available": bool(ca_cert),
+            "ca_cert": ca_cert,
         }
 
     async def _write_config(self, config: dict):
         """Write ipsec.conf and ipsec.secrets."""
-        server_ip = await get_public_ip()
-
-        # Detect default interface
-        _, default_iface, _ = await self._run_cmd(
-            "ip route show default | awk '{print $5}' | head -1",
-            check=False,
-        )
-        default_iface = default_iface.strip() or "eth0"
-
+        server_ip = await self._server_address()
+        default_iface = await self._default_iface()
         subnet = config.get("subnet", "10.10.0.0/24")
+        cipher = config.get("cipher", "aes256-sha256-modp2048")
+        # The configured cipher first, then proposals used by the native Windows,
+        # macOS/iOS and Android (strongSwan) clients; a single strict proposal
+        # rejects most of them.
+        ike = f"{cipher},aes256-sha256-ecp256,aes256gcm16-prfsha384-ecp384,aes256-sha1-modp1024,aes128-sha1-modp1024!"
+        esp_cipher = "-".join(p for p in cipher.split("-") if not p.startswith(("modp", "ecp")))
+        esp = f"{esp_cipher},aes256gcm16,aes256-sha256,aes256-sha1,aes128-sha1!"
 
-        nat_port = config.get("nat_port", 4500)
-
-        ipsec_conf = f"""config setup
-    charondebug="ike 1, knl 1, cfg 0"
-    uniqueids=no
-
-conn ikev2-vpn
+        self._ikev2_conn = f"""conn ikev2-vpn
     auto=add
     compress=no
     type=tunnel
@@ -294,31 +327,18 @@ conn ikev2-vpn
     rightdns={config.get('dns', '1.1.1.1')}
     rightsendcert=never
     eap_identity=%identity
-    ike={config.get('cipher', 'aes256-sha256-modp2048')}!
-    esp={config.get('cipher', 'aes256-sha256-modp2048')}!
+    ike={ike}
+    esp={esp}
     ikelifetime={config.get('lifetime', '24h')}
     margintime={config.get('margintime', '3h')}
 """
-        # Configure NAT-T port if non-default
-        if nat_port != 4500:
-            ipsec_conf += f"    nat_traversal=yes\n"
-        with open("/tmp/cc_ipsec.conf", "w") as f:
-            f.write(ipsec_conf)
-        await self._run_cmd("sudo mv /tmp/cc_ipsec.conf /etc/ipsec.conf", check=False)
+        self._write_ipsec_conf(with_ikev2=True)
 
-        # Secrets file (preserve existing entries)
+        # Server key for the RSA cert (keep EAP/PSK entries)
         if not os.path.exists("/etc/ipsec.secrets"):
-            secrets = f": RSA server-key.pem\n"
-            with open("/tmp/cc_ipsec.secrets", "w") as f:
-                f.write(secrets)
-            await self._run_cmd("sudo mv /tmp/cc_ipsec.secrets /etc/ipsec.secrets", check=False)
-        else:
-            # Ensure RSA line exists
-            await self._run_cmd(
-                "grep -q 'RSA server-key.pem' /etc/ipsec.secrets || "
-                "echo ': RSA server-key.pem' | sudo tee -a /etc/ipsec.secrets",
-                check=False,
-            )
+            open("/etc/ipsec.secrets", "w").close()
+            os.chmod("/etc/ipsec.secrets", 0o600)
+        _set_secret_line(": RSA ", ": RSA server-key.pem")
 
         # NAT rules
         await self._run_cmd(
@@ -328,6 +348,58 @@ conn ikev2-vpn
         )
         await self._run_cmd(
             f"sudo iptables -C FORWARD -s {subnet} -j ACCEPT 2>/dev/null || "
-            f"sudo iptables -A FORWARD -s {subnet} -j ACCEPT",
+            f"sudo iptables -I FORWARD -s {subnet} -j ACCEPT; "
+            f"sudo iptables -C FORWARD -d {subnet} -j ACCEPT 2>/dev/null || "
+            f"sudo iptables -I FORWARD -d {subnet} -j ACCEPT",
             check=False,
         )
+
+    _ikev2_conn = ""
+
+    def _write_ipsec_conf(self, with_ikev2: bool):
+        """Write /etc/ipsec.conf. Always includes /etc/ipsec.d/*.conf so the
+        L2TP/IPSec connection (written there by the L2TP manager) is loaded too."""
+        conf = IPSEC_CONF_HEADER
+        if with_ikev2 and self._ikev2_conn:
+            conf += "\n" + self._ikev2_conn
+        conf += "\ninclude /etc/ipsec.d/*.conf\n"
+        with open("/etc/ipsec.conf", "w") as f:
+            f.write(conf)
+
+    async def _server_address(self) -> str:
+        """Address clients connect to (panel override first, then public IP)."""
+        panel_cfg = await get_core_config("candyconnect") or {}
+        return panel_cfg.get("server_ip") or await get_public_ip()
+
+    async def _pki_cmd(self) -> str:
+        """strongSwan's pki tool: `pki` (strongswan-pki) or the legacy `ipsec pki` wrapper."""
+        rc, _, _ = await self._run_cmd("command -v pki", check=False)
+        return "pki" if rc == 0 else "ipsec pki"
+
+
+IPSEC_CONF_HEADER = """config setup
+    charondebug="ike 1, knl 1, cfg 0"
+    uniqueids=no
+"""
+
+
+def _escape_secret(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _set_secret_line(prefix: str, line, path: str = "/etc/ipsec.secrets"):
+    """Replace (or remove when line is None) the ipsec.secrets line starting with prefix."""
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = []
+    lines = [l for l in lines if not l.startswith(prefix)]
+    if line is not None:
+        lines.append(line)
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass

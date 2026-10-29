@@ -26,13 +26,38 @@ async function request<T>(
     body: body ? JSON.stringify(body) : undefined,
   });
 
-  if (!res.ok && res.status === 401) {
+  let json: any = null;
+  try {
+    json = await res.json();
+  } catch {
+    json = null;
+  }
+
+  // 401 = invalid/expired token; 403 "Not authenticated" = missing bearer header
+  if (res.status === 401 || (res.status === 403 && json?.message === 'Not authenticated')) {
     sessionStorage.removeItem('cc_auth');
     sessionStorage.removeItem('cc_token');
     window.location.reload();
   }
 
-  return res.json();
+  return normalizeResponse<T>(res, json);
+}
+
+// Server errors normally come back as {success: false, message}, but FastAPI
+// validation errors (422) use {detail: [...]} and proxies may return non-JSON.
+function normalizeResponse<T>(res: Response, json: any): ApiResponse<T> {
+  if (json && typeof json === 'object' && typeof json.success === 'boolean') {
+    if (!json.success && !json.message) json.message = `Request failed (HTTP ${res.status})`;
+    return json;
+  }
+  if (json && typeof json === 'object' && json.detail !== undefined) {
+    const detail = Array.isArray(json.detail)
+      ? json.detail.map((d: any) => d?.msg ? `${(d.loc || []).slice(1).join('.')}: ${d.msg}` : String(d)).join('; ')
+      : String(json.detail);
+    return { success: false, message: detail || `Request failed (HTTP ${res.status})` };
+  }
+  if (!res.ok) return { success: false, message: `Request failed (HTTP ${res.status})` };
+  return { success: true, message: '', ...(json && typeof json === 'object' ? json : {}) };
 }
 
 // ── Auth ──
@@ -49,7 +74,9 @@ export async function login(username: string, password: string): Promise<LoginRe
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ username, password }),
   });
-  return res.json();
+  let json: any = null;
+  try { json = await res.json(); } catch { json = null; }
+  return normalizeResponse<never>(res, json) as LoginResponse;
 }
 
 // ── Dashboard ──
@@ -100,7 +127,7 @@ export interface ClientProtocols {
 }
 
 export interface ConnectionHistoryEntry {
-  ip: string; time: string; protocol: string; duration: string;
+  ip: string; time: string; protocol: string; event?: string; duration?: string;
 }
 
 export interface Client {
@@ -177,6 +204,7 @@ export async function getLogs(limit: number = 100, source?: string): Promise<Log
 
 export interface Tunnel {
   id: string; name: string; ip: string; port: number; status: string;
+  username?: string; type?: string; created_at?: number;
 }
 
 export async function getTunnels(): Promise<Tunnel[]> {

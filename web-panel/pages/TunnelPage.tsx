@@ -30,6 +30,9 @@ const TunnelPage: React.FC = () => {
 
     useEffect(() => {
         fetchTunnels();
+        // SSH installation runs in the background on the server; poll for status changes
+        const interval = setInterval(fetchTunnels, 10000);
+        return () => clearInterval(interval);
     }, []);
 
     const fetchTunnels = async () => {
@@ -44,11 +47,12 @@ const TunnelPage: React.FC = () => {
     };
 
     const handleAdd = async () => {
-        if (!formData.name || !formData.ip) return notify('Please fill all fields', 'warn');
+        if (!formData.name.trim() || !formData.ip.trim()) return notify('Server name and IP are required', 'warn');
+        if (!formData.port || formData.port < 1 || formData.port > 65535) return notify('SSH port must be 1-65535', 'warn');
         setAdding(true);
         try {
-            const res = await addTunnel({ ...formData, port: +formData.port });
-            notify('Tunnel added successfully', 'success');
+            const res = await addTunnel({ ...formData, name: formData.name.trim(), ip: formData.ip.trim(), port: +formData.port, password: formData.password || undefined });
+            notify(formData.password ? 'Tunnel added, SSH installation started' : 'Tunnel added successfully', 'success');
             setInstallCmd(res.install_command);
             fetchTunnels();
             setShowAddModal(false);
@@ -71,10 +75,27 @@ const TunnelPage: React.FC = () => {
         }
     };
 
-    const copyCmd = () => {
-        if (installCmd) {
-            navigator.clipboard.writeText(installCmd);
+    const copyCmd = async () => {
+        if (!installCmd) return;
+        try {
+            // navigator.clipboard only exists in secure contexts (HTTPS/localhost);
+            // the panel is often served over plain HTTP, so fall back to execCommand.
+            if (navigator.clipboard && window.isSecureContext) {
+                await navigator.clipboard.writeText(installCmd);
+            } else {
+                const ta = document.createElement('textarea');
+                ta.value = installCmd;
+                ta.style.position = 'fixed';
+                ta.style.opacity = '0';
+                document.body.appendChild(ta);
+                ta.select();
+                const ok = document.execCommand('copy');
+                document.body.removeChild(ta);
+                if (!ok) throw new Error('copy failed');
+            }
             notify('Command copied to clipboard', 'success');
+        } catch {
+            notify('Could not copy automatically, please copy the command manually', 'warn');
         }
     };
 
@@ -109,8 +130,8 @@ const TunnelPage: React.FC = () => {
                                 </div>
                             </div>
                             <div className="flex items-center gap-2 mt-4 pt-4 border-t border-slate-100 dark:border-slate-700/50">
-                                <div className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${t.status === 'installed' ? 'bg-green-100 dark:bg-green-900/30 text-green-700' : 'bg-amber-100 dark:bg-amber-900/30 text-amber-700'}`}>
-                                    {t.status.toUpperCase()}
+                                <div className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${t.status === 'installed' ? 'bg-green-100 dark:bg-green-900/30 text-green-700' : t.status === 'failed' ? 'bg-red-100 dark:bg-red-900/30 text-red-700' : 'bg-amber-100 dark:bg-amber-900/30 text-amber-700'}`}>
+                                    {(t.status || 'pending').toUpperCase()}
                                 </div>
                                 <div className="flex-1" />
                                 <button onClick={() => handleDelete(t.id)} className="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors"><Trash2 size={16} /></button>

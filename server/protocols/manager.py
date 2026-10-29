@@ -18,6 +18,9 @@ from database import (
     get_logs,
 )
 import database as db
+import logging
+
+logger = logging.getLogger("candyconnect")
 
 # Import protocol implementations (some may be placeholders)
 from protocols.v2ray import V2RayProtocol
@@ -78,13 +81,28 @@ class ProtocolManager:
             clients = await get_all_clients()
             for client in clients:
                 logger.info(f"Syncing client '{client['username']}' to backends...")
-                pdata = await self.add_client_to_protocols(
-                    client["username"], client, client["protocols"],
-                    existing_data=client.get("protocol_data")
-                )
-                await update_client(client["id"], {"protocol_data": pdata})
+                pdata = await self.sync_client(client)
+                await update_client(client["id"], {"protocol_data": pdata}, log=False)
+            # WireGuard peers are written into wg0.conf; apply now that keys are stored
+            if clients and await self._protocols["wireguard"].is_running():
+                await self._protocols["wireguard"].start()
         except Exception as e:
             logger.error(f"Failed to sync clients to backends: {e}")
+
+    async def enforce_limits(self) -> int:
+        """Remove expired / over-quota clients from the backends (and restore them
+        when the admin extends the limit). Returns the number of state changes."""
+        changed = 0
+        for client in await get_all_clients():
+            suspended = bool(client.get("enabled", True) and db.client_limit_reason(client))
+            if suspended != bool(client.get("suspended", False)):
+                pdata = await self.sync_client(client)
+                await update_client(client["id"], {"protocol_data": pdata, "suspended": suspended}, log=False)
+                await db.add_log("WARN" if suspended else "INFO", "System",
+                                 f"Client '{client['username']}' "
+                                 + (f"suspended: {db.client_limit_reason(client)}" if suspended else "re-activated"))
+                changed += 1
+        return changed
 
     async def install_protocol(self, proto_id: str) -> bool:
         proto = self.get_protocol(proto_id)
@@ -218,17 +236,48 @@ class ProtocolManager:
             if not proto:
                 continue
             try:
+                # Reuse existing keys/configs (WireGuard keys, DNSTT ssh password, ...),
+                # but the current account data wins (e.g. a changed password).
                 data_in = dict(client_data)
-                # Allow protocol to reuse existing keys/configs if given
-                if existing_data and existing_data.get(pid):
-                    data_in.update(existing_data[pid])
+                for k, v in ((existing_data or {}).get(pid) or {}).items():
+                    if k != "password":
+                        data_in[k] = v
                 pdata = await proto.add_client(username, data_in)
                 if isinstance(pdata, dict):
                     result[pid] = pdata
-            except Exception:
-                # Skip failing protocol but continue others
+            except Exception as e:
+                # Skip failing protocol but continue others; keep old data so keys aren't lost
+                logger.warning(f"add_client failed for {pid}/{username}: {e}")
+                if existing_data and existing_data.get(pid):
+                    result[pid] = existing_data[pid]
                 continue
         return result
+
+    async def sync_client(self, client: dict) -> dict:
+        """Apply a client's current state to all backends and return its protocol_data.
+
+        Enabled protocols get the client (re)added; protocols that were disabled,
+        or every protocol when the account itself is disabled, get it removed.
+        """
+        enabled = dict(client.get("protocols") or {})
+        if not client.get("enabled", True) or db.client_limit_reason(client):
+            enabled = {}
+        existing = client.get("protocol_data") or {}
+        for pid, data in existing.items():
+            if not enabled.get(pid):
+                proto = self.get_protocol(pid)
+                if proto:
+                    try:
+                        await proto.remove_client(client["username"], data or {})
+                    except Exception as e:
+                        logger.warning(f"remove_client failed for {pid}/{client['username']}: {e}")
+        pdata = await self.add_client_to_protocols(
+            client["username"], client, enabled, existing_data=existing,
+        )
+        # Keep stored data (keys, uuid) of disabled protocols so re-enabling restores the same config
+        for pid, data in existing.items():
+            pdata.setdefault(pid, data)
+        return pdata
 
     async def remove_client_from_protocols(self, client: dict) -> None:
         """Remove a client from all protocols using stored protocol_data."""

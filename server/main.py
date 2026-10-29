@@ -9,6 +9,7 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.exceptions import RequestValidationError
 
 from config import PANEL_PORT, DATA_DIR, CORE_DIR, BACKUP_DIR, LOG_DIR
 from database import init_db, close_redis, add_log
@@ -52,6 +53,9 @@ async def status_checker():
                 marked = await mark_offline_stale_clients(timeout_seconds=300)
                 if marked > 0:
                     logger.info(f"Marked {marked} stale client(s) as offline")
+
+                # Suspend expired / over-quota clients on the VPN backends
+                await protocol_manager.enforce_limits()
         except Exception as e:
             logger.warning(f"Status checker error: {e}")
         await asyncio.sleep(60)
@@ -126,6 +130,19 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(
         status_code=exc.status_code,
         content={"success": False, "message": str(exc.detail)},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Return validation errors in the same {success, message} format."""
+    parts = []
+    for err in exc.errors():
+        loc = ".".join(str(x) for x in err.get("loc", []) if x != "body")
+        parts.append(f"{loc}: {err.get('msg', 'invalid')}" if loc else err.get("msg", "invalid"))
+    return JSONResponse(
+        status_code=422,
+        content={"success": False, "message": "; ".join(parts) or "Invalid request"},
     )
 
 

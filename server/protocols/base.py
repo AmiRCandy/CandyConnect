@@ -4,6 +4,7 @@ CandyConnect - Base VPN Protocol Manager
 import asyncio, os, signal, time, json, logging
 from typing import Optional
 from database import get_core_status, set_core_status, add_log, get_core_config
+from config import LOG_DIR
 
 logger = logging.getLogger("candyconnect")
 
@@ -123,9 +124,11 @@ class BaseProtocol:
 
     async def _run_cmd(self, cmd: str, check: bool = True, timeout: int = 30) -> tuple[int, str, str]:
         """Run a shell command and return (returncode, stdout, stderr)."""
+        proc = None
         try:
             proc = await asyncio.create_subprocess_shell(
                 cmd,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -145,21 +148,40 @@ class BaseProtocol:
             return -1, "", f"Command timed out after {timeout}s"
 
     async def _start_process(self, cmd: str, cwd: str = None) -> Optional[int]:
-        """Start a background process and return its PID."""
-        self._process = await asyncio.create_subprocess_shell(
-            cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
-        )
+        """Start a background process and return its PID.
+
+        Output goes to a per-protocol log file instead of a pipe: nothing reads
+        the pipe of a long-running daemon, so once its buffer fills the daemon
+        would block on write and hang. ``exec`` makes the shell replace itself,
+        so the tracked PID is the daemon itself and SIGTERM reaches it.
+        """
+        os.makedirs(LOG_DIR, exist_ok=True)
+        log_path = os.path.join(LOG_DIR, f"{self.PROTOCOL_ID}.log")
+        log_file = open(log_path, "ab")
+        try:
+            self._process = await asyncio.create_subprocess_shell(
+                f"exec {cmd}",
+                stdout=log_file,
+                stderr=asyncio.subprocess.STDOUT,
+                stdin=asyncio.subprocess.DEVNULL,
+                cwd=cwd,
+            )
+        finally:
+            log_file.close()
         pid = self._process.pid
-        
+
         # Wait a moment to see if it crashes early
         await asyncio.sleep(1.5)
         if self._process.returncode is not None:
-            _, err = await self._process.communicate()
-            err_msg = err.decode("utf-8", errors="replace").strip()
-            await add_log("ERROR", self.PROTOCOL_NAME, f"Process died immediately: {err_msg}")
+            err_msg = ""
+            try:
+                with open(log_path, "rb") as f:
+                    f.seek(max(0, os.path.getsize(log_path) - 2000))
+                    err_msg = f.read().decode("utf-8", errors="replace").strip()
+            except Exception:
+                pass
+            await add_log("ERROR", self.PROTOCOL_NAME, f"Process died immediately: {err_msg[-500:]}")
+            self._process = None
             return None
 
         await set_core_status(self.PROTOCOL_ID, {
@@ -170,6 +192,14 @@ class BaseProtocol:
         })
         await add_log("INFO", self.PROTOCOL_NAME, f"Service started (PID: {pid})")
         return pid
+
+    async def _default_iface(self) -> str:
+        """Return the interface of the default route (falls back to eth0)."""
+        _, out, _ = await self._run_cmd(
+            "ip -4 route show default | awk '{for(i=1;i<NF;i++) if($i==\"dev\") {print $(i+1); exit}}'",
+            check=False,
+        )
+        return out.strip().splitlines()[0] if out.strip() else "eth0"
 
     async def _is_installed(self, binary: str) -> bool:
         """Check if a binary is available, checking common system paths as well."""
@@ -190,7 +220,7 @@ class BaseProtocol:
         max_retries = 5
         for i in range(max_retries):
             # Use -o DPkg::Lock::Timeout=60 if supported, but manual retry is safer
-            rc, out, err = await self._run_cmd(f"sudo apt install -y {packages}", check=False, timeout=180)
+            rc, out, err = await self._run_cmd(f"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y {packages}", check=False, timeout=180)
             if rc == 0:
                 return True
             

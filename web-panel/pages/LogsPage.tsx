@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { getLogs } from '../services/api';
 import type { LogEntry } from '../services/api';
+import { normLevel } from '../utils/format';
 import {
     ArrowLeft,
     Search,
@@ -41,14 +42,15 @@ const LogsPage: React.FC<{ onBack: () => void }> = ({ onBack }) => {
     }, [limit]);
 
     const filteredLogs = logs.filter(log => {
-        const matchesSearch = log.message.toLowerCase().includes(filter.toLowerCase()) ||
-            log.source.toLowerCase().includes(filter.toLowerCase());
-        const matchesLevel = levelFilter === 'ALL' || log.level === levelFilter;
+        const q = filter.toLowerCase();
+        const matchesSearch = (log.message || '').toLowerCase().includes(q) ||
+            (log.source || '').toLowerCase().includes(q);
+        const matchesLevel = levelFilter === 'ALL' || normLevel(log.level) === levelFilter;
         return matchesSearch && matchesLevel;
     });
 
     const logLevelColor = (level: string) => {
-        switch (level) {
+        switch (normLevel(level)) {
             case 'ERROR': return 'text-red-500 bg-red-500/10 border-red-500/20';
             case 'WARN': return 'text-amber-500 bg-amber-500/10 border-amber-500/20';
             case 'INFO': return 'text-blue-500 bg-blue-500/10 border-blue-500/20';
@@ -57,7 +59,7 @@ const LogsPage: React.FC<{ onBack: () => void }> = ({ onBack }) => {
     };
 
     return (
-        <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+        <div className="space-y-6 animate-fade-in">
             <div className="flex items-center justify-between">
                 <div className="flex items-center gap-4">
                     <button
@@ -117,7 +119,6 @@ const LogsPage: React.FC<{ onBack: () => void }> = ({ onBack }) => {
                                 <option value={100}>100 Entries</option>
                                 <option value={500}>500 Entries</option>
                                 <option value={1000}>1000 Entries</option>
-                                <option value={5000}>5000 Entries</option>
                             </select>
                         </div>
                     </div>
@@ -152,7 +153,7 @@ const LogsPage: React.FC<{ onBack: () => void }> = ({ onBack }) => {
                                         </td>
                                         <td className="px-5 py-3">
                                             <span className={`px-2 py-0.5 rounded-full text-[10px] font-black border ${logLevelColor(log.level)}`}>
-                                                {log.level}
+                                                {normLevel(log.level)}
                                             </span>
                                         </td>
                                         <td className="px-5 py-3">

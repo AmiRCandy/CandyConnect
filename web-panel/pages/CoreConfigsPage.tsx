@@ -3,6 +3,7 @@ import { getCoreConfigs, updateCoreConfig, restartCore, getCores, getLogs, type 
 import { useNotify } from '../components/Notification';
 import Modal from '../components/Modal';
 import { BtnSecondary } from '../components/UI';
+import { normLevel, logTime } from '../utils/format';
 import { Candy, Zap, Shield, Lock, KeyRound, Radio, Globe, Wind, Castle, Settings, Circle, Loader2, Activity } from 'lucide-react';
 
 const CoreLogViewer: React.FC<{ coreId: string; onClose: () => void }> = ({ coreId, onClose }) => {
@@ -24,8 +25,8 @@ const CoreLogViewer: React.FC<{ coreId: string; onClose: () => void }> = ({ core
           logs.length === 0 ? <div className="p-4 text-center text-slate-500">No recent logs found for this core.</div> :
             logs.map((L, i) => (
               <div key={i} className="flex gap-2 border-b border-slate-100 dark:border-slate-800 pb-1 mb-1 last:border-0">
-                <span className="text-slate-400 whitespace-nowrap">{L.time.split(' ')[1]}</span>
-                <span className={`font-bold w-12 text-center ${L.level === 'ERROR' ? 'text-red-500' : L.level === 'WARN' ? 'text-amber-500' : 'text-blue-500'}`}>{L.level}</span>
+                <span className="text-slate-400 whitespace-nowrap">{logTime(L.time)}</span>
+                <span className={`font-bold w-12 text-center ${normLevel(L.level) === 'ERROR' ? 'text-red-500' : normLevel(L.level) === 'WARN' ? 'text-amber-500' : 'text-blue-500'}`}>{normLevel(L.level)}</span>
                 <span className="text-slate-700 dark:text-slate-300 break-all">{L.message}</span>
               </div>
             ))}

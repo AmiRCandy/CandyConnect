@@ -1,7 +1,7 @@
 """
 CandyConnect - OpenVPN Protocol Manager
 """
-import asyncio, os, time
+import asyncio, os, time, ipaddress
 from protocols.base import BaseProtocol
 from database import get_core_config, get_core_status, set_core_status, add_log
 from config import DATA_DIR
@@ -25,42 +25,51 @@ class OpenVPNProtocol(BaseProtocol):
                 if not await self._apt_install("openvpn easy-rsa"):
                     return False
 
-            # Set up Easy-RSA PKI
+            # Set up Easy-RSA PKI.
+            # install() runs on every server start, so every step must be idempotent:
+            # `easyrsa --batch init-pki` DELETES an existing PKI (CA + all client certs).
             os.makedirs(self.EASYRSA_DIR, exist_ok=True)
-            await self._run_cmd(f"cp -r /usr/share/easy-rsa/* {self.EASYRSA_DIR}/", check=False)
+            if not os.path.exists(os.path.join(self.EASYRSA_DIR, "easyrsa")):
+                await self._run_cmd(f"cp -r /usr/share/easy-rsa/* {self.EASYRSA_DIR}/", check=False)
 
-            # Initialize PKI
-            await self._run_cmd(
-                f"cd {self.EASYRSA_DIR} && ./easyrsa --batch init-pki",
-                check=False,
-            )
-            # Build CA
-            await self._run_cmd(
-                f"cd {self.EASYRSA_DIR} && EASYRSA_BATCH=1 ./easyrsa --batch build-ca nopass",
-                check=False,
-            )
-            # Generate server cert
-            await self._run_cmd(
-                f"cd {self.EASYRSA_DIR} && EASYRSA_BATCH=1 ./easyrsa --batch build-server-full server nopass",
-                check=False,
-            )
-            # Generate DH params (can be slow, increase timeout)
-            await self._run_cmd(
-                f"cd {self.EASYRSA_DIR} && ./easyrsa --batch gen-dh",
-                check=False,
-                timeout=600,
-            )
-            # Generate TLS-Crypt key
-            await self._run_cmd(
-                f"sudo openvpn --genkey secret {self.PKI_DIR}/tc.key",
-                check=False,
-            )
+            if not os.path.exists(f"{self.PKI_DIR}/ca.crt"):
+                await add_log("INFO", self.PROTOCOL_NAME, "Creating PKI (CA + server certificate)...")
+                await self._run_cmd(
+                    f"cd {self.EASYRSA_DIR} && ./easyrsa --batch init-pki",
+                    check=False,
+                )
+                await self._run_cmd(
+                    f"cd {self.EASYRSA_DIR} && EASYRSA_BATCH=1 EASYRSA_REQ_CN='CandyConnect CA' ./easyrsa --batch build-ca nopass",
+                    check=False,
+                    timeout=120,
+                )
+            if not os.path.exists(f"{self.PKI_DIR}/issued/server.crt"):
+                await self._run_cmd(
+                    f"cd {self.EASYRSA_DIR} && EASYRSA_BATCH=1 ./easyrsa --batch build-server-full server nopass",
+                    check=False,
+                    timeout=120,
+                )
+            # No DH params needed: the server config uses "dh none" (ECDHE)
+
+            # Generate TLS-Crypt key (OpenVPN >= 2.5 syntax, fallback to 2.4 syntax)
+            if not os.path.exists(f"{self.PKI_DIR}/tc.key"):
+                rc, _, _ = await self._run_cmd(
+                    f"sudo openvpn --genkey secret {self.PKI_DIR}/tc.key",
+                    check=False,
+                )
+                if rc != 0:
+                    await self._run_cmd(
+                        f"sudo openvpn --genkey --secret {self.PKI_DIR}/tc.key",
+                        check=False,
+                    )
             
             # Generate initial CRL (needed for crl-verify to work)
-            await self._run_cmd(
-                f"cd {self.EASYRSA_DIR} && EASYRSA_BATCH=1 ./easyrsa gen-crl",
-                check=False,
-            )
+            if not os.path.exists(f"{self.PKI_DIR}/crl.pem"):
+                await self._run_cmd(
+                    f"cd {self.EASYRSA_DIR} && EASYRSA_BATCH=1 ./easyrsa gen-crl",
+                    check=False,
+                )
+            await self._publish_crl()
             
             # Ensure proper permissions and links
             await self._run_cmd(f"sudo chown -R root:root {self.OVPN_DIR} {self.EASYRSA_DIR}", check=False)
@@ -90,7 +99,7 @@ class OpenVPNProtocol(BaseProtocol):
 
             # Try systemctl first
             rc, _, err = await self._run_cmd(
-                "sudo systemctl enable openvpn-server@server && sudo systemctl start openvpn-server@server",
+                "sudo systemctl enable openvpn-server@server && sudo systemctl restart openvpn-server@server",
                 check=False,
             )
             
@@ -158,9 +167,7 @@ class OpenVPNProtocol(BaseProtocol):
                             return parts[i + 1]
         return ""
 
-    async def get_active_connections(self) -> int:
-        # Read the OpenVPN status file and count CLIENT_LIST entries.
-        # Avoid piping into grep -c (pipe exit-code issue).
+    async def _read_status(self) -> str:
         for status_file in [
             "/var/log/openvpn/openvpn-status.log",
             "/etc/openvpn/server/openvpn-status.log",
@@ -168,28 +175,30 @@ class OpenVPNProtocol(BaseProtocol):
         ]:
             rc, out, _ = await self._run_cmd(f"sudo cat {status_file} 2>/dev/null", check=False)
             if rc == 0 and out:
-                # CLIENT_LIST lines: one header + one per connected client
-                count = sum(1 for line in out.splitlines() if line.startswith("CLIENT_LIST,") or line.startswith("CLIENT_LIST\t"))
-                # Subtract 1 for the header line ("CLIENT_LIST,Common Name,...")
-                return max(0, count - 1)
-        return 0
+                return out
+        return ""
+
+    async def get_active_connections(self) -> int:
+        # status-version 2: one "CLIENT_LIST,..." line per connected client
+        # (the header line starts with "HEADER,CLIENT_LIST" so it is not counted)
+        out = await self._read_status()
+        return sum(1 for line in out.splitlines() if line.startswith("CLIENT_LIST,"))
 
     async def get_traffic(self) -> dict:
-        """Get total traffic from OpenVPN status log."""
+        """Sum per-client byte counters from the OpenVPN status file."""
         total_in = 0
         total_out = 0
         try:
-            status_file = "/var/log/openvpn/openvpn-status.log"
-            if not os.path.exists(status_file):
-                status_file = "/etc/openvpn/server/openvpn-status.log"
-
-            rc, out, _ = await self._run_cmd(f"sudo cat {status_file}", check=False)
-            if rc == 0:
-                for line in out.split("\n"):
-                    if line.startswith("TCP/UDP read bytes,"):
-                        total_in = int(line.split(",")[1])
-                    elif line.startswith("TCP/UDP write bytes,"):
-                        total_out = int(line.split(",")[1])
+            # CLIENT_LIST,CN,Real Address,Virtual Address,Virtual IPv6,Bytes Received,Bytes Sent,...
+            for line in (await self._read_status()).splitlines():
+                if line.startswith("CLIENT_LIST,"):
+                    parts = line.split(",")
+                    if len(parts) > 6:
+                        try:
+                            total_in += int(parts[5])
+                            total_out += int(parts[6])
+                        except ValueError:
+                            pass
         except Exception:
             pass
         # Return raw bytes so callers can aggregate accurately
@@ -197,6 +206,8 @@ class OpenVPNProtocol(BaseProtocol):
 
     async def add_client(self, username: str, client_data: dict) -> dict:
         """Generate client certificate and return .ovpn config data."""
+        if os.path.exists(f"{self.PKI_DIR}/issued/{username}.crt"):
+            return {"cert_generated": True, "username": username}
         # Generate client cert
         await self._run_cmd(
             f"cd {self.EASYRSA_DIR} && EASYRSA_BATCH=1 ./easyrsa --batch build-client-full {username} nopass",
@@ -214,6 +225,20 @@ class OpenVPNProtocol(BaseProtocol):
             f"cd {self.EASYRSA_DIR} && EASYRSA_BATCH=1 ./easyrsa gen-crl",
             check=False,
         )
+        await self._publish_crl()
+
+    async def _publish_crl(self):
+        """Copy the CRL where OpenVPN can re-read it after dropping to nobody:nogroup.
+
+        The easy-rsa dir is chmod 700, and OpenVPN re-reads crl-verify on every
+        new connection *after* dropping privileges, so pointing it at pki/crl.pem
+        rejects every client.
+        """
+        os.makedirs(self.OVPN_DIR, exist_ok=True)
+        await self._run_cmd(
+            f"sudo cp {self.PKI_DIR}/crl.pem {self.OVPN_DIR}/crl.pem && sudo chmod 644 {self.OVPN_DIR}/crl.pem",
+            check=False,
+        )
 
     async def get_client_config(self, username: str, server_ip: str, protocol_data: dict, config_id: str = None) -> dict:
         config = await get_core_config("openvpn")
@@ -223,11 +248,21 @@ class OpenVPNProtocol(BaseProtocol):
         port = config.get("port", 1194)
         protocol = config.get("protocol", "udp")
 
+        # Client created before OpenVPN was set up? Issue its certificate now.
+        if not os.path.exists(f"{self.PKI_DIR}/issued/{username}.crt") and os.path.exists(f"{self.PKI_DIR}/ca.crt"):
+            await self.add_client(username, {})
+
         # Read cert files
         ca = await self._read_file(f"{self.PKI_DIR}/ca.crt")
         cert = await self._read_file(f"{self.PKI_DIR}/issued/{username}.crt")
         key = await self._read_file(f"{self.PKI_DIR}/private/{username}.key")
         tc = await self._read_file(f"{self.PKI_DIR}/tc.key")
+        if not ca or not cert or not key:
+            return {}
+        # Certificate files contain a text dump before the PEM block; keep only the PEM part
+        if "-----BEGIN CERTIFICATE-----" in cert:
+            cert = cert[cert.index("-----BEGIN CERTIFICATE-----"):]
+        tls_crypt_block = f"<tls-crypt>\n{tc}\n</tls-crypt>\n" if config.get("tls_crypt") and tc else ""
 
         ovpn_config = f"""client
 dev tun
@@ -250,10 +285,7 @@ verb 3
 <key>
 {key}
 </key>
-<tls-crypt>
-{tc}
-</tls-crypt>
-"""
+{tls_crypt_block}"""
         return {
             "type": "openvpn",
             "server": server_ip,
@@ -274,15 +306,15 @@ verb 3
         os.makedirs(self.OVPN_DIR, exist_ok=True)
 
         # Detect default network interface
-        _, default_iface, _ = await self._run_cmd(
-            "ip route show default | awk '{print $5}' | head -1",
-            check=False,
-        )
-        default_iface = default_iface.strip() or "eth0"
+        default_iface = await self._default_iface()
 
         subnet = config.get("subnet", "10.8.0.0/24")
-        subnet_ip = subnet.split("/")[0]
-        subnet_mask = "255.255.255.0"
+        try:
+            net = ipaddress.ip_network(subnet, strict=False)
+            subnet = str(net)
+            subnet_ip, subnet_mask = str(net.network_address), str(net.netmask)
+        except ValueError:
+            subnet, subnet_ip, subnet_mask = "10.8.0.0/24", "10.8.0.0", "255.255.255.0"
 
         server_conf = f"""port {config.get('port', 1194)}
 proto {config.get('protocol', 'udp')}
@@ -306,9 +338,10 @@ group nogroup
 persist-key
 persist-tun
 status /var/log/openvpn/openvpn-status.log
+status-version 2
 log /var/log/openvpn/openvpn.log
 verb 3
-crl-verify {self.PKI_DIR}/crl.pem
+crl-verify {self.OVPN_DIR}/crl.pem
 """
         if config.get("tls_crypt"):
             server_conf += f"tls-crypt {self.PKI_DIR}/tc.key\n"
@@ -326,5 +359,10 @@ crl-verify {self.PKI_DIR}/crl.pem
         await self._run_cmd(
             f"sudo iptables -t nat -C POSTROUTING -s {subnet} -o {default_iface} -j MASQUERADE 2>/dev/null || "
             f"sudo iptables -t nat -A POSTROUTING -s {subnet} -o {default_iface} -j MASQUERADE",
+            check=False,
+        )
+        await self._run_cmd(
+            f"sudo iptables -C FORWARD -s {subnet} -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD -s {subnet} -j ACCEPT; "
+            f"sudo iptables -C FORWARD -d {subnet} -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD -d {subnet} -j ACCEPT",
             check=False,
         )

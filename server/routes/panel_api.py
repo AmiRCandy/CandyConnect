@@ -7,14 +7,17 @@ from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks
 from pydantic import BaseModel
 import paramiko
 import time
+import logging
+from starlette.concurrency import run_in_threadpool
 
 import database as db
 import auth
-from config import SUPPORTED_PROTOCOLS
+from config import SUPPORTED_PROTOCOLS, PANEL_PORT
 from system_info import get_server_info
 from protocols.manager import protocol_manager
 
 router = APIRouter(tags=["panel"])
+logger = logging.getLogger("candyconnect")
 
 # ── Auth ──
 
@@ -110,12 +113,10 @@ async def create_client(req: CreateClientRequest, user=Depends(auth.require_admi
         client = await db.create_client(req.model_dump())
         
         # Add to protocol backends
-        pdata = await protocol_manager.add_client_to_protocols(
-            client["username"], client, client["protocols"]
-        )
+        pdata = await protocol_manager.sync_client(client)
         
         # Update DB with protocol-specific data (keys, etc)
-        await db.update_client(client["id"], {"protocol_data": pdata})
+        await db.update_client(client["id"], {"protocol_data": pdata}, log=False)
         client["protocol_data"] = pdata
         
         return {"success": True, "message": "Client created", "data": client}
@@ -131,12 +132,9 @@ async def update_client(id: str, req: UpdateClientRequest, user=Depends(auth.req
     try:
         updated = await db.update_client(id, req.model_dump(exclude_unset=True))
         
-        # Update protocol backends
-        pdata = await protocol_manager.add_client_to_protocols(
-            updated["username"], updated, updated["protocols"], 
-            existing_data=updated.get("protocol_data")
-        )
-        await db.update_client(id, {"protocol_data": pdata})
+        # Update protocol backends (adds, re-applies password, removes disabled protocols)
+        pdata = await protocol_manager.sync_client(updated)
+        await db.update_client(id, {"protocol_data": pdata}, log=False)
         updated["protocol_data"] = pdata
         
         return {"success": True, "message": "Client updated", "data": updated}
@@ -194,7 +192,7 @@ async def background_install_tunnel(tunnel_id: str, ip: str, port: int, username
         except Exception as e:
             return False, "", str(e)
 
-    success, out, err = await auth.run_in_threadpool(_sync_ssh)
+    success, out, err = await run_in_threadpool(_sync_ssh)
     
     if success:
         await db.update_tunnel_status(tunnel_id, "installed")
@@ -213,7 +211,7 @@ async def add_tunnel(req: TunnelRequest, tasks: BackgroundTasks, user=Depends(au
     master_ip = server_info.get("ip", "YOUR_SERVER_IP")
     
     # Generates a command to run on the remote tunnel server
-    install_cmd = f"curl -fsSL https://get.candyconnect.io/tunnel | sudo bash -s -- --master {master_ip}:8443 --secret {tunnel['id']} --type {req.tunnel_type}"
+    install_cmd = f"curl -fsSL https://get.candyconnect.io/tunnel | sudo bash -s -- --master {master_ip}:{PANEL_PORT} --secret {tunnel['id']} --type {req.tunnel_type}"
     
     if req.ip and req.password:
         tasks.add_task(background_install_tunnel, tunnel['id'], req.ip, req.port, req.username, req.password, install_cmd)
@@ -221,7 +219,7 @@ async def add_tunnel(req: TunnelRequest, tasks: BackgroundTasks, user=Depends(au
     return {
         "success": True, 
         "message": "Tunnel added. installation started via SSH" if req.password else "Tunnel added. password missing for SSH install", 
-        "data": tunnel, 
+        "data": {k: v for k, v in tunnel.items() if k != "ssh_password"}, 
         "install_command": install_cmd
     }
 
@@ -243,7 +241,9 @@ async def start_core(id: str, user=Depends(auth.require_admin)):
         success = await protocol_manager.start_protocol(id)
         if success:
             return {"success": True, "message": f"{id.upper()} started"}
-        raise HTTPException(status_code=500, detail=f"Failed to start {id}")
+        raise HTTPException(status_code=500, detail=f"Failed to start {id}. Check the logs for details.")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception(f"Error starting {id}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -254,7 +254,9 @@ async def stop_core(id: str, user=Depends(auth.require_admin)):
         success = await protocol_manager.stop_protocol(id)
         if success:
             return {"success": True, "message": f"{id.upper()} stopped"}
-        raise HTTPException(status_code=500, detail=f"Failed to stop {id}")
+        raise HTTPException(status_code=500, detail=f"Failed to stop {id}. Check the logs for details.")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception(f"Error stopping {id}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -265,7 +267,9 @@ async def restart_core(id: str, user=Depends(auth.require_admin)):
         success = await protocol_manager.restart_protocol(id)
         if success:
             return {"success": True, "message": f"{id.upper()} restarted"}
-        raise HTTPException(status_code=500, detail=f"Failed to restart {id}")
+        raise HTTPException(status_code=500, detail=f"Failed to restart {id}. Check the logs for details.")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception(f"Error restarting {id}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -279,7 +283,19 @@ async def get_configs(user=Depends(auth.require_admin)):
 
 @router.put("/configs/{section}")
 async def update_config(section: str, data: dict = Body(...), user=Depends(auth.require_admin)):
+    if section == "v2ray" and "config_json" in data:
+        import json
+        try:
+            raw = data["config_json"]
+            json.loads(raw) if isinstance(raw, str) else None
+            if not isinstance(raw, str):
+                data["config_json"] = json.dumps(raw, indent=2)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid V2Ray config JSON: {e}")
     await db.update_core_config(section, data)
+    if section == "v2ray":
+        # A pasted config usually has no users: put the clients back in
+        await protocol_manager.get_protocol("v2ray").sync_clients(await db.get_all_clients())
     return {"success": True, "message": f"Config for {section} updated"}
 
 # ── Panel ──

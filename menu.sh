@@ -12,6 +12,7 @@ NC='\033[0m'
 
 CC_DIR="/opt/candyconnect"
 CC_SERVICE="candyconnect"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── Helpers ──
 
@@ -29,7 +30,7 @@ banner() {
 }
 
 check_install_status() {
-    if [ -d "$CC_DIR" ] && systemctl list-unit-files | grep -q "^$CC_SERVICE.service"; then
+    if [ -d "$CC_DIR" ] && systemctl list-unit-files 2>/dev/null | grep -q "^$CC_SERVICE.service"; then
         echo -e "Status: ${GREEN}${BOLD}INSTALLED${NC}"
         return 0
     else
@@ -52,11 +53,10 @@ show_menu() {
 # ── Functions ──
 
 install_cc() {
-    if [ -f "./install.sh" ]; then
-        chmod +x ./install.sh
-        ./install.sh
+    if [ -f "$SCRIPT_DIR/install.sh" ]; then
+        bash "$SCRIPT_DIR/install.sh"
     else
-        echo -e "${RED}[✗] Error: install.sh not found in current directory.${NC}"
+        echo -e "${RED}[✗] Error: install.sh not found in $SCRIPT_DIR.${NC}"
     fi
 }
 
@@ -75,7 +75,9 @@ uninstall_cc() {
         systemctl stop "xl2tpd" 2>/dev/null
         # Force kill any lingering processes
         pkill -f "dnstt-server" || true
-        pkill -f "xray" || true
+        pkill -x "xray" || true
+        wg-quick down wg0 2>/dev/null || true
+        rm -f /etc/wireguard/wg0.conf
         
         echo -e "${CYAN}[i] Removing service files...${NC}"
         rm -f "/etc/systemd/system/$CC_SERVICE.service"

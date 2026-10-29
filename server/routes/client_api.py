@@ -28,6 +28,9 @@ async def client_login(req: ClientLoginRequest):
     client = await db.verify_client(req.username, req.password)
     if not client:
         raise HTTPException(status_code=401, detail="Invalid username, password or account disabled")
+    reason = db.client_limit_reason(client)
+    if reason:
+        raise HTTPException(status_code=403, detail=reason)
     
     token = auth.create_client_token(req.username, client["id"])
     
@@ -51,6 +54,77 @@ async def client_login(req: ClientLoginRequest):
         },
         "account": _format_client(client)
     }
+
+
+async def _ensure_protocol_data(client: dict, pid: str, required_key: str) -> dict:
+    """Create the client's backend data on demand (e.g. the client was created
+    before the protocol was installed, so no keys were generated then)."""
+    pdata_all = client.get("protocol_data") or {}
+    pdata = pdata_all.get(pid) or {}
+    if pdata.get(required_key):
+        return pdata
+    result = await protocol_manager.add_client_to_protocols(
+        client["username"], client, {pid: True}, existing_data=pdata_all)
+    if result.get(pid, {}).get(required_key):
+        pdata_all[pid] = result[pid]
+        await db.update_client(client["id"], {"protocol_data": pdata_all}, log=False)
+        client["protocol_data"] = pdata_all
+        return result[pid]
+    return pdata
+
+
+def _v2ray_share_link(protocol: str, inbound: dict, stream: dict, client_uuid: str,
+                      password: str, server_ip: str, port, name: str) -> str:
+    """Build a standard share link (importable in v2rayN / v2rayNG / Hiddify / sing-box)."""
+    import base64, json
+    from urllib.parse import urlencode, quote
+
+    network = stream.get("network", "tcp")
+    security = stream.get("security", "none")
+    params = {"type": network, "security": security}
+    path = host = ""
+    if network == "ws":
+        ws = stream.get("wsSettings", {}) or {}
+        path = ws.get("path", "/")
+        host = (ws.get("headers") or {}).get("Host", "") or ws.get("host", "")
+    elif network == "grpc":
+        params["serviceName"] = (stream.get("grpcSettings", {}) or {}).get("serviceName", "")
+    elif network in ("httpupgrade", "splithttp", "xhttp"):
+        hs = stream.get(f"{network}Settings", {}) or {}
+        path, host = hs.get("path", "/"), hs.get("host", "")
+    if path:
+        params["path"] = path
+    if host:
+        params["host"] = host
+    if security == "tls":
+        tls = stream.get("tlsSettings", {}) or {}
+        if tls.get("serverName"):
+            params["sni"] = tls["serverName"]
+        params["fp"] = tls.get("fingerprint", "chrome")
+    elif security == "reality":
+        from protocols.v2ray import V2RayProtocol
+        rs = V2RayProtocol._client_stream_settings(stream).get("realitySettings", {})
+        params.update({"sni": rs.get("serverName", ""), "pbk": rs.get("publicKey", ""),
+                       "sid": rs.get("shortId", ""), "fp": rs.get("fingerprint", "chrome")})
+
+    if protocol == "vmess":
+        obj = {"v": "2", "ps": name, "add": server_ip, "port": str(port), "id": client_uuid,
+               "aid": "0", "scy": "auto", "net": network, "type": "none", "host": host,
+               "path": path, "tls": "tls" if security == "tls" else "", "sni": params.get("sni", "")}
+        return "vmess://" + base64.b64encode(json.dumps(obj).encode()).decode()
+    if protocol == "shadowsocks":
+        ss = inbound.get("settings", {}) or {}
+        userinfo = base64.urlsafe_b64encode(
+            f"{ss.get('method', 'aes-256-gcm')}:{ss.get('password', '')}".encode()).decode().rstrip("=")
+        return f"ss://{userinfo}@{server_ip}:{port}#{quote(name)}"
+    if protocol == "trojan":
+        return f"trojan://{quote(password, safe='')}@{server_ip}:{port}?{urlencode(params)}#{quote(name)}"
+    # vless
+    params["encryption"] = "none"
+    for c in (inbound.get("settings", {}) or {}).get("clients", []) or []:
+        if c.get("id") == client_uuid and c.get("flow"):
+            params["flow"] = c["flow"]
+    return f"vless://{client_uuid}@{server_ip}:{port}?{urlencode(params)}#{quote(name)}"
 
 
 def _format_client(client: dict) -> dict:
@@ -171,19 +245,18 @@ async def get_all_configs(payload=Depends(auth.require_client)):
                 for inbound in inbounds:
                     tag = inbound.get("tag", "v2ray-default")
                     protocol = inbound.get("protocol", "vless")
+                    if protocol not in ("vless", "vmess", "trojan", "shadowsocks"):
+                        continue  # api / dokodemo-door / socks inbounds are not client configs
                     port = inbound.get("port", 443)
-                    stream = inbound.get("streamSettings", {})
+                    stream = inbound.get("streamSettings", {}) or {}
+                    config_link = _v2ray_share_link(
+                        protocol, inbound, stream, client_uuid,
+                        pdata.get("password") or client.get("password", ""),
+                        server_ip, port, f"CC-{protocol.upper()}-{stream.get('network', 'tcp')}",
+                    )
                     network = stream.get("network", "tcp")
                     security = stream.get("security", "none")
-                    
-                    link_params = f"type={network}&security={security}"
-                    if security == "tls":
-                        tls_settings = stream.get("tlsSettings", {})
-                        sni = tls_settings.get("serverName", "")
-                        if sni: link_params += f"&sni={sni}"
-                    
-                    config_link = f"{protocol}://{client_uuid}@{server_ip}:{port}?{link_params}#CC-{protocol.upper()}-{network}"
-                    
+
                     network_display = {
                         "ws": "WebSocket", "websocket": "WebSocket",
                         "grpc": "gRPC", "tcp": "TCP", "kcp": "mKCP",
@@ -224,7 +297,7 @@ async def get_all_configs(payload=Depends(auth.require_client)):
     if is_enabled("wireguard"):
         wg_cfg_meta = await db.get_core_config("wireguard")
         port = int((wg_cfg_meta or {}).get("listen_port", 51820))
-        pdata = protocol_data.get("wireguard", {})
+        pdata = await _ensure_protocol_data(client, "wireguard", "private_key")
         privkey = pdata.get("private_key", "")
         
         # Link including private key if available
@@ -320,7 +393,7 @@ async def get_all_configs(payload=Depends(auth.require_client)):
             "port": port,
             "configLink": f"l2tp://{server_ip}:{port}",
             "icon": "📡",
-            "extraData": {"username": client["username"]}
+            "extraData": {"username": client["username"], "psk": (l2tp_cfg or {}).get("psk", "")}
         })
 
     # 6. DNSTT
@@ -409,6 +482,9 @@ async def get_protocol_config(protocol: str, payload=Depends(auth.require_client
     # If protocol is "vless-tcp", root is "vless", which maps to "v2ray"
     proto_root = protocol.split("-")[0].lower()
     core_protocol = proto_map.get(proto_root, proto_root)
+    if protocol_manager.get_protocol(core_protocol) is None:
+        # Custom V2Ray inbound tags (e.g. "inbound-443") don't start with a protocol name
+        core_protocol = "v2ray"
     
     # 2. Check if admin override (Admins have access to all)
     admin_user = await db.get_admin_username()
@@ -426,7 +502,10 @@ async def get_protocol_config(protocol: str, payload=Depends(auth.require_client
     if not p_mgr:
         raise HTTPException(status_code=404, detail=f"Protocol manager for {core_protocol} not found")
         
-    pdata = (client.get("protocol_data", {}) or {}).get(core_protocol, {})
+    if core_protocol == "wireguard":
+        pdata = await _ensure_protocol_data(client, "wireguard", "private_key")
+    else:
+        pdata = (client.get("protocol_data", {}) or {}).get(core_protocol, {})
     config = await p_mgr.get_client_config(client["username"], server_ip, pdata, config_id=protocol)
     
     if not config:
