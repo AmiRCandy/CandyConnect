@@ -10,6 +10,7 @@ interface ProxySettings {
   ip: string;
   port: string;
   authEnabled: boolean;
+  systemProxy: boolean;
   username: string;
   password: string;
   // TUN Configuration Options
@@ -35,6 +36,7 @@ const ProxyPage: React.FC<ProxyPageProps> = ({ onBack }) => {
     ip: '127.0.0.1',
     port: '1080',
     authEnabled: false,
+    systemProxy: true,
     username: '',
     password: '',
     // TUN Configuration defaults
@@ -66,6 +68,7 @@ const ProxyPage: React.FC<ProxyPageProps> = ({ onBack }) => {
           ip: loadedSettings.proxyAddress || '127.0.0.1',
           port: loadedSettings.proxyPort?.toString() || '1080',
           authEnabled: !!(loadedSettings.proxyUsername && loadedSettings.proxyPassword),
+          systemProxy: loadedSettings.systemProxy !== false,
           username: loadedSettings.proxyUsername || '',
           password: loadedSettings.proxyPassword || '',
           tunInet4CIDR: loadedSettings.tunInet4CIDR || '172.19.0.1/30',
@@ -98,6 +101,7 @@ const ProxyPage: React.FC<ProxyPageProps> = ({ onBack }) => {
         proxyPort: parseInt(newSettings.port) || 1080,
         proxyUsername: newSettings.username,
         proxyPassword: newSettings.password,
+        systemProxy: newSettings.systemProxy,
         tunInet4CIDR: newSettings.tunInet4CIDR,
         tunInet6CIDR: newSettings.tunInet6CIDR,
         mtu: newSettings.mtu,
@@ -247,6 +251,28 @@ const ProxyPage: React.FC<ProxyPageProps> = ({ onBack }) => {
                   placeholder="1080"
                 />
               </div>
+            </div>
+          </div>
+
+          {/* System Proxy */}
+          <div className="bg-white dark:bg-slate-800 rounded-lg p-4 shadow-sm border border-slate-200/50 dark:border-slate-700/50">
+            <div className={`flex items-center justify-between ${isRTL ? 'flex-row-reverse' : ''}`}>
+              <div>
+                <h3 className="text-base font-semibold text-slate-800 dark:text-slate-200">{t('systemProxy')}</h3>
+                <p className="text-sm text-slate-500 dark:text-slate-400">{t('systemProxyDesc')}</p>
+              </div>
+              <button
+                onClick={() => handleInputChange('systemProxy', !settings.systemProxy)}
+                className={`relative inline-flex h-6 w-11 flex-shrink-0 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-orange-500 focus:ring-offset-2 dark:focus:ring-offset-slate-800 ${settings.systemProxy
+                    ? 'bg-orange-500'
+                    : 'bg-slate-200 dark:bg-slate-600'
+                  }`}
+              >
+                <span
+                  className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${settings.systemProxy ? 'translate-x-6' : 'translate-x-1'
+                    }`}
+                />
+              </button>
             </div>
           </div>
 

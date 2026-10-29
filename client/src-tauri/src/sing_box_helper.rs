@@ -156,7 +156,7 @@ impl Config {
         // DNS: route through WireGuard outbound (not socks-out which doesn't exist here)
         cfg.dns.servers[0].detour = Some("wg-out".into());
 
-        cfg.inbounds = vec![Inbound::socks_inbound(socks_host, socks_port)];
+        cfg.inbounds = vec![Inbound::mixed_inbound(socks_host, socks_port)];
         cfg.outbounds = vec![
             Outbound::wireguard_full(
                 "wg-out", wg_endpoint, wg_port,
@@ -372,6 +372,20 @@ impl Inbound {
         Self {
             kind: "tun".into(),
             tag: "tun-in".into(),
+            extra,
+        }
+    }
+
+    /// mixed (SOCKS4/5 + HTTP proxy on one port) inbound preset — lets the OS system
+    /// proxy (HTTP) and SOCKS clients share the user's proxy port
+    pub fn mixed_inbound(bind: &str, port: u16) -> Self {
+        let mut extra = HashMap::new();
+        extra.insert("listen".into(), bind.into());
+        extra.insert("listen_port".into(), port.into());
+
+        Self {
+            kind: "mixed".into(),
+            tag: "mixed-in".into(),
             extra,
         }
     }
