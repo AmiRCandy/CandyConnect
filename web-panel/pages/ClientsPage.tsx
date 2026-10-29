@@ -8,16 +8,27 @@ import { Users, Search, ClipboardList, Pencil, Trash2, CheckCircle2, XCircle, Pl
 
 const ALL_PROTOCOLS = ['v2ray', 'wireguard', 'openvpn', 'ikev2', 'l2tp', 'dnstt', 'slipstream', 'trusttunnel'] as const;
 
-// Server timestamps are "YYYY-MM-DD HH:MM:SS" (server local time)
+// Server timestamps are "YYYY-MM-DD HH:MM:SS" (server local time); only used as a
+// fallback when the server does not send the timezone-independent *_ts fields.
 const parseTs = (t?: string | null) => {
   if (!t) return NaN;
   return new Date(t.replace(' ', 'T')).getTime();
 };
 
-// Time progress is derived from created_at/expires_at (the server never updates time_used)
+// Prefer unix seconds from the server (created_ts / expires_ts), else parse the strings
+const clientTimes = (c: Client) => ({
+  start: c.created_ts ? c.created_ts * 1000 : parseTs(c.created_at),
+  end: c.expires_ts ? c.expires_ts * 1000 : parseTs(c.expires_at),
+});
+
+// on_hold = the countdown only starts at the client's first connection
+const isOnHold = (c: Client) => !!c.time_limit?.on_hold && (Number(c.time_limit?.value) || 0) > 0;
+
+// Time progress is derived from created/expires timestamps
 const timeInfo = (c: Client) => {
-  const start = parseTs(c.created_at), end = parseTs(c.expires_at);
   const limit = Number(c.time_limit?.value) || 0;
+  if (isOnHold(c)) return { left: limit, pct: 0, mode: c.time_limit?.mode || 'days' };
+  const { start, end } = clientTimes(c);
   if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
     const used = Number(c.time_used) || 0;
     return { left: Math.max(0, limit - used), pct: limit > 0 ? (used / limit) * 100 : 0, mode: c.time_limit?.mode || 'days' };
@@ -29,7 +40,7 @@ const timeInfo = (c: Client) => {
 };
 
 const fmtTimeLimit = (c: Client) => {
-  if (c.time_limit?.on_hold) return `On Hold (${c.time_limit.value} ${c.time_limit.mode})`;
+  if (isOnHold(c)) return 'On hold';
   const t = timeInfo(c);
   if (t.left <= 0) return 'Expired';
   return `${t.left} ${t.left === 1 ? t.mode.replace(/s$/, '') : t.mode} left`;
@@ -237,8 +248,8 @@ const ClientsPage: React.FC = () => {
               ['Group', detailClient.group || 'None'],
               ['Comment', detailClient.comment || '-'],
               ['Traffic', fmtTraffic(detailClient)],
-              ['Time', fmtTimeLimit(detailClient)],
-              ['Created', detailClient.created_at], ['Expires', detailClient.expires_at],
+              ['Time', isOnHold(detailClient) ? `On hold (${detailClient.time_limit.value} ${detailClient.time_limit.mode}, starts at first connection)` : fmtTimeLimit(detailClient)],
+              ['Created', detailClient.created_at], ['Expires', isOnHold(detailClient) ? '-' : detailClient.expires_at],
               ['Last IP', detailClient.last_connected_ip || 'Never'], ['Last Connected', detailClient.last_connected_time || 'Never'],
             ].map(([k, v], i) => (
               <div key={i} className="flex justify-between py-1.5 border-b border-slate-100 dark:border-slate-700/50">
@@ -304,7 +315,6 @@ const ClientsPage: React.FC = () => {
                   {pid === 'openvpn' && <p><span className="text-slate-400">Config:</span> <span className="text-orange-500 font-mono">{detailClient.username}.ovpn available</span></p>}
                   {pid === 'ikev2' && <p><span className="text-slate-400">Auth:</span> <span className="text-green-500 font-bold">EAP-MSCHAPv2 Active</span></p>}
                   {pid === 'l2tp' && data?.psk && <p><span className="text-slate-400">IPSec PSK:</span> <span className="text-orange-500 font-mono">{data.psk}</span></p>}
-                  {['slipstream', 'trusttunnel'].includes(pid) && <p className="text-slate-400 italic">Experimental protocol</p>}
                 </div>
               ))}
               {Object.keys(detailClient.protocol_data || {}).length === 0 && <p className="text-slate-400 italic">No protocol data generated yet.</p>}

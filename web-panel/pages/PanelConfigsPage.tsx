@@ -1,13 +1,22 @@
 import React, { useState, useEffect } from 'react';
 import { getPanel, updatePanel, changePassword as apiChangePassword, restartPanel as apiRestartPanel, type PanelData } from '../services/api';
 import { useNotify } from '../components/Notification';
-import { Wrench, Globe, AlertTriangle, Key, Lock, Info, Flame, Loader2 } from 'lucide-react';
+import { Wrench, Globe, AlertTriangle, Key, Lock, Info, Flame, Loader2, RotateCw } from 'lucide-react';
 
 // Defined at module level: defining it inside the page component made React remount
 // every card (and its inputs) on each keystroke, dropping input focus.
 const Card: React.FC<{ children: React.ReactNode; danger?: boolean }> = ({ children, danger }) => (
   <div className={`bg-white dark:bg-slate-800 rounded-xl p-5 shadow-sm border ${danger ? 'border-red-200 dark:border-red-800/50' : 'border-slate-200/50 dark:border-slate-700/50'}`}>{children}</div>
 );
+
+const RESERVED_PATHS = ['/api', '/client-api', '/health', '/docs'];
+const normPath = (p: string) => '/' + p.trim().replace(/^\/+|\/+$/g, '');
+
+// Port and path the browser is currently using for the panel
+const currentPort = () => +(window.location.port || (window.location.protocol === 'https:' ? 443 : 80));
+const currentPath = () => '/' + (window.location.pathname.split('/')[1] || '');
+const panelUrl = (port: number, path: string) =>
+  `${window.location.protocol}//${window.location.hostname}:${port}${normPath(path)}/`;
 
 const PanelConfigsPage: React.FC = () => {
   const { notify } = useNotify();
@@ -20,6 +29,9 @@ const PanelConfigsPage: React.FC = () => {
   const [curPass, setCurPass] = useState('');
   const [newPass, setNewPass] = useState('');
   const [confPass, setConfPass] = useState('');
+  // Set after a save that needs a panel restart to take effect
+  const [restartNotice, setRestartNotice] = useState<{ message: string; port: number; path: string } | null>(null);
+  const [restarting, setRestarting] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -54,12 +66,16 @@ const PanelConfigsPage: React.FC = () => {
   })();
 
   const savePanelAccess = async () => {
-    if (port < 1 || port > 65535) { notify('Port must be 1-65535', 'error'); return; }
-    if (!path.startsWith('/')) { notify('Path must start with /', 'error'); return; }
+    if (!Number.isInteger(port) || port < 1 || port > 65535) { notify('Port must be 1-65535', 'error'); return; }
+    const p = normPath(path);
+    if (!/^\/[A-Za-z0-9_-]+$/.test(p)) { notify('Path must look like /candyconnect (letters, digits, - and _)', 'error'); return; }
+    if (RESERVED_PATHS.includes(p)) { notify(`${p} is reserved, choose another path`, 'error'); return; }
     setSaving(true);
     try {
-      const msg = await updatePanel({ panel_port: port, panel_path: path });
-      notify(msg, 'success');
+      const res = await updatePanel({ panel_port: port, panel_path: p });
+      setPath(p);
+      notify(res.message, 'success');
+      setRestartNotice(res.restart_required ? { message: res.message, port, path: p } : null);
     } catch (e: any) {
       notify(e.message || 'Failed to save', 'error');
     } finally { setSaving(false); }
@@ -79,13 +95,26 @@ const PanelConfigsPage: React.FC = () => {
     } finally { setSaving(false); }
   };
 
+  // Restart the panel; if the port/path the panel will come back on differs from
+  // the one in the address bar, send the browser to the new URL afterwards.
   const handleRestart = async () => {
+    const target = restartNotice || (data ? { port: data.config.panel_port, path: data.config.panel_path } : null);
+    setRestarting(true);
     notify('Restarting panel...', 'warn');
     try {
       await apiRestartPanel();
-      notify('Panel restart initiated', 'success');
+      if (target && (target.port !== currentPort() || normPath(target.path) !== currentPath())) {
+        const url = panelUrl(target.port, target.path);
+        notify(`Panel restart initiated, redirecting to ${url} ...`, 'success');
+        setTimeout(() => { window.location.href = url; }, 4000);
+      } else {
+        notify('Panel restart initiated', 'success');
+        setRestartNotice(null);
+        setRestarting(false);
+      }
     } catch (e: any) {
       notify(e.message || 'Failed to restart', 'error');
+      setRestarting(false);
     }
   };
 
@@ -108,18 +137,29 @@ const PanelConfigsPage: React.FC = () => {
           <div>
             <label className="block text-xs font-semibold text-slate-600 dark:text-slate-400 mb-1">Panel Port</label>
             <input type="number" value={port} onChange={e => setPort(+e.target.value)} min={1} max={65535} className="w-full px-3 py-2.5 border border-slate-300 dark:border-slate-600 rounded-xl bg-slate-50 dark:bg-slate-700 text-slate-900 dark:text-slate-200 text-sm" />
-            <p className="text-[10px] text-slate-400 mt-1">{window.location.protocol}//{s.ip}:{port}{path}</p>
+            <p className="text-[10px] text-slate-400 mt-1">{window.location.protocol}//{s.ip}:{port}{normPath(path)}/</p>
           </div>
           <div>
             <label className="block text-xs font-semibold text-slate-600 dark:text-slate-400 mb-1">Panel Path</label>
             <input type="text" value={path} onChange={e => setPath(e.target.value)} className="w-full px-3 py-2.5 border border-slate-300 dark:border-slate-600 rounded-xl bg-slate-50 dark:bg-slate-700 text-slate-900 dark:text-slate-200 text-sm" />
-            <p className="text-[10px] text-slate-400 mt-1">Must start with /</p>
+            <p className="text-[10px] text-slate-400 mt-1">e.g. /candyconnect (letters, digits, - and _)</p>
           </div>
         </div>
         <div className="flex items-center justify-between mt-4 pt-4 border-t border-slate-200 dark:border-slate-700">
           <p className="text-[10px] text-slate-400 flex items-center gap-1"><AlertTriangle className="w-3 h-3" /> Changing port/path requires reconnection</p>
           <button onClick={savePanelAccess} disabled={saving} className="px-4 py-2 rounded-xl text-sm font-bold text-white bg-orange-500 hover:bg-orange-600 transition-colors disabled:opacity-50">Save</button>
         </div>
+        {restartNotice && (
+          <div className="mt-4 p-3 rounded-xl bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 flex flex-col sm:flex-row sm:items-center gap-3">
+            <div className="flex-1 text-xs text-amber-800 dark:text-amber-300">
+              <p className="font-bold flex items-center gap-1.5"><AlertTriangle className="w-3.5 h-3.5" /> {restartNotice.message}</p>
+              <p className="mt-1">After the restart the panel will be at <span className="font-mono">{panelUrl(restartNotice.port, restartNotice.path)}</span></p>
+            </div>
+            <button onClick={handleRestart} disabled={restarting} className="px-4 py-2 rounded-xl text-sm font-bold text-white bg-orange-500 hover:bg-orange-600 transition-colors disabled:opacity-50 flex items-center justify-center gap-2 whitespace-nowrap">
+              {restarting ? <Loader2 className="w-4 h-4 animate-spin" /> : <RotateCw className="w-4 h-4" />} Restart now
+            </button>
+          </div>
+        )}
       </Card>
 
       {/* Admin Password */}
@@ -183,7 +223,7 @@ const PanelConfigsPage: React.FC = () => {
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div>
             <p className="text-xs text-slate-500 dark:text-slate-400 mb-3">Restart the entire panel. All active sessions will be terminated.</p>
-            <button onClick={handleRestart} className="px-4 py-2 rounded-xl text-sm font-bold text-white bg-red-500 hover:bg-red-600 transition-colors">Restart Panel</button>
+            <button onClick={handleRestart} disabled={restarting} className="px-4 py-2 rounded-xl text-sm font-bold text-white bg-red-500 hover:bg-red-600 transition-colors disabled:opacity-50">Restart Panel</button>
           </div>
         </div>
       </Card>

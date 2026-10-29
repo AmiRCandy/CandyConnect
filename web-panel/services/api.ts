@@ -140,6 +140,7 @@ export interface Client {
   time_limit: { mode: string; value: number; on_hold: boolean };
   time_used: number;
   created_at: string; expires_at: string;
+  created_ts?: number | null; expires_ts?: number | null;   // unix seconds
   protocols: ClientProtocols;
   protocol_data: Record<string, any>;
   last_connected_ip: string | null; last_connected_time: string | null;
@@ -202,9 +203,27 @@ export async function getLogs(limit: number = 100, source?: string): Promise<Log
   return res.data;
 }
 
+export type TunnelTransport = 'tcp' | 'tcpmux' | 'ws' | 'wsmux';
+export type TunnelStatus = 'pending' | 'installing' | 'installed' | 'failed';
+
 export interface Tunnel {
-  id: string; name: string; ip: string; port: number; status: string;
+  id: string; name: string; ip: string; port: number; status: TunnelStatus | string;
   username?: string; type?: string; created_at?: number;
+  transport?: TunnelTransport | string; tunnel_port?: number;
+  ports?: string[]; accept_udp?: boolean;
+  error?: string | null; has_password?: boolean; local_running?: boolean;
+}
+
+export interface AddTunnelRequest {
+  name: string; ip: string;
+  port: number;            // SSH port of the relay
+  username: string;
+  password?: string;       // if given, the server installs the relay over SSH
+  tunnel_type: 'backhaul';
+  transport: TunnelTransport;
+  tunnel_port: number;     // Backhaul port on the relay
+  ports?: string;          // "443, 8080" or "8443=443"; empty = all VPN TCP ports
+  accept_udp: boolean;
 }
 
 export async function getTunnels(): Promise<Tunnel[]> {
@@ -212,10 +231,17 @@ export async function getTunnels(): Promise<Tunnel[]> {
   return res.data || [];
 }
 
-export async function addTunnel(data: { ip: string; port: number; name: string; username: string; password?: string; tunnel_type: string }): Promise<{ install_command: string }> {
-  const res = await request<any>('POST', '/tunnels', data);
+export async function addTunnel(data: AddTunnelRequest): Promise<{ message: string; install_command: string; data?: Tunnel }> {
+  const res = await request<Tunnel>('POST', '/tunnels', data);
   if (!res.success) throw new Error(res.message);
-  return res as any;
+  const r = res as ApiResponse<Tunnel> & { install_command?: string };
+  return { message: r.message, install_command: r.install_command || '', data: r.data };
+}
+
+export async function reinstallTunnel(id: string): Promise<string> {
+  const res = await request<void>('POST', `/tunnels/${id}/reinstall`);
+  if (!res.success) throw new Error(res.message);
+  return res.message;
 }
 
 export async function deleteTunnel(id: string): Promise<void> {
@@ -290,12 +316,17 @@ export interface CoreConfigs {
     mtu: number;
   };
   slipstream: {
-    port: number; method: string; obfs: string; obfs_host: string;
-    fast_open: boolean; no_delay: boolean; udp_relay: boolean; timeout: number;
+    domain: string;               // NS-delegated tunnel domain, e.g. s.example.com
+    dns_listen_port: number;      // default 5301
+    congestion_control: 'bbr' | 'dcubic' | string;
   };
   trusttunnel: {
-    port: number; protocol: string; camouflage: string; fragment_size: number;
-    fragment_interval: number; sni: string; alpn: string; padding: boolean; timeout: number;
+    port: number;                 // default 9443
+    hostname: string;             // TLS SNI / certificate name
+    cert_path: string;            // cert_path + key_path empty = auto self-signed
+    key_path: string;
+    enable_http1: boolean; enable_http2: boolean; enable_quic: boolean;
+    ipv6_available: boolean; allow_private_network_connections: boolean;
   };
 }
 
@@ -327,10 +358,12 @@ export async function getPanel(): Promise<PanelData> {
   return res.data;
 }
 
-export async function updatePanel(data: { panel_port?: number; panel_path?: string }): Promise<string> {
+export interface UpdatePanelResult { message: string; restart_required: boolean }
+
+export async function updatePanel(data: { panel_port?: number; panel_path?: string }): Promise<UpdatePanelResult> {
   const res = await request<void>('PUT', '/panel', data);
   if (!res.success) throw new Error(res.message);
-  return res.message;
+  return { message: res.message, restart_required: !!(res as any).restart_required };
 }
 
 export async function changePassword(current_password: string, new_password: string, confirm_password: string): Promise<string> {
