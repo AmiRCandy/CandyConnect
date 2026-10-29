@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { getDashboard, type DashboardData } from '../services/api';
-import { formatUptime, formatTraffic } from '../utils/format';
+import { formatUptime, formatTraffic, normLevel, logTime } from '../utils/format';
 import ProgressBar from '../components/ProgressBar';
 import { Users, Link2, Cpu, Clock, Monitor, Zap, Shield, Lock, KeyRound, Radio, Globe, Wind, Castle, ArrowDownCircle, ArrowUpCircle, Activity, Server, Loader2, ExternalLink, ArrowDownUp } from 'lucide-react';
 
@@ -15,13 +15,15 @@ const coreIcons: Record<string, React.ReactNode> = {
   trusttunnel: <Castle className="w-4.5 h-4.5 text-indigo-500" strokeWidth={2} />,
 };
 
-const logLevelIcon = (level: string) => {
+const logLevelIcon = (raw: string) => {
+  const level = normLevel(raw);
   if (level === 'ERROR') return <div className="w-2 h-2 rounded-full bg-red-500 flex-shrink-0 mt-1.5" />;
   if (level === 'WARN') return <div className="w-2 h-2 rounded-full bg-amber-500 flex-shrink-0 mt-1.5" />;
   return <div className="w-2 h-2 rounded-full bg-green-500 flex-shrink-0 mt-1.5" />;
 };
 
-const logLevelColor = (level: string) => {
+const logLevelColor = (raw: string) => {
+  const level = normLevel(raw);
   if (level === 'ERROR') return 'text-red-500';
   if (level === 'WARN') return 'text-amber-500';
   return 'text-green-600 dark:text-green-400';
@@ -56,8 +58,9 @@ const DashboardPage: React.FC = () => {
 
   const s = data.server;
   const cpuPct = s.cpu.usage;
-  const ramPct = parseFloat(((s.ram.used / s.ram.total) * 100).toFixed(1));
-  const diskPct = parseFloat(((s.disk.used / s.disk.total) * 100).toFixed(1));
+  const pct = (used: number, total: number) => (total > 0 ? parseFloat(((used / total) * 100).toFixed(1)) : 0);
+  const ramPct = pct(s.ram.used, s.ram.total);
+  const diskPct = pct(s.disk.used, s.disk.total);
   const totalClients = data.stats.total_clients;
   const totalConnections = data.stats.active_connections;
   const runningCores = data.stats.running_cores;
@@ -111,7 +114,7 @@ const DashboardPage: React.FC = () => {
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-5">
           {[
-            { label: 'CPU', sub: `${s.cpu.model.split(' ').slice(0, 3).join(' ')} · ${s.cpu.cores} Cores`, pct: cpuPct, icon: <Cpu className="w-4 h-4" strokeWidth={2} /> },
+            { label: 'CPU', sub: `${(s.cpu.model || 'Unknown').split(' ').slice(0, 3).join(' ')} · ${s.cpu.cores} Cores`, pct: cpuPct, icon: <Cpu className="w-4 h-4" strokeWidth={2} /> },
             { label: 'Memory', sub: `${(s.ram.used / 1024).toFixed(1)} / ${(s.ram.total / 1024).toFixed(1)} GB`, pct: ramPct, icon: <Activity className="w-4 h-4" strokeWidth={2} /> },
             { label: 'Disk', sub: `${s.disk.used} / ${s.disk.total} GB`, pct: diskPct, icon: <Server className="w-4 h-4" strokeWidth={2} /> },
           ].map((r, i) => (
@@ -178,7 +181,7 @@ const DashboardPage: React.FC = () => {
                   <div className={`w-7 h-7 rounded-lg flex items-center justify-center ${core.status === 'running' ? 'bg-white dark:bg-slate-600' : 'bg-slate-200 dark:bg-slate-700'}`}>
                     {coreIcons[core.id]}
                   </div>
-                  <span className="font-bold text-sm text-slate-800 dark:text-slate-200">{core.name.split(' ')[0]}</span>
+                  <span className="font-bold text-sm text-slate-800 dark:text-slate-200">{(core.name || core.id).split(' ')[0]}</span>
                 </div>
                 <div className={`w-2.5 h-2.5 rounded-full ${core.status === 'running' ? 'bg-green-500 shadow-sm shadow-green-500/50' : 'bg-red-400'}`} />
               </div>
@@ -189,7 +192,7 @@ const DashboardPage: React.FC = () => {
                 </div>
                 <div className="bg-white dark:bg-slate-600/30 rounded-lg px-2.5 py-1.5">
                   <span className="text-slate-400 dark:text-slate-500 block text-[10px]">Port</span>
-                  <span className="font-semibold text-slate-700 dark:text-slate-300">{core.port}</span>
+                  <span className="font-semibold text-slate-700 dark:text-slate-300">{core.port || '-'}</span>
                 </div>
                 <div className="bg-white dark:bg-slate-600/30 rounded-lg px-2.5 py-1.5">
                   <span className="text-slate-400 dark:text-slate-500 block text-[10px]">Connections</span>
@@ -200,7 +203,7 @@ const DashboardPage: React.FC = () => {
                   <span className="font-semibold text-slate-700 dark:text-slate-300">{formatTraffic(core.total_traffic?.out || 0)}</span>
                 </div>
               </div>
-              <p className="text-[10px] text-slate-400 dark:text-slate-500 mt-2 font-mono">v{core.version}</p>
+              <p className="text-[10px] text-slate-400 dark:text-slate-500 mt-2 font-mono">{core.version ? `v${String(core.version).replace(/^v/i, '')}` : 'version unknown'}</p>
             </div>
           ))}
         </div>
@@ -237,8 +240,8 @@ const DashboardPage: React.FC = () => {
           {data.logs.map((log, i) => (
             <div key={i} className="flex items-start gap-3 py-2 border-b border-slate-100 dark:border-slate-700/50 last:border-b-0 text-xs hover:bg-slate-50 dark:hover:bg-slate-700/20 rounded px-1 transition-colors">
               {logLevelIcon(log.level)}
-              <span className="text-slate-400 dark:text-slate-500 whitespace-nowrap font-mono w-16 flex-shrink-0">{log.time.split(' ')[1]}</span>
-              <span className={`font-bold uppercase w-11 flex-shrink-0 ${logLevelColor(log.level)}`}>{log.level}</span>
+              <span className="text-slate-400 dark:text-slate-500 whitespace-nowrap font-mono w-16 flex-shrink-0">{logTime(log.time)}</span>
+              <span className={`font-bold uppercase w-11 flex-shrink-0 ${logLevelColor(log.level)}`}>{normLevel(log.level)}</span>
               <span className="text-orange-500 dark:text-orange-400 font-semibold flex-shrink-0">{log.source}</span>
               <span className="text-slate-600 dark:text-slate-400 flex-1 min-w-0">{log.message}</span>
             </div>

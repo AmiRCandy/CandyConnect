@@ -44,8 +44,8 @@ CandyConnect is an all-in-one VPN server management system that supports multipl
 | **IKEv2/IPSec** | strongSwan | ✅ Full |
 | **L2TP/IPSec** | xl2tpd + strongSwan | ✅ Full |
 | **DNSTT** | DNS-over-UDP tunnel | ✅ Full |
-| **SlipStream** | — | 🔜 Planned |
-| **TrustTunnel** | — | 🔜 Planned |
+| **SlipStream** | DNS tunnel over QUIC ([slipstream](https://github.com/EndPositive/slipstream)) | ✅ Server (Ubuntu 22.04+) · Linux client |
+| **TrustTunnel** | HTTP/2 & QUIC VPN ([TrustTunnel](https://github.com/TrustTunnel/TrustTunnel)) | ✅ Full (`tt://` links) |
 
 ### Architecture
 
@@ -132,11 +132,14 @@ The admin web panel provides full server management:
 - **Dashboard** — Server resources, VPN core status, active connections per protocol, real traffic stats, live logs
 - **Clients** — Create, edit, delete VPN users with per-protocol access control, traffic limits, time limits, and connection history
 - **Core Configs** — Configure each VPN protocol (ports, ciphers, keys, interfaces, DNS, etc.)
-- **Panel Configs** — Change panel port/path, admin password, view server info
+- **Panel Configs** — Change panel port/path (saved to `/opt/candyconnect/.env`, applied on panel restart), admin password, view server info
+- **Tunnels** — Relay servers via [Backhaul](https://github.com/Musixal/Backhaul): give the relay's SSH login and CandyConnect installs the relay, runs the tunnel client here, and adds "via relay" V2Ray configs for users
 
 ### Access
 
-Open `http://<SERVER_IP>:8443/candyconnect` in your browser.
+Open `http://<SERVER_IP>:8443/candyconnect` in your browser (or the port/path you configured).
+
+> **Docker:** the panel port is the one published by `docker-compose.yml` (`CC_PANEL_PORT` in the project's `.env`); changing it from the panel has no effect inside the container.
 
 Default credentials:
 - **Username:** `admin`
@@ -157,7 +160,11 @@ The CandyConnect desktop client (built with Tauri + React) connects to the serve
 | OpenVPN | ✅ Native | — |
 | IKEv2 | ✅ Native | — |
 | L2TP | ✅ Native | — |
-| DNSTT | ✅ via tunnel | — |
+| DNSTT | ✅ via tunnel | ✅ SOCKS (built-in SSH) |
+| SlipStream | ✅ via tunnel (Linux) | ✅ SOCKS (Linux) |
+| TrustTunnel | ✅ via TrustTunnel client | — (or import the `tt://` link in the TrustTunnel app) |
+
+**Proxy mode** sets the system proxy (Windows / macOS / GNOME & KDE) while connected and restores it on disconnect.
 
 ### How It Works
 
@@ -356,6 +363,40 @@ NS    dns.example.com   →   srv.example.com
 4. Save and start the DNSTT core
 
 > **Note:** Propagation of DNS records can take up to 24–48 hours depending on your registrar's TTL settings. Test with `dig NS dns.yourdomain.com` to confirm.
+
+---
+
+## 💨 SlipStream Setup (DNS tunnel over QUIC)
+
+SlipStream works like DNSTT (same SSH accounts) but uses QUIC, which is usually much faster.
+Use a **different subdomain** than DNSTT: both share UDP port 53 and the server routes
+queries to the right daemon by domain name.
+
+```
+A     srv.example.com   →   1.2.3.4
+NS    s.example.com     →   srv.example.com
+```
+
+1. Go to **Core Configs → SlipStream**, set **Domain** to `s.example.com` and save
+2. Start the SlipStream core (the server downloads `slipstream-server` automatically; needs Ubuntu 22.04+ / Debian 12+)
+
+## 🏰 TrustTunnel Setup
+
+1. Go to **Core Configs → TrustTunnel**, set the port (default `9443`) and the TLS hostname.
+   Leave the certificate paths empty to use an automatic self-signed certificate (it is embedded in the client links).
+2. Start the TrustTunnel core. Each user enabled for TrustTunnel gets a `tt://` link in the desktop client,
+   which also works in the official TrustTunnel apps (Android / iOS / macOS).
+
+## 🔀 Relay Tunnels (Backhaul)
+
+If users can reach a relay server (e.g. a domestic server) but not this server directly:
+
+1. Go to **Tunnels → Add**, enter the relay's IP and SSH login (root or a sudo user).
+2. CandyConnect installs the Backhaul server on the relay over SSH, starts the Backhaul client here
+   and forwards the VPN TCP ports (all V2Ray inbounds by default).
+3. Users automatically get extra V2Ray configs named "... (via &lt;relay&gt;)" that connect to the relay IP.
+
+Without a password the panel shows an install script to run on the relay as root.
 
 ---
 

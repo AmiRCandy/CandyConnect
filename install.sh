@@ -18,6 +18,8 @@ CC_PANEL_DIR="$CC_DIR/web-panel"
 CC_SERVICE="candyconnect"
 CC_USER="candyconnect"
 CC_PORT="${CC_PORT:-8443}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export DEBIAN_FRONTEND=noninteractive
 
 log()  { echo -e "${GREEN}[✓]${NC} $1"; }
 warn() { echo -e "${YELLOW}[!]${NC} $1"; }
@@ -66,17 +68,17 @@ install_nodejs() {
         info "Installing Node.js 20 from NodeSource..."
         curl -fsSL https://deb.nodesource.com/setup_20.x | bash - || {
             warn "NodeSource setup failed, trying alternative method..."
-            apt install -y nodejs npm
+            apt-get install -y nodejs npm
         }
-        apt install -y nodejs
+        apt-get install -y nodejs
         log "Node.js $(node -v) installed"
     fi
 }
 
 install_dependencies() {
     info "Installing system dependencies..."
-    apt update -y
-    apt install -y \
+    apt-get update -y
+    apt-get install -y \
         python3 python3-pip python3-venv \
         redis-server \
         curl wget unzip git rsync \
@@ -96,6 +98,8 @@ install_dependencies() {
     if ! command -v xray &>/dev/null; then
         bash -c 'curl -sL https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh | bash -s -- install' || warn "Xray installation failed"
     fi
+    # CandyConnect runs Xray itself; the stock xray.service would be a second, unused instance
+    systemctl disable --now xray >/dev/null 2>&1 || true
 
     # Install DNSTT-server (Robust install with checksum verification)
     info "Installing DNSTT..."
@@ -106,30 +110,40 @@ install_dependencies() {
         DFILE="dnstt-server-linux-${DARCH}"
         
         info "Downloading DNSTT from ${DURL}/${DFILE}..."
-        curl -L -o "/tmp/${DFILE}" "${DURL}/${DFILE}"
-        curl -L -s -o "/tmp/SHA256SUMS" "${DURL}/SHA256SUMS"
-        
-        cd /tmp
-        if sha256sum -c <(grep "${DFILE}" SHA256SUMS) 2>/dev/null; then
-            mv "/tmp/${DFILE}" "/usr/local/bin/dnstt-server"
-            chmod +x "/usr/local/bin/dnstt-server"
-            info "DNSTT verified and installed"
+        TMPD=$(mktemp -d)
+        if curl -fsSL -o "${TMPD}/${DFILE}" "${DURL}/${DFILE}"; then
+            if curl -fsSL -o "${TMPD}/SHA256SUMS" "${DURL}/SHA256SUMS" && \
+               (cd "$TMPD" && grep " ${DFILE}\$" SHA256SUMS | sha256sum -c - >/dev/null 2>&1); then
+                info "DNSTT checksum verified"
+            else
+                warn "DNSTT checksum could not be verified, installing anyway"
+            fi
+            install -m 755 "${TMPD}/${DFILE}" /usr/local/bin/dnstt-server
+            log "DNSTT installed"
         else
-            warn "DNSTT checksum verification failed! Attempting insecure install..."
-            wget -qO /usr/local/bin/dnstt-server "${DURL}/${DFILE}" || warn "DNSTT download failed"
-            chmod +x /usr/local/bin/dnstt-server
+            warn "DNSTT download failed (DNSTT protocol will be unavailable)"
         fi
-        cd - >/dev/null
+        rm -rf "$TMPD"
     fi
 
     # Enable and start Redis
     systemctl enable redis-server || true
     systemctl start redis-server || true
 
-    # Wipe database to ensure fresh config (per user request)
-    if command -v redis-cli &>/dev/null; then
-        log "Wiping existing Redis database..."
-        redis-cli FLUSHALL >/dev/null 2>&1 || true
+    # Optionally wipe the database for a fresh config (keeps clients by default on re-install)
+    if command -v redis-cli &>/dev/null && [ "$(redis-cli DBSIZE 2>/dev/null)" != "0" ] && [ -n "$(redis-cli DBSIZE 2>/dev/null)" ]; then
+        if [ "${CC_WIPE_DB:-}" = "1" ]; then
+            WIPE="y"
+        else
+            echo -ne "${BOLD}${YELLOW}Existing CandyConnect data found. Wipe it (all clients/configs)? [y/N]: ${NC}"
+            read WIPE
+        fi
+        if [[ "$WIPE" == "y" || "$WIPE" == "Y" ]]; then
+            log "Wiping existing Redis database..."
+            redis-cli FLUSHALL >/dev/null 2>&1 || true
+        else
+            info "Keeping existing data"
+        fi
     fi
 
     log "Dependencies installed"
@@ -145,28 +159,23 @@ install_server() {
     info "Installing CandyConnect server..."
 
     # Copy server files
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
     if [ ! -d "$SCRIPT_DIR/server" ]; then
         err "Server source directory not found at $SCRIPT_DIR/server"
     fi
 
-    cp -r "$SCRIPT_DIR/server/"* "$CC_SERVER_DIR/"
+    rsync -a --exclude='venv' --exclude='__pycache__' "$SCRIPT_DIR/server/" "$CC_SERVER_DIR/" 2>/dev/null || \
+        cp -r "$SCRIPT_DIR/server/"* "$CC_SERVER_DIR/"
 
     # Create Python virtual environment
-    python3 -m venv "$CC_SERVER_DIR/venv"
-    source "$CC_SERVER_DIR/venv/bin/activate"
-    pip install --upgrade pip
-    pip install -r "$CC_SERVER_DIR/requirements.txt"
-    deactivate
+    python3 -m venv "$CC_SERVER_DIR/venv" || err "Failed to create Python venv (is python3-venv installed?)"
+    "$CC_SERVER_DIR/venv/bin/pip" install --upgrade pip
+    "$CC_SERVER_DIR/venv/bin/pip" install -r "$CC_SERVER_DIR/requirements.txt" || err "Failed to install Python dependencies"
 
     log "Server installed"
 }
 
 install_panel() {
     info "Building web panel..."
-
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
     if [ ! -d "$SCRIPT_DIR/web-panel" ]; then
         err "Web panel source directory not found at $SCRIPT_DIR/web-panel"
@@ -180,14 +189,15 @@ install_panel() {
         cp -r "$SCRIPT_DIR/web-panel/"* "$CC_PANEL_DIR/"
 
     # Install npm dependencies and build
-    cd "$CC_PANEL_DIR"
-    npm install --legacy-peer-deps
+    cd "$CC_PANEL_DIR" || err "Cannot enter $CC_PANEL_DIR"
+    npm install --legacy-peer-deps || err "npm install failed"
     npm run build || err "Web panel build failed. Check TypeScript errors above."
 
     if [ ! -d "$CC_PANEL_DIR/dist" ]; then
         err "Web panel build failed - dist directory not created"
     fi
 
+    cd "$SCRIPT_DIR"
     log "Web panel built"
 }
 
@@ -198,7 +208,9 @@ ask_domain() {
     echo -e "Please enter your domain name (e.g., vpn.yourdomain.com)."
     echo -e "This is CRITICAL for DNSTT and client configuration links."
     echo -ne "${BOLD}${YELLOW}Domain [vpn.candyconnect.io]: ${NC}"
-    read CC_DOMAIN
+    if [ -z "${CC_DOMAIN:-}" ]; then
+        read CC_DOMAIN
+    fi
     if [ -z "$CC_DOMAIN" ]; then
         CC_DOMAIN="vpn.candyconnect.io"
     fi
@@ -216,12 +228,22 @@ generate_secrets() {
         cp "$CC_DIR/.env" "$CC_DIR/.env.bak"
     fi
 
+    # Keep settings changed from the panel (port/path) and the JWT secret on re-install
+    if [ -f "$CC_DIR/.env.bak" ]; then
+        OLD_PORT=$(grep -E '^CC_PANEL_PORT=' "$CC_DIR/.env.bak" | cut -d= -f2)
+        OLD_PATH=$(grep -E '^CC_PANEL_PATH=' "$CC_DIR/.env.bak" | cut -d= -f2)
+        OLD_JWT=$(grep -E '^CC_JWT_SECRET=' "$CC_DIR/.env.bak" | cut -d= -f2-)
+        [ -n "$OLD_PORT" ] && CC_PORT="$OLD_PORT"
+        [ -n "$OLD_JWT" ] && JWT_SECRET="$OLD_JWT"
+    fi
+    CC_PATH="${OLD_PATH:-/candyconnect}"
+
     cat > "$CC_DIR/.env" << EOF
 CC_DATA_DIR=$CC_DIR
 CC_REDIS_URL=redis://127.0.0.1:6379/0
 CC_JWT_SECRET=$JWT_SECRET
 CC_PANEL_PORT=$CC_PORT
-CC_PANEL_PATH=/candyconnect
+CC_PANEL_PATH=$CC_PATH
 CC_DOMAIN=$CC_DOMAIN
 CC_ADMIN_USER=admin
 CC_ADMIN_PASS=admin123
@@ -255,9 +277,10 @@ Group=root
 WorkingDirectory=CC_SERVER_DIR_PLACEHOLDER
 EnvironmentFile=CC_DIR_PLACEHOLDER/.env
 ExecStartPre=/bin/bash -c 'redis-cli ping > /dev/null 2>&1 || sleep 5'
-ExecStart=CC_SERVER_DIR_PLACEHOLDER/venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port CC_PANEL_PORT_PLACEHOLDER --log-level info
-Restart=on-failure
-RestartSec=10
+ExecStart=CC_SERVER_DIR_PLACEHOLDER/venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port ${CC_PANEL_PORT} --log-level info
+# "always": the panel's Restart button exits cleanly and relies on systemd to start it again
+Restart=always
+RestartSec=3
 StandardOutput=append:CC_DIR_PLACEHOLDER/logs/server.log
 StandardError=append:CC_DIR_PLACEHOLDER/logs/server.log
 
@@ -272,7 +295,6 @@ SERVICEEOF
     # Replace placeholders with actual paths
     sed -i "s|CC_SERVER_DIR_PLACEHOLDER|$CC_SERVER_DIR|g" /etc/systemd/system/${CC_SERVICE}.service
     sed -i "s|CC_DIR_PLACEHOLDER|$CC_DIR|g" /etc/systemd/system/${CC_SERVICE}.service
-    sed -i "s|CC_PANEL_PORT_PLACEHOLDER|$CC_PORT|g" /etc/systemd/system/${CC_SERVICE}.service
 
     systemctl daemon-reload
     systemctl enable "$CC_SERVICE"
@@ -290,13 +312,19 @@ SERVICEEOF
 setup_firewall() {
     info "Configuring firewall rules..."
 
-    # Allow common VPN ports
-    for port in $CC_PORT 443 51820 1194 500 4500 1701 53 8388 9443; do
+    # Allow panel + VPN ports (8080 = VMess-WS, 5300/5301 = DNSTT/SlipStream listen ports, 9443 = TrustTunnel)
+    for port in $CC_PORT 443 8080 51820 1194 500 4500 1701 53 5300 5301 9443; do
         iptables -C INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null || \
-            iptables -A INPUT -p tcp --dport $port -j ACCEPT
+            iptables -I INPUT -p tcp --dport $port -j ACCEPT
         iptables -C INPUT -p udp --dport $port -j ACCEPT 2>/dev/null || \
-            iptables -A INPUT -p udp --dport $port -j ACCEPT
+            iptables -I INPUT -p udp --dport $port -j ACCEPT
+        # UFW (enabled by default on some images) keeps its own persistent rules
+        if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+            ufw allow "$port" >/dev/null 2>&1 || true
+        fi
     done
+    # IPsec ESP traffic (IKEv2 / L2TP without NAT-T)
+    iptables -C INPUT -p esp -j ACCEPT 2>/dev/null || iptables -I INPUT -p esp -j ACCEPT
 
     # Enable IP forwarding
     sysctl -w net.ipv4.ip_forward=1
@@ -320,7 +348,7 @@ print_summary() {
     echo -e "${BOLD}${GREEN}  🍬 CandyConnect Installed Successfully!${NC}"
     echo -e "${BOLD}${GREEN}═══════════════════════════════════════════${NC}"
     echo ""
-    echo -e "  ${BOLD}Panel URL:${NC}    http://${SERVER_IP}:${CC_PORT}/candyconnect"
+    echo -e "  ${BOLD}Panel URL:${NC}    http://${SERVER_IP}:${CC_PORT}${CC_PATH:-/candyconnect}"
     echo -e "  ${BOLD}API URL:${NC}      http://${SERVER_IP}:${CC_PORT}/api"
     echo -e "  ${BOLD}Client API:${NC}   http://${SERVER_IP}:${CC_PORT}/client-api"
     echo -e "  ${BOLD}Admin User:${NC}   admin"
@@ -344,11 +372,11 @@ main() {
     banner
     check_root
     check_os
+    ask_domain
     install_dependencies
     setup_directories
     install_server
     install_panel
-    ask_domain
     generate_secrets
     setup_firewall
     create_systemd_service

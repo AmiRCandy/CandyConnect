@@ -1,10 +1,11 @@
 """
 CandyConnect - L2TP/IPSec Protocol Manager
 """
-import os, time
+import os, time, ipaddress
 from protocols.base import BaseProtocol
 from database import get_core_config, get_core_status, set_core_status, add_log
 from system_info import get_public_ip
+from protocols.ikev2 import IPSEC_CONF_HEADER, _set_secret_line, _escape_secret
 
 
 class L2TPProtocol(BaseProtocol):
@@ -35,9 +36,10 @@ class L2TPProtocol(BaseProtocol):
                 await add_log("ERROR", self.PROTOCOL_NAME, "No L2TP config found")
                 return False
             await self._write_config(config)
+            await self._ensure_ipsec()
             
             # Try systemctl
-            rc, _, err = await self._run_cmd("sudo systemctl enable xl2tpd && sudo systemctl start xl2tpd", check=False)
+            rc, _, err = await self._run_cmd("sudo systemctl enable xl2tpd && sudo systemctl restart xl2tpd", check=False)
             
             if rc != 0:
                 # Fallback: direct start
@@ -64,8 +66,8 @@ class L2TPProtocol(BaseProtocol):
         try:
             await self._run_cmd("sudo systemctl stop xl2tpd", check=False)
             await self._run_cmd("sudo pkill xl2tpd", check=False)
-            await self._run_cmd("sudo systemctl stop ipsec", check=False)
-            await self._run_cmd("sudo ipsec stop", check=False)
+            # strongSwan is shared with IKEv2, so only drop the L2TP connection
+            await self._run_cmd("sudo ipsec down L2TP-PSK", check=False)
             
             status = await get_core_status(self.PROTOCOL_ID)
             await set_core_status(self.PROTOCOL_ID, {
@@ -136,16 +138,13 @@ class L2TPProtocol(BaseProtocol):
         return {"in": total_rx, "out": total_tx}
 
     async def add_client(self, username: str, client_data: dict) -> dict:
-        password = client_data.get("password", username)
-        await self._run_cmd(
-            f"grep -q '{username}' /etc/ppp/chap-secrets 2>/dev/null || "
-            f"echo '{username} * {password} *' | sudo tee -a /etc/ppp/chap-secrets",
-            check=False,
-        )
+        password = str(client_data.get("password", username)).replace('"', '')
+        # Replace any existing line so password changes take effect
+        _set_chap_secret(username, f'"{username}" * "{password}" *')
         return {"username": username}
 
     async def remove_client(self, username: str, protocol_data: dict):
-        await self._run_cmd(f"sudo sed -i '/^{username} /d' /etc/ppp/chap-secrets", check=False)
+        _set_chap_secret(username, None)
 
     async def get_client_config(self, username: str, server_ip: str, protocol_data: dict, config_id: str = None) -> dict:
         config = await get_core_config("l2tp")
@@ -160,12 +159,7 @@ class L2TPProtocol(BaseProtocol):
         }
 
     async def _write_config(self, config: dict):
-        _, default_iface, _ = await self._run_cmd(
-            "ip route show default | awk '{print $5}' | head -1", check=False,
-        )
-        default_iface = default_iface.strip() or "eth0"
-
-        server_ip = await get_public_ip()
+        default_iface = await self._default_iface()
 
         local_ip = config.get("local_ip", "10.20.0.1")
         remote_range = config.get("remote_range", "10.20.0.10-10.20.0.250")
@@ -183,7 +177,7 @@ require chap = yes
 refuse pap = yes
 require authentication = yes
 name = CandyConnectVPN
-ppp debug = yes
+ppp debug = no
 pppoptfile = /etc/ppp/options.xl2tpd
 length bit = yes
 """
@@ -197,6 +191,9 @@ ipcp-accept-remote
 ms-dns {config.get('dns', '1.1.1.1')}
 noccp
 auth
+require-mschap-v2
+lcp-echo-failure 4
+lcp-echo-interval 30
 mtu {config.get('mtu', 1400)}
 mru {config.get('mru', 1400)}
 nodefaultroute
@@ -224,7 +221,8 @@ connect-delay 5000
     rightprotoport=17/%any
     rekey=no
     forceencaps=yes
-    ikeport={ipsec_port}
+    ike=aes256-sha1-modp1024,aes128-sha1-modp1024,aes256-sha256-modp2048,3des-sha1-modp1024!
+    esp=aes256-sha1,aes128-sha1,aes256-sha256,3des-sha1!
 """
         with open("/tmp/cc_l2tp_ipsec.conf", "w") as f:
             f.write(ipsec_conf)
@@ -235,19 +233,60 @@ connect-delay 5000
         )
 
         # PSK secret - update if changed
+        if not os.path.exists("/etc/ipsec.secrets"):
+            open("/etc/ipsec.secrets", "w").close()
+        _set_secret_line("%any %any : PSK ", f'%any %any : PSK "{_escape_secret(psk)}"')
+
+        # NAT + forwarding for the PPP clients
+        try:
+            subnet = str(ipaddress.ip_network(f"{local_ip}/24", strict=False))
+        except ValueError:
+            subnet = "10.20.0.0/24"
         await self._run_cmd(
-            f"sudo sed -i '/%any %any : PSK/d' /etc/ipsec.secrets 2>/dev/null || true",
-            check=False,
-        )
-        await self._run_cmd(
-            f"echo '%any %any : PSK \"{psk}\"' | sudo tee -a /etc/ipsec.secrets",
+            f"sudo iptables -t nat -C POSTROUTING -s {subnet} -o {default_iface} -j MASQUERADE 2>/dev/null || "
+            f"sudo iptables -t nat -A POSTROUTING -s {subnet} -o {default_iface} -j MASQUERADE; "
+            f"sudo iptables -C FORWARD -i ppp+ -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD -i ppp+ -j ACCEPT; "
+            f"sudo iptables -C FORWARD -o ppp+ -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD -o ppp+ -j ACCEPT",
             check=False,
         )
 
-        # NAT
-        subnet_base = local_ip.rsplit(".", 1)[0]
-        await self._run_cmd(
-            f"sudo iptables -t nat -C POSTROUTING -s {subnet_base}.0/24 -o {default_iface} -j MASQUERADE 2>/dev/null || "
-            f"sudo iptables -t nat -A POSTROUTING -s {subnet_base}.0/24 -o {default_iface} -j MASQUERADE",
-            check=False,
-        )
+    async def _ensure_ipsec(self):
+        """Make strongSwan load /etc/ipsec.d/l2tp.conf and (re)start or reload it."""
+        try:
+            with open("/etc/ipsec.conf") as f:
+                conf = f.read()
+        except OSError:
+            conf = IPSEC_CONF_HEADER
+        if "include /etc/ipsec.d/*.conf" not in conf:
+            conf = conf.rstrip("\n") + "\n\ninclude /etc/ipsec.d/*.conf\n"
+            with open("/etc/ipsec.conf", "w") as f:
+                f.write(conf)
+
+        if await self._is_service_active("strongswan-starter") or await self._is_service_active("ipsec"):
+            await self._run_cmd("sudo ipsec reload && sudo ipsec rereadsecrets", check=False)
+            return
+        await self._run_cmd("sudo systemctl enable strongswan-starter", check=False)
+        rc, _, _ = await self._run_cmd("sudo systemctl start strongswan-starter", check=False)
+        if rc != 0:
+            rc2, _, _ = await self._run_cmd("pgrep charon", check=False)
+            if rc2 == 0:
+                await self._run_cmd("sudo ipsec reload && sudo ipsec rereadsecrets", check=False)
+            else:
+                await self._run_cmd("sudo ipsec start", check=False)
+
+
+def _set_chap_secret(username: str, line, path: str = "/etc/ppp/chap-secrets"):
+    """Replace (or remove when line is None) a user's entry in chap-secrets."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = []
+    lines = [l for l in lines
+             if not (l.split()[:1] and l.split()[0].strip('"') == username)]
+    if line is not None:
+        lines.append(line)
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(path, 0o600)

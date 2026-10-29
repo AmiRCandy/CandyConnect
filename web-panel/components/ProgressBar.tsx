@@ -3,7 +3,7 @@ import React from 'react';
 interface ProgressBarProps { percent: number; height?: string; showLabel?: boolean; }
 
 const ProgressBar: React.FC<ProgressBarProps> = ({ percent, height = 'h-2.5', showLabel = true }) => {
-  const capped = Math.min(100, Math.max(0, percent));
+  const capped = Number.isFinite(percent) ? Math.min(100, Math.max(0, percent)) : 0;
   const color = capped > 90 ? 'bg-red-500' : capped > 70 ? 'bg-amber-500' : 'bg-green-500';
   return (
     <div className="w-full">

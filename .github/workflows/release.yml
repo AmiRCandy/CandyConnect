@@ -211,6 +211,43 @@ jobs:
             cp dnstt-client extra-tools/
           fi
 
+          # ── slipstream-client (official builds exist for Linux only) ─────────────
+          if [ "$PLATFORM" == "ubuntu-22.04" ]; then
+            SLIP_URL="https://github.com/EndPositive/slipstream/releases/download/v0.1.1/slipstream-client-v0.1.1-linux-x86_64"
+            if curl -fSL --retry 3 --retry-delay 5 "$SLIP_URL" -o extra-tools/slipstream-client; then
+              chmod +x extra-tools/slipstream-client
+              echo "slipstream-client downloaded OK"
+            else
+              echo "WARNING: Failed to download slipstream-client from $SLIP_URL"
+              rm -f extra-tools/slipstream-client
+            fi
+          fi
+
+          # ── TrustTunnel CLI client (+ setup_wizard) ───────────────────────────────
+          TT_VERSION="v1.1.11"
+          if [ "$PLATFORM" == "windows-latest" ]; then
+            TT_ASSET="trusttunnel_client-${TT_VERSION}-windows-x86_64.zip"
+          elif [ "$PLATFORM" == "ubuntu-22.04" ]; then
+            TT_ASSET="trusttunnel_client-${TT_VERSION}-linux-x86_64.tar.gz"
+          else
+            TT_ASSET="trusttunnel_client-${TT_VERSION}-macos-universal.tar.gz"
+          fi
+          TT_URL="https://github.com/TrustTunnel/TrustTunnelClient/releases/download/${TT_VERSION}/${TT_ASSET}"
+          if curl -fSL --retry 3 --retry-delay 5 "$TT_URL" -o "$TT_ASSET"; then
+            mkdir -p extra-tools/trusttunnel
+            # Keep the archive's whole layout; the app searches for the binaries recursively
+            if [[ "$TT_ASSET" == *.zip ]]; then
+              unzip -q -o "$TT_ASSET" -d extra-tools/trusttunnel
+            else
+              tar -xzf "$TT_ASSET" -C extra-tools/trusttunnel
+              find extra-tools/trusttunnel -type f \( -name 'trusttunnel_client' -o -name 'setup_wizard' \) -exec chmod +x {} +
+            fi
+            rm -f "$TT_ASSET"
+            echo "TrustTunnel client downloaded OK"
+          else
+            echo "WARNING: Failed to download the TrustTunnel client from $TT_URL"
+          fi
+
           # ── Cleanup & summary ──────────────────────────────────────────────────────
           rm -f xray.zip "sing-box.${SING_EXT}"
           echo "✅ extra-tools contents:"

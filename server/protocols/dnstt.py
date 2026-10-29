@@ -34,7 +34,7 @@ class DNSTTProtocol(BaseProtocol):
 
             # Create dnstt user if not exists (as in dnstt-deploy.sh)
             await self._run_cmd(
-                "id dnstt &>/dev/null || sudo useradd -r -s /bin/false -d /nonexistent -c 'dnstt service user' dnstt",
+                "id dnstt >/dev/null 2>&1 || sudo useradd -r -s /bin/false -d /nonexistent -c 'dnstt service user' dnstt",
                 check=False
             )
             await self._run_cmd(f"sudo chown dnstt:dnstt {self.DNSTT_DIR}", check=False)
@@ -113,11 +113,9 @@ class DNSTTProtocol(BaseProtocol):
                 # Ensure ssh is running
                 await self._run_cmd("sudo systemctl start ssh", check=False)
 
-            # Clean up old iptables rules to avoid duplicates
-            await self._run_cmd("sudo iptables -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT 2>/dev/null || true", check=False)
-            
-            # Redirect port 53 to listen_port
-            await self._setup_redirection(listen_port)
+            # Redirect port 53 queries for our domain to listen_port (idempotent)
+            await self._setup_redirection(listen_port, remove=True)  # old catch-all rule
+            await self._dns_redirect(domain, listen_port)
 
             # Start dnstt-server
             pid = await self._start_process(
@@ -142,29 +140,38 @@ class DNSTTProtocol(BaseProtocol):
         await self._run_cmd("sudo pkill -9 dnstt-server", check=False)
         
         # 3. Clean up iptables for redirection
-        await self._run_cmd("sudo iptables -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT 2>/dev/null || true", check=False)
+        config = await get_core_config("dnstt") or {}
+        await self._setup_redirection(int(config.get("listen_port", 5300)), remove=True)
+        await self._dns_redirect(config.get("domain", ""), int(config.get("listen_port", 5300)), remove=True)
         
         return True
 
-    async def _setup_redirection(self, port: int):
-        """Redirect port 53/udp to the custom listen port using iptables."""
-        # Get default interface
-        _, iface, _ = await self._run_cmd("ip route | grep default | awk '{print $5}' | head -1", check=False)
-        iface = iface.strip() or "eth0"
-        
-        # Add rules
-        await self._run_cmd(f"sudo iptables -I INPUT -p udp --dport {port} -j ACCEPT", check=False)
-        await self._run_cmd(
-            f"sudo iptables -t nat -I PREROUTING -i {iface} -p udp --dport 53 -j REDIRECT --to-ports {port}",
-            check=False,
-        )
-        # IPv6 support if available
+    async def _setup_redirection(self, port: int, remove: bool = False):
+        """Redirect port 53/udp to the custom listen port using iptables.
+
+        Each rule is checked with -C before inserting so restarts don't stack
+        duplicates; remove=True deletes exactly the same rules.
+        """
+        iface = await self._default_iface()
+        rules = [
+            ("iptables", f"INPUT -p udp --dport {port} -j ACCEPT"),
+            ("iptables", f"-t nat PREROUTING -i {iface} -p udp --dport 53 -j REDIRECT --to-ports {port}"),
+        ]
         if os.path.exists("/proc/net/if_inet6"):
-            await self._run_cmd(f"sudo ip6tables -I INPUT -p udp --dport {port} -j ACCEPT", check=False)
-            await self._run_cmd(
-                f"sudo ip6tables -t nat -I PREROUTING -i {iface} -p udp --dport 53 -j REDIRECT --to-ports {port}",
-                check=False,
-            )
+            rules += [
+                ("ip6tables", f"INPUT -p udp --dport {port} -j ACCEPT"),
+                ("ip6tables", f"-t nat PREROUTING -i {iface} -p udp --dport 53 -j REDIRECT --to-ports {port}"),
+            ]
+        for tool, rule in rules:
+            table = ""
+            if rule.startswith("-t nat "):
+                table, rule = "-t nat ", rule[len("-t nat "):]
+            if remove:
+                await self._run_cmd(
+                    f"while sudo {tool} {table}-D {rule} 2>/dev/null; do :; done", check=False)
+            else:
+                await self._run_cmd(
+                    f"sudo {tool} {table}-C {rule} 2>/dev/null || sudo {tool} {table}-I {rule}", check=False)
 
     async def _setup_dante(self):
         """Configure dante-server for DNSTT SOCKS mode."""
@@ -204,24 +211,65 @@ class DNSTTProtocol(BaseProtocol):
 
     async def add_client(self, username: str, client_data: dict) -> dict:
         ssh_user = f"dnstt_{username}"
-        password = client_data.get("password", self._gen_password())
+        password = client_data.get("ssh_password") or client_data.get("password") or self._gen_password()
 
         # Create system user (non-root, no shell login except through tunnel)
         await self._run_cmd(
-            f"sudo useradd -m -s /bin/false {ssh_user} 2>/dev/null || true",
+            f"id {ssh_user} >/dev/null 2>&1 || sudo useradd -m -s /bin/false {ssh_user}",
             check=False,
         )
-        # Set password
-        proc = await asyncio.create_subprocess_shell(
-            f"echo '{ssh_user}:{password}' | sudo chpasswd",
+        # Set password (via stdin, so quotes/special chars in the password are safe)
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "chpasswd",
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        await proc.communicate()
+        await proc.communicate(f"{ssh_user}:{password}\n".encode())
+        await self._ensure_sshd_config()
 
         return {"ssh_username": ssh_user, "ssh_password": password}
 
+    async def _ensure_sshd_config(self):
+        """Allow password login + TCP forwarding (only) for dnstt_* users.
+
+        Many VPS images disable PasswordAuthentication globally, which would make
+        every DNSTT login fail.
+        """
+        conf_dir = "/etc/ssh/sshd_config.d"
+        conf_path = os.path.join(conf_dir, "candyconnect-dnstt.conf")
+        content = (
+            "# Managed by CandyConnect: DNSTT tunnel users\n"
+            "Match User dnstt_*\n"
+            "    PasswordAuthentication yes\n"
+            "    KbdInteractiveAuthentication yes\n"
+            "    AllowTcpForwarding yes\n"
+            "    X11Forwarding no\n"
+            "    PermitTTY no\n"
+            "Match all\n"
+        )
+        if not os.path.isdir(conf_dir):
+            return
+        try:
+            with open(conf_path) as f:
+                if f.read() == content:
+                    return
+        except OSError:
+            pass
+        with open(conf_path, "w") as f:
+            f.write(content)
+        # Only reload if the resulting config is valid
+        rc, _, _ = await self._run_cmd("sudo sshd -t", check=False)
+        if rc == 0:
+            await self._run_cmd("sudo systemctl reload ssh || sudo systemctl reload sshd", check=False)
+        else:
+            os.remove(conf_path)
+
     async def remove_client(self, username: str, protocol_data: dict):
+        from database import get_client_by_username
+        client = await get_client_by_username(username)
+        if client and (client.get("protocols") or {}).get("slipstream") and client.get("enabled", True):
+            return  # SSH account still used by SlipStream
         ssh_user = protocol_data.get("ssh_username") or f"dnstt_{username}"
         await self._run_cmd(f"sudo userdel -r {ssh_user} 2>/dev/null || true", check=False)
 

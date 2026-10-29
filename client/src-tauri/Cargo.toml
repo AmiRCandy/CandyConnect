@@ -27,7 +27,11 @@ tauri = { version = "2.0.0-rc.17", features = ["tray-icon"] }
 tauri-plugin-log = "2.0.0-rc"
 tauri-plugin-fs = "2.0.0-rc"
 libc = "0.2"
-windows-sys = { version = "0.52", features = ["Win32_UI_Shell", "Win32_Foundation"] }
+# Built-in SSH client (DNSTT SSH tunnel mode) — pure Rust crypto, no OpenSSL
+russh = "0.49"
+async-trait = "0.1"
+tokio = { version = "1", features = ["net", "io-util", "sync", "time", "macros", "rt-multi-thread"] }
+windows-sys = { version = "0.52", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_System_Registry", "Win32_Networking_WinInet"] }
 
 [features]
 default = ["custom-protocol"]

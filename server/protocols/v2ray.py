@@ -159,53 +159,64 @@ class V2RayProtocol(BaseProtocol):
             return len(lines)
         return 0
 
-    async def add_client(self, username: str, client_data: dict) -> dict:
+    async def sync_clients(self, clients: list) -> None:
+        """Re-add every V2Ray-enabled client to the config with a single restart
+        (used after the admin replaces the config JSON in the panel)."""
+        for c in clients:
+            if c.get("enabled", True) and (c.get("protocols") or {}).get("v2ray"):
+                await self.add_client(c["username"], c, restart=False)
+        if await self.is_running():
+            await self.restart()
+
+    async def add_client(self, username: str, client_data: dict, restart: bool = True) -> dict:
         """Add a client to V2Ray config (generates UUID for VLESS/VMess)."""
         client_uuid = str(uuid.uuid5(uuid.NAMESPACE_DNS, username))
+        password = client_data.get("password") or username
+        email = f"{username}@candyconnect"
+        result = {"uuid": client_uuid, "password": password}
 
         config = await get_core_config("v2ray")
         if not config:
-            return {"uuid": client_uuid}
+            return result
 
         try:
             config_obj = json.loads(config.get("config_json", "{}"))
+            before = json.dumps(config_obj, sort_keys=True)
             # Add client to all inbound protocols
             for inbound in config_obj.get("inbounds", []):
                 proto = inbound.get("protocol", "")
-                settings = inbound.setdefault("settings", {})
+                if proto not in ("vless", "vmess", "trojan"):
+                    # Shadowsocks uses a single server-wide password; api/dokodemo have no users
+                    continue
+                settings = inbound.get("settings")
+                if not isinstance(settings, dict):
+                    settings = inbound["settings"] = {}
+                clients = settings.get("clients")
+                if not isinstance(clients, list):
+                    clients = settings["clients"] = []
 
                 if proto in ("vless", "vmess"):
-                    clients = settings.setdefault("clients", [])
-                    # Check if already exists
                     if not any(c.get("id") == client_uuid for c in clients):
-                        client_entry = {"id": client_uuid, "email": f"{username}@candyconnect"}
+                        client_entry = {"id": client_uuid, "email": email}
                         if proto == "vless":
                             client_entry["flow"] = ""
                         clients.append(client_entry)
+                else:  # trojan: replace entry so password changes are applied
+                    settings["clients"] = [c for c in clients if c.get("email") != email]
+                    settings["clients"].append({"password": password, "email": email})
 
-                elif proto == "trojan":
-                    clients = settings.setdefault("clients", [])
-                    if not any(c.get("password") == client_data.get("password", username) for c in clients):
-                        clients.append({
-                            "password": client_data.get("password", username),
-                            "email": f"{username}@candyconnect",
-                        })
+            if json.dumps(config_obj, sort_keys=True) != before:
+                config["config_json"] = json.dumps(config_obj, indent=2)
+                await update_core_config("v2ray", config)
 
-                elif proto == "shadowsocks":
-                    # Shadowsocks uses single password, handled differently
-                    pass
-
-            config["config_json"] = json.dumps(config_obj, indent=2)
-            await update_core_config("v2ray", config)
-
-            # Restart if running to apply changes
-            if await self.is_running():
-                await self.restart()
+                # Restart if running to apply changes
+                if restart and await self.is_running():
+                    await self.restart()
 
         except json.JSONDecodeError:
             pass
 
-        return {"uuid": client_uuid}
+        return result
 
     async def remove_client(self, username: str, protocol_data: dict):
         client_uuid = protocol_data.get("uuid") or str(uuid.uuid5(uuid.NAMESPACE_DNS, username))
@@ -224,6 +235,8 @@ class V2RayProtocol(BaseProtocol):
                 ]
             config["config_json"] = json.dumps(config_obj, indent=2)
             await update_core_config("v2ray", config)
+            if await self.is_running():
+                await self.restart()
         except json.JSONDecodeError:
             pass
 
@@ -233,9 +246,20 @@ class V2RayProtocol(BaseProtocol):
         if not config:
             return {}
 
+        # A bare core id means "any inbound"
+        if config_id and config_id.lower() in ("v2ray", "v2ray-basic", "xray"):
+            config_id = None
+
         outbounds = []
         try:
             config_obj = json.loads(config.get("config_json", "{}"))
+            # Prefer an exact tag match ("vless-tcp-tls" must not resolve to "vless-tcp")
+            if config_id:
+                wanted = {config_id.lower(), config_id.lower()[6:] if config_id.lower().startswith("v2ray-") else config_id.lower()}
+                exact = [ib for ib in config_obj.get("inbounds", [])
+                         if str(ib.get("tag", "")).lower() in wanted]
+                if exact:
+                    config_obj["inbounds"] = exact
             for inbound in config_obj.get("inbounds", []):
                 proto = inbound.get("protocol", "")
                 if proto not in ("vless", "vmess", "trojan", "shadowsocks"):
@@ -268,38 +292,51 @@ class V2RayProtocol(BaseProtocol):
                         continue
                 
                 # Build client outbound
+                user = {"id": client_uuid, "encryption": "none", "level": 0}
+                if proto == "vmess":
+                    user = {"id": client_uuid, "alterId": 0, "security": "auto", "level": 0}
+                elif proto == "vless":
+                    # Use the same flow the server has for this user (empty = no flow).
+                    # Forcing xtls-rprx-vision when the server has none breaks the connection.
+                    inbound_clients = inbound.get("settings", {}).get("clients", []) or []
+                    me = next((c for c in inbound_clients if c.get("id") == client_uuid), None)
+                    flow = (me or {}).get("flow") or ""
+                    if flow:
+                        user["flow"] = flow
+
                 outbound = {
                     "protocol": proto,
                     "settings": {
                         "vnext": [{
                             "address": server_ip,
                             "port": port,
-                            "users": [{"id": client_uuid, "encryption": "none", "level": 0}]
+                            "users": [user]
                         }]
                     },
-                    "streamSettings": stream, # Copy stream settings (network, security, tlsSettings)
-                    "tag": "proxy"
+                    "streamSettings": self._client_stream_settings(stream),
+                    "tag": "proxy",
+                    "_inbound_tag": inbound_tag,
                 }
 
-                # Protocol specific adjustments
-                if proto == "vless":
-                    outbound["settings"]["vnext"][0]["users"][0]["encryption"] = "none"
-                    if "flow" in inbound.get("settings", {}).get("clients", [{}])[0]:
-                        outbound["settings"]["vnext"][0]["users"][0]["flow"] = "xtls-rprx-vision"
-                
-                elif proto == "trojan":
+                if proto == "trojan":
                     outbound["settings"] = {
                         "servers": [{
                             "address": server_ip,
                             "port": port,
                             "password": protocol_data.get("password") or username,
-                            "email": f"{username}@candyconnect"
                         }]
                     }
                 
                 elif proto == "shadowsocks":
-                    # Shadowsocks usually has one global password - adjust if per-user logic added later
-                    pass
+                    ss = inbound.get("settings", {})
+                    outbound["settings"] = {
+                        "servers": [{
+                            "address": server_ip,
+                            "port": port,
+                            "method": ss.get("method", "aes-256-gcm"),
+                            "password": ss.get("password", ""),
+                        }]
+                    }
 
                 outbounds.append(outbound)
                 
@@ -334,9 +371,12 @@ class V2RayProtocol(BaseProtocol):
             "outbounds": outbounds + [{"protocol": "freedom", "tag": "direct"}],
             "routing": {
                 "domainStrategy": "AsIs",
+                # Plain CIDRs instead of geoip:/geosite: so the client works without geo*.dat files
                 "rules": [
-                    {"type": "field", "outboundTag": "direct", "domain": ["geosite:cn", "geosite:private"]},
-                    {"type": "field", "outboundTag": "direct", "ip": ["geoip:cn", "geoip:private"]}
+                    {"type": "field", "outboundTag": "direct", "ip": [
+                        "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                        "169.254.0.0/16", "::1/128", "fc00::/7", "fe80::/10",
+                    ]},
                 ]
             }
         }
@@ -355,7 +395,7 @@ class V2RayProtocol(BaseProtocol):
                 
                 stream = outbound.get("streamSettings", {})
                 sub_protocols.append({
-                    "tag": outbound.get("tag", f"{proto}-{port}"),
+                    "tag": outbound.pop("_inbound_tag", None) or f"{proto}-{port}",
                     "protocol": proto,
                     "transport": stream.get("network", "tcp"),
                     "security": stream.get("security", "none"),
@@ -369,3 +409,50 @@ class V2RayProtocol(BaseProtocol):
             "config_json": client_json,
             "sub_protocols": sub_protocols,
         }
+
+    @staticmethod
+    def _client_stream_settings(stream: dict) -> dict:
+        """Convert server-side streamSettings to client-side ones.
+
+        The server's tlsSettings/realitySettings contain certificate file paths and
+        private keys that don't exist (and must not leak) on the client.
+        """
+        client = {k: v for k, v in (stream or {}).items()
+                  if k not in ("tlsSettings", "realitySettings", "xtlsSettings", "sockopt")}
+        security = client.get("security", "none")
+        if security == "tls":
+            tls = (stream or {}).get("tlsSettings", {}) or {}
+            out = {"fingerprint": tls.get("fingerprint", "chrome")}
+            if tls.get("serverName"):
+                out["serverName"] = tls["serverName"]
+            if tls.get("alpn"):
+                out["alpn"] = tls["alpn"]
+            if tls.get("allowInsecure"):
+                out["allowInsecure"] = True
+            client["tlsSettings"] = out
+        elif security == "reality":
+            rs = (stream or {}).get("realitySettings", {}) or {}
+            server_names = rs.get("serverNames") or [rs.get("serverName", "")]
+            short_ids = rs.get("shortIds") or [""]
+            public_key = rs.get("publicKey", "")
+            if not public_key and rs.get("privateKey"):
+                try:
+                    import base64
+                    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+                    from cryptography.hazmat.primitives import serialization
+                    raw = rs["privateKey"]
+                    priv = X25519PrivateKey.from_private_bytes(
+                        base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
+                    pub = priv.public_key().public_bytes(
+                        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+                    public_key = base64.urlsafe_b64encode(pub).decode().rstrip("=")
+                except Exception:
+                    public_key = ""
+            client["realitySettings"] = {
+                "serverName": server_names[0] if server_names else "",
+                "publicKey": public_key,
+                "shortId": short_ids[0] if short_ids else "",
+                "fingerprint": rs.get("fingerprint", "chrome"),
+                "spiderX": rs.get("spiderX", ""),
+            }
+        return client

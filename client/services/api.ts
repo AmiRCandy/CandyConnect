@@ -125,6 +125,7 @@ export interface Settings {
   dnsttProxyPort?: number; // local SOCKS proxy port for dnstt-client (default 7070)
   l2tpPsk?: string; // L2TP/IPSec pre-shared key (override server-provided value)
   ikev2AuthMethod?: string; // 'eap' | 'cert' — IKEv2 authentication method
+  systemProxy?: boolean; // Proxy mode: point the OS system proxy at the local proxy (default true)
 }
 
 export interface VPNConfig {
@@ -184,6 +185,7 @@ let _settings: Settings = {
   dnsttProxyPort: 7070,
   l2tpPsk: '',
   ikev2AuthMethod: 'eap',
+  systemProxy: true,
 };
 
 let _logs: Array<{ timestamp: string; level: string; message: string }> = [
@@ -232,11 +234,20 @@ async function apiRequest<T>(method: string, path: string, body?: unknown): Prom
     throw new Error('Session expired. Please login again.');
   }
 
-  const data = await res.json();
-  if (data.success === false) {
-    throw new Error(data.message || data.detail?.message || 'Request failed');
+  let data: any = null;
+  try {
+    data = await res.json();
+  } catch {
+    throw new Error(`Server returned an invalid response (HTTP ${res.status})`);
   }
-  return data.data !== undefined ? data.data : data;
+  // FastAPI errors (403/404/422/500) come back as { detail: ... } without a `success` field
+  if (!res.ok || data?.success === false) {
+    const detail = typeof data?.detail === 'string'
+      ? data.detail
+      : (data?.detail?.message || (data?.detail ? JSON.stringify(data.detail) : ''));
+    throw new Error(data?.message || detail || `Request failed (HTTP ${res.status})`);
+  }
+  return data && data.data !== undefined ? data.data : data;
 }
 
 async function addLog(level: string, message: string) {
@@ -301,11 +312,17 @@ export const Login = async (credentials: LoginCredentials): Promise<{
       body: JSON.stringify({ username: credentials.username, password: credentials.password }),
     });
 
-    const data = await res.json();
+    let data: any = null;
+    try {
+      data = await res.json();
+    } catch {
+      throw new Error(`Server returned an invalid response (HTTP ${res.status})`);
+    }
 
-    if (!data.success) {
-      addLog('error', `Login failed: ${data.message}`);
-      return { success: false, error: data.message || 'Invalid credentials' };
+    if (!res.ok || !data?.success || !data?.token) {
+      const msg = data?.message || (typeof data?.detail === 'string' ? data.detail : '') || 'Invalid credentials';
+      addLog('error', `Login failed: ${msg}`);
+      return { success: false, error: msg };
     }
 
     localStorage.setItem('cc_last_server', credentials.serverAddress);
@@ -612,62 +629,60 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
 
     // 2. Check protocol type from config ID
     const isDnstt = configId.toLowerCase().startsWith('dnstt');
+    const isSlipstream = configId.toLowerCase().startsWith('slipstream');
+    const isTrusttunnel = configId.toLowerCase().startsWith('trusttunnel');
     const isL2tp = configId.toLowerCase().startsWith('l2tp');
     const isIkev2 = configId.toLowerCase().startsWith('ikev2');
     const isWireguard = configId.toLowerCase().startsWith('wireguard');
     const isOpenvpn = configId.toLowerCase().startsWith('openvpn');
 
-    if (isDnstt) {
-      // ── DNSTT Connection Flow ──
-      // Fetch the DNSTT config from the server (contains extraData with domain, public_key, etc.)
-      // First try configs list to get extraData, then fall back to individual config endpoint
-      let dnsttExtra: Record<string, any> | null = null;
+    if (isDnstt || isSlipstream) {
+      // ── DNS tunnel flow (DNSTT / SlipStream) ──
+      // The /configs list entry has the basics; the per-protocol config (/configs/<id>) adds
+      // tunnel_mode / congestion_control, so merge both (per-protocol values win).
+      const label = isDnstt ? 'DNSTT' : 'SlipStream';
+      let tunnelExtra: Record<string, any> = {};
       let serverIp = _serverInfo?.ip || '0.0.0.0';
 
-      // Try to find config in cached configs
-      const cachedConfig = _cachedConfigs.find(c => c.id === configId);
-      if (cachedConfig?.extraData) {
-        dnsttExtra = cachedConfig.extraData;
+      const cachedConfig = _cachedConfigs.find(c => c.id === configId)
+        || (await LoadConfigs()).find(c => c.id === configId);
+      if (cachedConfig) {
+        tunnelExtra = { ...(cachedConfig.extraData || {}) };
         serverIp = cachedConfig.address || serverIp;
       }
-
-      // If not cached, fetch from server
-      if (!dnsttExtra) {
-        try {
-          const configData = await apiRequest<any>('GET', `/configs/${encodeURIComponent(configId)}`);
-          dnsttExtra = configData?.extra_data || configData?.extraData || configData;
-          serverIp = configData?.server || configData?.address || serverIp;
-        } catch {
-          // Last resort: try the full configs list
-          const allConfigs = await LoadConfigs();
-          const found = allConfigs.find(c => c.id === configId);
-          if (found?.extraData) {
-            dnsttExtra = found.extraData;
-            serverIp = found.address || serverIp;
-          }
+      try {
+        const configData = await apiRequest<any>('GET', `/configs/${encodeURIComponent(configId)}`);
+        const data = configData?.extra_data || configData?.extraData || configData || {};
+        for (const [k, v] of Object.entries(data)) {
+          if (v !== undefined && v !== null && v !== '') tunnelExtra[k] = v;
         }
+        serverIp = configData?.server || configData?.address || serverIp;
+      } catch (e: any) {
+        if (Object.keys(tunnelExtra).length === 0) {
+          throw new Error(`Could not retrieve ${label} configuration from server: ${e?.message || e}`);
+        }
+        addLog('warn', `${label}: per-protocol config unavailable (${e?.message || e}), using the config list data`);
       }
 
-      if (!dnsttExtra) {
-        throw new Error('Could not retrieve DNSTT configuration data from server');
-      }
+      const domain = tunnelExtra.domain;
+      const tunnelMode = String(tunnelExtra.tunnel_mode || 'ssh').toLowerCase();
+      const sshUser = tunnelExtra.ssh_username || '';
+      const sshPass = tunnelExtra.ssh_password || '';
 
-      const domain = dnsttExtra.domain;
-      const publicKey = dnsttExtra.public_key;
-      const sshUser = dnsttExtra.ssh_username;
-      const sshPass = dnsttExtra.ssh_password;
-
-      if (!domain || !publicKey) {
-        throw new Error('DNSTT config missing required fields: domain or public_key');
+      if (!domain) {
+        throw new Error(`${label} config is missing the tunnel domain`);
       }
-      if (!sshUser || !sshPass) {
-        throw new Error('DNSTT config missing SSH credentials (ssh_username / ssh_password)');
+      if (isDnstt && !tunnelExtra.public_key) {
+        throw new Error('DNSTT config is missing the server public key');
+      }
+      if (tunnelMode !== 'socks' && (!sshUser || !sshPass)) {
+        throw new Error(`${label} config missing SSH credentials (ssh_username / ssh_password)`);
       }
 
       const resolver = currentSettings.dnsttResolver || 'auto';
 
-      // In proxy mode: SSH SOCKS proxy listens on the user-configured proxy address/port
-      // In TUN mode: SSH SOCKS proxy listens on an internal port; sing-box handles the user-facing proxy
+      // Proxy mode: the built-in SOCKS5/HTTP proxy listens on the user-configured address/port.
+      // TUN mode: it listens on an internal port and sing-box routes everything into it.
       const proxyHost = mode === 'proxy'
         ? (currentSettings.proxyHost || currentSettings.proxyAddress || '127.0.0.1')
         : '127.0.0.1';
@@ -675,21 +690,35 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
         ? (currentSettings.proxyPort || 1080)
         : (currentSettings.dnsttProxyPort || 7070);
 
-      addLog('info', `DNSTT: domain=${domain}, resolver=${resolver}, sshUser=${sshUser}, socks=${proxyHost}:${proxyPort}, mode=${mode}`);
+      addLog('info', `${label}: domain=${domain}, resolver=${resolver}, tunnel=${tunnelMode}${tunnelMode === 'socks' ? '' : `, sshUser=${sshUser}`}, local proxy=${proxyHost}:${proxyPort}, mode=${mode}`);
 
-      // Call the Rust start_dnstt command
-      // Flow: dnstt-client (TCP tunnel) → SSH -D (SOCKS proxy) → [sing-box TUN if tun mode]
-      await invoke('start_dnstt', {
-        domain: domain,
-        publicKey: publicKey,
-        resolver: resolver,
-        mode: mode,
-        proxyHost: proxyHost,
-        proxyPort: proxyPort,
-        serverIp: serverIp,
-        sshUser: sshUser,
-        sshPass: sshPass,
-      });
+      // Flow: tunnel client (local TCP port) → built-in SSH/SOCKS5 local proxy → [sing-box TUN if tun mode]
+      if (isDnstt) {
+        await invoke('start_dnstt', {
+          domain: domain,
+          publicKey: tunnelExtra.public_key,
+          resolver: resolver,
+          mode: mode,
+          proxyHost: proxyHost,
+          proxyPort: proxyPort,
+          serverIp: serverIp,
+          sshUser: sshUser,
+          sshPass: sshPass,
+          tunnelMode: tunnelMode,
+        });
+      } else {
+        await invoke('start_slipstream', {
+          domain: domain,
+          resolver: resolver,
+          congestionControl: tunnelExtra.congestion_control || 'bbr',
+          mode: mode,
+          proxyHost: proxyHost,
+          proxyPort: proxyPort,
+          serverIp: serverIp,
+          sshUser: sshUser,
+          sshPass: sshPass,
+        });
+      }
 
     } else if (isL2tp || isIkev2) {
       // ── L2TP / IKEv2 Native VPN Connection Flow ──
@@ -704,18 +733,21 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
         serverIp = cachedConfig.address || serverIp;
       }
 
-      // If not cached, fetch from server
-      if (!nativeExtra) {
+      // If not cached, the L2TP PSK is missing, or IKEv2 (its CA certificate / remote id are only
+      // in the per-protocol config, not in the /configs list), fetch from server
+      if (!nativeExtra || isIkev2 || (isL2tp && !nativeExtra.psk && !currentSettings.l2tpPsk)) {
         try {
           const configData = await apiRequest<any>('GET', `/configs/${encodeURIComponent(configId)}`);
-          nativeExtra = configData?.extra_data || configData?.extraData || configData;
+          nativeExtra = { ...(nativeExtra || {}), ...(configData?.extra_data || configData?.extraData || configData || {}) };
           serverIp = configData?.server || configData?.address || serverIp;
         } catch {
-          const allConfigs = await LoadConfigs();
-          const found = allConfigs.find(c => c.id === configId);
-          if (found?.extraData) {
-            nativeExtra = found.extraData;
-            serverIp = found.address || serverIp;
+          if (!nativeExtra) {
+            const allConfigs = await LoadConfigs();
+            const found = allConfigs.find(c => c.id === configId);
+            if (found?.extraData) {
+              nativeExtra = found.extraData;
+              serverIp = found.address || serverIp;
+            }
           }
         }
       }
@@ -748,11 +780,16 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
           authMethod: 'psk',
         });
       } else {
-        // IKEv2
+        // IKEv2 (EAP-MSCHAPv2; the server cert is issued by the server's own CA)
         const port = nativeExtra?.port || cachedConfig?.port || 500;
-        const authMethod = currentSettings.ikev2AuthMethod || 'eap';
+        const authMethod = nativeExtra?.auth === 'eap-mschapv2' ? 'eap' : (currentSettings.ikev2AuthMethod || 'eap');
+        const caCert: string = nativeExtra?.ca_cert || '';
+        const remoteId: string = nativeExtra?.remote_id || serverIp;
 
-        addLog('info', `IKEv2: server=${serverIp}, port=${port}, user=${vpnUsername}, auth=${authMethod}`);
+        addLog('info', `IKEv2: server=${serverIp}, port=${port}, user=${vpnUsername}, auth=${authMethod}, remoteId=${remoteId}, ca=${caCert ? 'provided' : 'missing'}`);
+        if (!caCert) {
+          addLog('warn', 'IKEv2: the server did not send its CA certificate — the connection only works if the CA is already trusted');
+        }
 
         await invoke('start_native_vpn', {
           protocol: protocol,
@@ -762,6 +799,8 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
           password: vpnPassword,
           psk: '',
           authMethod: authMethod,
+          caCert: caCert || null,
+          remoteId: remoteId,
         });
       }
 
@@ -797,18 +836,25 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
         throw new Error('Could not retrieve WireGuard configuration data from server');
       }
 
-      const privateKey = wgExtra.private_key || wgExtra.privateKey || '';
-      const peerPublicKey = wgExtra.peer_public_key || wgExtra.peerPublicKey || wgExtra.public_key || wgExtra.publicKey || '';
-      const preSharedKey = wgExtra.pre_shared_key || wgExtra.preSharedKey || '';
-      const wgPort = wgExtra.port || cachedConfig?.port || 51820;
-      const localAddresses = wgExtra.local_addresses || wgExtra.addresses || wgExtra.address
-        ? (Array.isArray(wgExtra.local_addresses || wgExtra.addresses || wgExtra.address)
-          ? (wgExtra.local_addresses || wgExtra.addresses || wgExtra.address)
-          : [(wgExtra.local_addresses || wgExtra.addresses || wgExtra.address)])
-        : ['10.0.0.2/32'];
+      // /configs returns { private_key, public_key, address }, /configs/wireguard returns
+      // { client_private_key, server_public_key, client_address } — accept both shapes.
+      const privateKey = wgExtra.private_key || wgExtra.privateKey || wgExtra.client_private_key || '';
+      const peerPublicKey = wgExtra.peer_public_key || wgExtra.peerPublicKey || wgExtra.server_public_key
+        || wgExtra.public_key || wgExtra.publicKey || '';
+      const preSharedKey = wgExtra.pre_shared_key || wgExtra.preSharedKey || wgExtra.preshared_key || '';
+      const wgPort = Number(wgExtra.port || cachedConfig?.port || 51820);
+      const wgMtu = Number(wgExtra.mtu) || 1420;
+      const rawAddresses = wgExtra.local_addresses || wgExtra.addresses || wgExtra.address || wgExtra.client_address;
+      const localAddresses: string[] = (Array.isArray(rawAddresses) ? rawAddresses : String(rawAddresses || '').split(','))
+        .map((a: string) => String(a).trim())
+        .filter((a: string) => a.length > 0)
+        .map((a: string) => (a.includes('/') ? a : (a.includes(':') ? `${a}/128` : `${a}/32`)));
 
       if (!privateKey || !peerPublicKey) {
         throw new Error('WireGuard config missing required keys (private_key / peer_public_key)');
+      }
+      if (localAddresses.length === 0) {
+        throw new Error('WireGuard config missing the client tunnel address — ask the admin to re-save this user');
       }
 
       addLog('info', `WireGuard: server=${serverIp}, port=${wgPort}, mode=${mode}, addresses=${localAddresses.join(',')}`);
@@ -821,6 +867,7 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
         preSharedKey: preSharedKey,
         localAddresses: localAddresses,
         mode: mode,
+        mtu: wgMtu,
       });
 
     } else if (isOpenvpn) {
@@ -872,6 +919,46 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
         password: ovpnPassword,
         mode: mode,
       });
+
+    } else if (isTrusttunnel) {
+      // ── TrustTunnel Connection Flow (official trusttunnel_client CLI) ──
+      const cachedConfig = _cachedConfigs.find(c => c.id === configId)
+        || (await LoadConfigs()).find(c => c.id === configId);
+      let ttExtra: Record<string, any> = { ...(cachedConfig?.extraData || {}) };
+      let deepLink = cachedConfig?.configLink || '';
+      if (!ttExtra.endpoint_config) {
+        try {
+          const configData = await apiRequest<any>('GET', `/configs/${encodeURIComponent(configId)}`);
+          ttExtra = { ...ttExtra, ...(configData?.extra_data || configData?.extraData || configData || {}) };
+          deepLink = deepLink || configData?.configLink || configData?.config_link || configData?.link || '';
+        } catch { }
+      }
+      const endpointConfig: string = ttExtra.endpoint_config || '';
+      addLog('info', `TrustTunnel: host=${ttExtra.hostname || cachedConfig?.address || '?'}, user=${ttExtra.username || '?'}, endpoint config=${endpointConfig ? 'provided' : 'missing'}`);
+
+      try {
+        if (!endpointConfig) {
+          throw new Error('TRUSTTUNNEL_CLIENT_MISSING: no endpoint configuration');
+        }
+        await invoke('start_trusttunnel', { endpointConfig: endpointConfig, mode: mode });
+      } catch (e: any) {
+        const msg = typeof e === 'string' ? e : (e?.message || String(e));
+        if (!msg.startsWith('TRUSTTUNNEL_CLIENT_MISSING')) throw e;
+        const why = endpointConfig ? 'TrustTunnel client is not installed' : 'The server sent no TrustTunnel endpoint configuration';
+        // No usable CLI client: hand the tt:// deep link to the TrustTunnel app instead
+        if (deepLink.startsWith('tt://')) {
+          let copied = false;
+          try {
+            await navigator.clipboard.writeText(deepLink);
+            copied = true;
+          } catch { }
+          addLog('warn', `${why} — ${copied ? 'link copied to the clipboard' : 'copy the link manually'}: import it into the TrustTunnel app`);
+          throw new Error(copied
+            ? `${why}. The tt:// link was copied to your clipboard — import it into the TrustTunnel app.`
+            : `${why}. Import this link into the TrustTunnel app: ${deepLink}`);
+        }
+        throw new Error(`${why} and the server has no tt:// link for this account (is the TrustTunnel endpoint running?)`);
+      }
 
     } else {
       // ── Standard (Xray) Connection Flow ──
@@ -999,28 +1086,10 @@ export const PingProfile = async (name: string): Promise<PingResult> => {
 };
 
 export const PingAllProfiles = async (): Promise<PingResult[]> => {
-  // Try real backend bulk ping
-  try {
-    const results = await apiRequest<any[]>('POST', '/ping-all');
-    if (Array.isArray(results) && results.length > 0) {
-      return results.map(r => ({
-        profileName: r.protocol || r.config_id,
-        configId: r.config_id,
-        latency: r.latency || 0,
-        success: r.reachable !== false,
-      }));
-    }
-  } catch {
-    // Fallback: ping each config individually
-  }
-
-  const configs = await LoadConfigs();
-  const results: PingResult[] = [];
-  for (const c of configs) {
-    const r = await PingConfig(c.id);
-    results.push(r);
-  }
-  return results;
+  // The server's /ping-all only returns placeholder latencies (0) keyed by "<protocol>-1",
+  // which don't match config ids — so measure each config from the client instead.
+  const configs = _cachedConfigs.length > 0 ? _cachedConfigs : await LoadConfigs();
+  return Promise.all(configs.map(c => PingConfig(c.id)));
 };
 
 export const PingAllConfigs = async (): Promise<PingResult[]> => {
@@ -1121,7 +1190,8 @@ export const GetNetworkSpeed = async (): Promise<NetworkSpeed> => {
       try {
         // Normalize protocol ID: strip trailing "-N" suffix (e.g. "wireguard-1" → "wireguard")
         // so the server stores it under the canonical protocol key in Redis.
-        const normalizedProtocol = _connectedProtocol.replace(/-\d+$/, '');
+        // Relay variants ("<config id>~relay-<id>") count towards the base config's protocol.
+        const normalizedProtocol = _connectedProtocol.split('~relay-')[0].replace(/-\d+$/, '');
         await apiRequest('POST', '/traffic', {
           protocol: normalizedProtocol,
           bytes_sent: ulDelta,
@@ -1150,7 +1220,11 @@ export const LoadLogs = async (): Promise<Array<{ timestamp: string; level: stri
     if (content) {
       // Handle the JSONL format: each line is a JSON object
       const lines = content.split('\n').filter(l => l.trim().length > 0);
-      return lines.map(l => JSON.parse(l)).reverse(); // Newest first
+      const parsed: Array<{ timestamp: string; level: string; message: string }> = [];
+      for (const l of lines) {
+        try { parsed.push(JSON.parse(l)); } catch { /* skip malformed line */ }
+      }
+      return parsed.reverse(); // Newest first
     }
   } catch (e) {
     console.debug('Failed to read log file:', e);

@@ -246,26 +246,29 @@ const AppContent: React.FC = () => {
     }
 
     // Connect with the last selected config (fallback to first available)
+    let selected: string | undefined;
     try {
       const { LoadSettings } = await import('./services/api');
       const settings = await LoadSettings();
-      const selected = (settings as any).selectedProfile as string | undefined;
-      if (selected) {
-        await handleConnectToProtocol(selected);
-        return;
-      }
+      selected = settings.selectedProfile || undefined;
     } catch { }
 
+    let cfgs: VPNConfig[] = [];
     try {
-      const cfgs = await LoadConfigs();
-      if (cfgs.length > 0) {
-        await handleConnectToProtocol(cfgs[0].id);
-        return;
-      }
+      cfgs = await LoadConfigs();
     } catch { }
 
-    // Final fallback (legacy)
-    await handleConnectToProtocol(connectedProtocol || 'v2ray');
+    // Only use the saved selection if it is still offered by the server
+    if (selected && (cfgs.length === 0 || cfgs.some(c => c.id === selected))) {
+      await handleConnectToProtocol(selected);
+      return;
+    }
+    if (cfgs.length > 0) {
+      await handleConnectToProtocol(cfgs[0].id);
+      return;
+    }
+
+    setConnectionError('No VPN configurations are available for this account');
   };
 
   // Render login page if not authenticated

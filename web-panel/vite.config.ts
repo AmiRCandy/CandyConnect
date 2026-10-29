@@ -3,7 +3,8 @@ import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
 export default defineConfig({
-  base: '/candyconnect/',
+  // Relative asset URLs: the server can mount the panel under any path (CC_PANEL_PATH)
+  base: './',
   plugins: [react()],
   resolve: {
     alias: { '@': path.resolve(__dirname, '.') },

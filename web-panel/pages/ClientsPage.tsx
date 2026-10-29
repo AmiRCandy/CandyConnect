@@ -8,15 +8,46 @@ import { Users, Search, ClipboardList, Pencil, Trash2, CheckCircle2, XCircle, Pl
 
 const ALL_PROTOCOLS = ['v2ray', 'wireguard', 'openvpn', 'ikev2', 'l2tp', 'dnstt', 'slipstream', 'trusttunnel'] as const;
 
-// Helper to adapt snake_case API client to display
-const fmtTimeLimit = (c: Client) => {
-  const r = c.time_limit.value - c.time_used;
-  if (c.time_limit.on_hold) return `On Hold (${c.time_limit.value} ${c.time_limit.mode})`;
-  return `${r} ${c.time_limit.mode} left`;
+// Server timestamps are "YYYY-MM-DD HH:MM:SS" (server local time); only used as a
+// fallback when the server does not send the timezone-independent *_ts fields.
+const parseTs = (t?: string | null) => {
+  if (!t) return NaN;
+  return new Date(t.replace(' ', 'T')).getTime();
 };
 
-const fmtTraffic = (c: Client) => formatClientTraffic(c.traffic_used, { value: c.traffic_limit.value, unit: c.traffic_limit.unit });
-const trafficPct = (c: Client) => getTrafficPercent(c.traffic_used, { value: c.traffic_limit.value, unit: c.traffic_limit.unit });
+// Prefer unix seconds from the server (created_ts / expires_ts), else parse the strings
+const clientTimes = (c: Client) => ({
+  start: c.created_ts ? c.created_ts * 1000 : parseTs(c.created_at),
+  end: c.expires_ts ? c.expires_ts * 1000 : parseTs(c.expires_at),
+});
+
+// on_hold = the countdown only starts at the client's first connection
+const isOnHold = (c: Client) => !!c.time_limit?.on_hold && (Number(c.time_limit?.value) || 0) > 0;
+
+// Time progress is derived from created/expires timestamps
+const timeInfo = (c: Client) => {
+  const limit = Number(c.time_limit?.value) || 0;
+  if (isOnHold(c)) return { left: limit, pct: 0, mode: c.time_limit?.mode || 'days' };
+  const { start, end } = clientTimes(c);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+    const used = Number(c.time_used) || 0;
+    return { left: Math.max(0, limit - used), pct: limit > 0 ? (used / limit) * 100 : 0, mode: c.time_limit?.mode || 'days' };
+  }
+  const now = Date.now();
+  const pct = ((now - start) / (end - start)) * 100;
+  const daysLeft = Math.max(0, Math.ceil((end - now) / 86400000));
+  return { left: daysLeft, pct, mode: 'days' };
+};
+
+const fmtTimeLimit = (c: Client) => {
+  if (isOnHold(c)) return 'On hold';
+  const t = timeInfo(c);
+  if (t.left <= 0) return 'Expired';
+  return `${t.left} ${t.left === 1 ? t.mode.replace(/s$/, '') : t.mode} left`;
+};
+
+const fmtTraffic = (c: Client) => formatClientTraffic(c.traffic_used, c.traffic_limit);
+const trafficPct = (c: Client) => getTrafficPercent(c.traffic_used, c.traffic_limit);
 
 const genPassword = () => {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789!@#$%';
@@ -67,7 +98,7 @@ const ClientsPage: React.FC = () => {
     const matchesGroup = selectedGroup === 'All' || c.group === selectedGroup;
     if (!search && matchesGroup) return true;
     const q = search.toLowerCase();
-    return matchesGroup && (c.username.toLowerCase().includes(q) || c.comment.toLowerCase().includes(q) || c.last_connected_ip?.includes(q));
+    return matchesGroup && ((c.username || '').toLowerCase().includes(q) || (c.comment || '').toLowerCase().includes(q) || !!c.last_connected_ip?.includes(q));
   });
 
   const openAddModal = () => {
@@ -82,11 +113,13 @@ const ClientsPage: React.FC = () => {
 
   const openEditModal = (client: Client) => {
     setIsAddMode(false); setEditClient(client);
-    setFUsername(client.username); setFPassword(client.password); setFComment(client.comment);
-    setFTrafficVal(client.traffic_limit.value); setFTrafficUnit(client.traffic_limit.unit as any);
-    setFTimeVal(client.time_limit.value); setFTimeMode(client.time_limit.mode as any);
-    setFOnHold(client.time_limit.on_hold); setFEnabled(client.enabled); setFGroup(client.group || '');
-    setFProtocols({ ...client.protocols });
+    setFUsername(client.username); setFPassword(client.password || ''); setFComment(client.comment || '');
+    setFTrafficVal(client.traffic_limit?.value ?? 50); setFTrafficUnit((client.traffic_limit?.unit as any) || 'GB');
+    setFTimeVal(client.time_limit?.value ?? 30); setFTimeMode((client.time_limit?.mode as any) || 'days');
+    setFOnHold(!!client.time_limit?.on_hold); setFEnabled(client.enabled !== false); setFGroup(client.group || '');
+    const p: Record<string, boolean> = {};
+    ALL_PROTOCOLS.forEach(k => p[k] = !!client.protocols?.[k]);
+    setFProtocols(p);
   };
 
   const handleSave = async () => {
@@ -102,11 +135,11 @@ const ClientsPage: React.FC = () => {
           time_limit: { mode: fTimeMode, value: fTimeVal, on_hold: fOnHold },
           protocols: fProtocols as unknown as ClientProtocols,
         });
-        notify(`Client "${fUsername}" created`, 'success');
+        notify(`Client "${fUsername.trim()}" created`, 'success');
       } else if (editClient) {
         await updateClient(editClient.id, {
           password: fPassword.trim(), comment: fComment.trim(), enabled: fEnabled,
-          group: fGroup.trim() || undefined,
+          group: fGroup.trim(), // send '' so the group can be cleared
           traffic_limit: { value: fTrafficVal, unit: fTrafficUnit },
           time_limit: { mode: fTimeMode, value: fTimeVal, on_hold: fOnHold },
           protocols: fProtocols as unknown as ClientProtocols,
@@ -173,7 +206,7 @@ const ClientsPage: React.FC = () => {
               <div>
                 <div className="flex justify-between items-start mb-2">
                   <div className={`w-2.5 h-2.5 rounded-full ${client.is_online ? 'bg-green-500 shadow-sm shadow-green-500/50 animate-pulse' : !client.enabled ? 'bg-red-500' : 'bg-slate-300 dark:bg-slate-600'}`} title={client.is_online ? 'Online' : !client.enabled ? 'Disabled' : 'Offline'} />
-                  {client.time_limit.on_hold && <PauseCircle className="w-3 h-3 text-amber-500" />}
+                  {client.time_limit?.on_hold && <PauseCircle className="w-3 h-3 text-amber-500" />}
                 </div>
                 <h3 className="font-bold text-slate-800 dark:text-slate-200 text-sm truncate" title={client.username}>{client.username}</h3>
                 {client.group && <span className="text-[10px] px-1.5 py-0.5 bg-slate-100 dark:bg-slate-700 rounded text-slate-500 dark:text-slate-400 inline-block mt-1 truncate max-w-full">{client.group}</span>}
@@ -182,9 +215,9 @@ const ClientsPage: React.FC = () => {
                 <div>
                   <div className="flex justify-between items-end text-[9px] text-slate-500 dark:text-slate-400 mb-0.5">
                     <span className="flex items-center gap-1"><Clock className="w-2.5 h-2.5" /> {fmtTimeLimit(client)}</span>
-                    <span>{Math.round((client.time_used / client.time_limit.value) * 100)}%</span>
+                    <span>{Math.round(Math.min(100, Math.max(0, timeInfo(client).pct)))}%</span>
                   </div>
-                  <ProgressBar percent={(client.time_used / client.time_limit.value) * 100} height="h-1" showLabel={false} />
+                  <ProgressBar percent={timeInfo(client).pct} height="h-1" showLabel={false} />
                 </div>
                 <div>
                   <div className="flex justify-between items-end text-[9px] text-slate-500 dark:text-slate-400 mb-0.5">
@@ -215,8 +248,8 @@ const ClientsPage: React.FC = () => {
               ['Group', detailClient.group || 'None'],
               ['Comment', detailClient.comment || '-'],
               ['Traffic', fmtTraffic(detailClient)],
-              ['Time', fmtTimeLimit(detailClient)],
-              ['Created', detailClient.created_at], ['Expires', detailClient.expires_at],
+              ['Time', isOnHold(detailClient) ? `On hold (${detailClient.time_limit.value} ${detailClient.time_limit.mode}, starts at first connection)` : fmtTimeLimit(detailClient)],
+              ['Created', detailClient.created_at], ['Expires', isOnHold(detailClient) ? '-' : detailClient.expires_at],
               ['Last IP', detailClient.last_connected_ip || 'Never'], ['Last Connected', detailClient.last_connected_time || 'Never'],
             ].map(([k, v], i) => (
               <div key={i} className="flex justify-between py-1.5 border-b border-slate-100 dark:border-slate-700/50">
@@ -226,18 +259,23 @@ const ClientsPage: React.FC = () => {
             ))}
             <h4 className="text-xs font-bold text-orange-500 uppercase tracking-wider pt-2">Protocols</h4>
             <div className="flex flex-wrap gap-1.5">
-              {Object.entries(detailClient.protocols).map(([k, v]) => (
+              {Object.entries(detailClient.protocols || {}).map(([k, v]) => (
                 <span key={k} className={`text-xs px-2 py-1 rounded-full border font-medium ${v ? 'bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-400 border-green-200 dark:border-green-800' : 'bg-slate-100 dark:bg-slate-700 text-slate-400 dark:text-slate-500 border-slate-200 dark:border-slate-600'}`}>{protocolIcon(k)} {protocolName(k)}</span>
               ))}
             </div>
             <h4 className="text-xs font-bold text-orange-500 uppercase tracking-wider pt-2">Connection History</h4>
             <div className="space-y-1.5 max-h-40 overflow-y-auto">
-              {detailClient.connection_history.map((h, i) => (
-                <div key={i} className="flex items-center justify-between bg-slate-50 dark:bg-slate-700/50 rounded-lg p-2 text-xs">
-                  <div><p className="font-medium text-slate-700 dark:text-slate-300">{h.protocol}</p><p className="text-slate-400">{h.time}</p></div>
-                  <div className="text-right"><p className="text-slate-400">{h.ip}</p><p className={h.duration === 'Active' ? 'text-green-600 dark:text-green-400 font-bold' : 'text-slate-500'}>{h.duration}</p></div>
-                </div>
-              ))}
+              {(detailClient.connection_history || []).map((h, i) => {
+                const status = h.duration || h.event || '';
+                const active = status === 'Active' || status === 'connect';
+                return (
+                  <div key={i} className="flex items-center justify-between bg-slate-50 dark:bg-slate-700/50 rounded-lg p-2 text-xs">
+                    <div><p className="font-medium text-slate-700 dark:text-slate-300">{protocolName(h.protocol)}</p><p className="text-slate-400">{h.time}</p></div>
+                    <div className="text-right"><p className="text-slate-400">{h.ip}</p><p className={active ? 'text-green-600 dark:text-green-400 font-bold capitalize' : 'text-slate-500 capitalize'}>{status}</p></div>
+                  </div>
+                );
+              })}
+              {(!detailClient.connection_history || detailClient.connection_history.length === 0) && <p className="text-xs text-slate-400 italic">No connections yet.</p>}
             </div>
             {/* Per-Protocol Traffic */}
             {detailClient.protocol_traffic && Object.keys(detailClient.protocol_traffic).length > 0 && (
@@ -261,26 +299,25 @@ const ClientsPage: React.FC = () => {
 
             <h4 className="text-xs font-bold text-orange-500 uppercase tracking-wider pt-2">Protocol Details</h4>
             <div className="bg-slate-50 dark:bg-slate-700/30 rounded-lg p-3 text-xs space-y-2 break-all">
-              {Object.entries(detailClient.protocol_data).map(([pid, data]: [string, any]) => (
+              {Object.entries(detailClient.protocol_data || {}).map(([pid, data]: [string, any]) => (
                 <div key={pid} className="space-y-1">
                   <p className="font-bold text-slate-400 border-b border-slate-200 dark:border-slate-700/50 pb-0.5 mb-1 flex items-center gap-1.5">
                     {protocolIcon(pid)} {protocolName(pid)}
                   </p>
-                  {pid === 'v2ray' && <p><span className="text-slate-400">UUID:</span> <span className="text-orange-500 font-mono">{data.uuid}</span></p>}
-                  {pid === 'wireguard' && <p><span className="text-slate-400">Public Key:</span> <span className="text-orange-500 font-mono">{data.public_key}</span></p>}
+                  {pid === 'v2ray' && <p><span className="text-slate-400">UUID:</span> <span className="text-orange-500 font-mono">{data?.uuid}</span></p>}
+                  {pid === 'wireguard' && <p><span className="text-slate-400">Public Key:</span> <span className="text-orange-500 font-mono">{data?.public_key}</span></p>}
                   {pid === 'dnstt' && (
                     <>
-                      <p><span className="text-slate-400">SSH User:</span> <span className="text-orange-500 font-mono">{data.ssh_username}</span></p>
-                      <p><span className="text-slate-400">SSH Pass:</span> <span className="text-orange-500 font-mono">{data.ssh_password}</span></p>
+                      <p><span className="text-slate-400">SSH User:</span> <span className="text-orange-500 font-mono">{data?.ssh_username}</span></p>
+                      <p><span className="text-slate-400">SSH Pass:</span> <span className="text-orange-500 font-mono">{data?.ssh_password}</span></p>
                     </>
                   )}
                   {pid === 'openvpn' && <p><span className="text-slate-400">Config:</span> <span className="text-orange-500 font-mono">{detailClient.username}.ovpn available</span></p>}
                   {pid === 'ikev2' && <p><span className="text-slate-400">Auth:</span> <span className="text-green-500 font-bold">EAP-MSCHAPv2 Active</span></p>}
-                  {pid === 'l2tp' && data.psk && <p><span className="text-slate-400">IPSec PSK:</span> <span className="text-orange-500 font-mono">{data.psk}</span></p>}
-                  {['slipstream', 'trusttunnel'].includes(pid) && <p className="text-slate-400 italic">Experimental protocol</p>}
+                  {pid === 'l2tp' && data?.psk && <p><span className="text-slate-400">IPSec PSK:</span> <span className="text-orange-500 font-mono">{data.psk}</span></p>}
                 </div>
               ))}
-              {Object.keys(detailClient.protocol_data).length === 0 && <p className="text-slate-400 italic">No protocol data generated yet.</p>}
+              {Object.keys(detailClient.protocol_data || {}).length === 0 && <p className="text-slate-400 italic">No protocol data generated yet.</p>}
             </div>
           </div>
         )}

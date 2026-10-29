@@ -1,9 +1,10 @@
 import React, { useState, useEffect } from 'react';
-import { getCoreConfigs, updateCoreConfig, restartCore, getCores, getLogs, type LogEntry, type CoreConfigs, type VpnCore } from '../services/api';
+import { getCoreConfigs, updateCoreConfig, restartCore, startCore, stopCore, getCores, getLogs, type LogEntry, type CoreConfigs, type VpnCore } from '../services/api';
 import { useNotify } from '../components/Notification';
 import Modal from '../components/Modal';
 import { BtnSecondary } from '../components/UI';
-import { Candy, Zap, Shield, Lock, KeyRound, Radio, Globe, Wind, Castle, Settings, Circle, Loader2, Activity } from 'lucide-react';
+import { normLevel, logTime } from '../utils/format';
+import { Candy, Zap, Shield, Lock, KeyRound, Radio, Globe, Wind, Castle, Settings, Circle, Loader2, Activity, Info, Play, Square } from 'lucide-react';
 
 const CoreLogViewer: React.FC<{ coreId: string; onClose: () => void }> = ({ coreId, onClose }) => {
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -24,8 +25,8 @@ const CoreLogViewer: React.FC<{ coreId: string; onClose: () => void }> = ({ core
           logs.length === 0 ? <div className="p-4 text-center text-slate-500">No recent logs found for this core.</div> :
             logs.map((L, i) => (
               <div key={i} className="flex gap-2 border-b border-slate-100 dark:border-slate-800 pb-1 mb-1 last:border-0">
-                <span className="text-slate-400 whitespace-nowrap">{L.time.split(' ')[1]}</span>
-                <span className={`font-bold w-12 text-center ${L.level === 'ERROR' ? 'text-red-500' : L.level === 'WARN' ? 'text-amber-500' : 'text-blue-500'}`}>{L.level}</span>
+                <span className="text-slate-400 whitespace-nowrap">{logTime(L.time)}</span>
+                <span className={`font-bold w-12 text-center ${normLevel(L.level) === 'ERROR' ? 'text-red-500' : normLevel(L.level) === 'WARN' ? 'text-amber-500' : 'text-blue-500'}`}>{normLevel(L.level)}</span>
                 <span className="text-slate-700 dark:text-slate-300 break-all">{L.message}</span>
               </div>
             ))}
@@ -121,12 +122,15 @@ const WireGuardConfigPanel: React.FC<{
 // Extracted as a proper component to handle mutable form state correctly
 const SimpleConfigPanel: React.FC<{
   id: string; title: string; cfg: CoreConfigs; cores: VpnCore[]; saving: boolean;
-  fields: { label: string; key: string; type?: string; options?: string[]; value: any; readOnly?: boolean }[];
+  fields: { label: string; key: string; type?: string; options?: string[]; value: any; readOnly?: boolean; placeholder?: string }[];
   toggles: { label: string; key: string; value: boolean }[];
+  note?: React.ReactNode;
+  toggleCore: (id: string, name: string, running: boolean) => Promise<void>;
   save: (section: string, data: unknown, name: string) => Promise<void>;
   restart: (id: string, name: string) => Promise<void>;
   viewLogs: (id: string) => void;
-}> = ({ id, title, cfg, cores, saving, fields, toggles, save, restart, viewLogs }) => {
+}> = ({ id, title, cfg, cores, saving, fields, toggles, note, toggleCore, save, restart, viewLogs }) => {
+  const [busy, setBusy] = useState(false);
   const sectionKey = id as keyof CoreConfigs;
   const [formData, setFormData] = useState<Record<string, any>>({ ...(cfg[sectionKey] as any) });
 
@@ -144,13 +148,19 @@ const SimpleConfigPanel: React.FC<{
         <h3 className="font-bold text-slate-800 dark:text-slate-200 flex items-center gap-2"><Icon className="w-5 h-5 text-slate-500" /> {title}</h3>
         {core && <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${core.status === 'running' ? 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400' : 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400'}`}>{core.status === 'running' ? 'Online' : 'Offline'}</span>}
       </div>
+      {note && (
+        <div className="flex gap-2.5 p-3 rounded-xl bg-blue-50 dark:bg-blue-900/20 border border-blue-200/60 dark:border-blue-800/50 text-xs text-blue-800 dark:text-blue-300">
+          <Info size={16} className="shrink-0 mt-0.5" />
+          <div className="space-y-1">{note}</div>
+        </div>
+      )}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         {fields.map(f => (
           <div key={f.key}>
             <Label>{f.label}</Label>
             {f.options
               ? <Select value={formData[f.key] ?? f.value} options={f.options} onChange={e => setFormData(prev => ({ ...prev, [f.key]: e.target.value }))} />
-              : <Input type={f.type || 'text'} value={formData[f.key] ?? f.value} readOnly={f.readOnly} onChange={e => !f.readOnly && setFormData(prev => ({ ...prev, [f.key]: f.type === 'number' ? +e.target.value : e.target.value }))} />
+              : <Input type={f.type || 'text'} value={formData[f.key] ?? f.value ?? ''} placeholder={f.placeholder} readOnly={f.readOnly} onChange={e => !f.readOnly && setFormData(prev => ({ ...prev, [f.key]: f.type === 'number' ? +e.target.value : e.target.value }))} />
             }
           </div>
         ))}
@@ -163,8 +173,19 @@ const SimpleConfigPanel: React.FC<{
       <div className="border-t border-slate-200 dark:border-slate-700 pt-4 flex flex-wrap gap-3">
         <BtnPrimary disabled={saving} onClick={() => save(id, formData, title)}>Save Config</BtnPrimary>
         <BtnWarn onClick={() => restart(id, title.split(' ')[0])}>Restart Service</BtnWarn>
+        {core && (
+          <BtnSecondary
+            disabled={busy}
+            title={core.status === 'running' ? 'Stop the core (also disables it on boot)' : 'Start the core (also enables it on boot)'}
+            onClick={async () => { setBusy(true); try { await toggleCore(id, title.split(' ')[0], core.status === 'running'); } finally { setBusy(false); } }}
+          >
+            {busy ? <Loader2 size={14} className="mr-2 animate-spin" /> : core.status === 'running' ? <Square size={14} className="mr-2" /> : <Play size={14} className="mr-2" />}
+            {core.status === 'running' ? 'Stop' : 'Start'}
+          </BtnSecondary>
+        )}
         <BtnSecondary onClick={() => viewLogs(id)}><Activity size={14} className="mr-2" /> Logs</BtnSecondary>
       </div>
+      {core && <p className="text-[11px] text-slate-400 dark:text-slate-500 -mt-2">Starting a core also enables it on boot; stopping it disables it on boot.</p>}
     </Card>
   );
 };
@@ -230,6 +251,15 @@ const CoreConfigsPage: React.FC = () => {
     }
   };
 
+  const toggleCore = async (id: string, name: string, running: boolean) => {
+    try {
+      notify(running ? await stopCore(id) : await startCore(id), 'success');
+    } catch (e: any) {
+      notify(e.message || `Failed to ${running ? 'stop' : 'start'} ${name}`, 'error');
+    }
+    try { setCores(await getCores()); } catch { /* keep the old status */ }
+  };
+
   const renderCandyConnect = () => (
     <Card className="space-y-4">
       <div className="flex items-center justify-between"><h3 className="font-bold text-slate-800 dark:text-slate-200 flex items-center gap-2"><Candy className="w-5 h-5 text-orange-500" /> CandyConnect Config</h3><span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400">Active</span></div>
@@ -275,8 +305,8 @@ const CoreConfigsPage: React.FC = () => {
     <WireGuardConfigPanel cfg={cfg} saving={saving} save={save} restart={restart} viewLogs={setLogModalCore} />
   );
 
-  const renderSimpleConfig = (id: string, title: string, fields: { label: string; key: string; type?: string; options?: string[]; value: any; readOnly?: boolean }[], toggles: { label: string; key: string; value: boolean }[] = []) => (
-    <SimpleConfigPanel key={id} id={id} title={title} cfg={cfg} cores={cores} saving={saving} fields={fields} toggles={toggles} save={save} restart={restart} viewLogs={setLogModalCore} />
+  const renderSimpleConfig = (id: string, title: string, fields: { label: string; key: string; type?: string; options?: string[]; value: any; readOnly?: boolean; placeholder?: string }[], toggles: { label: string; key: string; value: boolean }[] = [], note?: React.ReactNode) => (
+    <SimpleConfigPanel key={id} id={id} title={title} cfg={cfg} cores={cores} saving={saving} fields={fields} toggles={toggles} note={note} toggleCore={toggleCore} save={save} restart={restart} viewLogs={setLogModalCore} />
   );
 
   const renderTab = () => {
@@ -324,22 +354,28 @@ const CoreConfigsPage: React.FC = () => {
         { label: 'Public Key', key: 'public_key', value: cfg.dnstt.public_key, readOnly: true },
       ]);
       case 'slipstream': return renderSimpleConfig('slipstream', 'SlipStream', [
-        { label: 'Port', key: 'port', type: 'number', value: cfg.slipstream.port },
-        { label: 'Method', key: 'method', options: ['aes-256-cfb', 'aes-256-gcm', 'chacha20-ietf-poly1305'], value: cfg.slipstream.method },
-        { label: 'Obfuscation', key: 'obfs', options: ['tls', 'http', 'none'], value: cfg.slipstream.obfs },
-        { label: 'Obfs Host', key: 'obfs_host', value: cfg.slipstream.obfs_host },
-        { label: 'Timeout (s)', key: 'timeout', type: 'number', value: cfg.slipstream.timeout },
-      ], [{ label: 'TCP Fast Open', key: 'fast_open', value: cfg.slipstream.fast_open }, { label: 'No Delay', key: 'no_delay', value: cfg.slipstream.no_delay }, { label: 'UDP Relay', key: 'udp_relay', value: cfg.slipstream.udp_relay }]);
+        { label: 'Tunnel Domain (NS-delegated)', key: 'domain', value: cfg.slipstream.domain, placeholder: 's.example.com' },
+        { label: 'DNS Listen Port', key: 'dns_listen_port', type: 'number', value: cfg.slipstream.dns_listen_port ?? 5301 },
+        { label: 'Congestion Control', key: 'congestion_control', options: ['bbr', 'dcubic'], value: cfg.slipstream.congestion_control || 'bbr' },
+      ], [], <>
+        <p>SlipStream tunnels QUIC over DNS. It needs two DNS records: <code className="font-mono px-1 rounded bg-blue-100/70 dark:bg-blue-900/40">NS s.example.com &rarr; ns.example.com</code> and <code className="font-mono px-1 rounded bg-blue-100/70 dark:bg-blue-900/40">A ns.example.com &rarr; server IP</code>.</p>
+        <p>It shares UDP port 53 with DNSTT, so each of them must use a different domain. Requires Ubuntu 22.04+ / Debian 12+.</p>
+      </>);
       case 'trusttunnel': return renderSimpleConfig('trusttunnel', 'TrustTunnel', [
-        { label: 'Port', key: 'port', type: 'number', value: cfg.trusttunnel.port },
-        { label: 'Protocol', key: 'protocol', options: ['https', 'http', 'quic'], value: cfg.trusttunnel.protocol },
-        { label: 'Camouflage', key: 'camouflage', options: ['cloudflare', 'amazon', 'google', 'none'], value: cfg.trusttunnel.camouflage },
-        { label: 'Fragment Size', key: 'fragment_size', type: 'number', value: cfg.trusttunnel.fragment_size },
-        { label: 'Fragment Interval (ms)', key: 'fragment_interval', type: 'number', value: cfg.trusttunnel.fragment_interval },
-        { label: 'SNI', key: 'sni', value: cfg.trusttunnel.sni },
-        { label: 'ALPN', key: 'alpn', value: cfg.trusttunnel.alpn },
-        { label: 'Timeout (s)', key: 'timeout', type: 'number', value: cfg.trusttunnel.timeout },
-      ], [{ label: 'Padding', key: 'padding', value: cfg.trusttunnel.padding }]);
+        { label: 'Port', key: 'port', type: 'number', value: cfg.trusttunnel.port ?? 9443 },
+        { label: 'Hostname (TLS SNI / cert name)', key: 'hostname', value: cfg.trusttunnel.hostname, placeholder: 'vpn.example.com' },
+        { label: 'Certificate Path', key: 'cert_path', value: cfg.trusttunnel.cert_path, placeholder: 'empty = auto self-signed' },
+        { label: 'Key Path', key: 'key_path', value: cfg.trusttunnel.key_path, placeholder: 'empty = auto self-signed' },
+      ], [
+        { label: 'HTTP/1.1', key: 'enable_http1', value: cfg.trusttunnel.enable_http1 ?? true },
+        { label: 'HTTP/2', key: 'enable_http2', value: cfg.trusttunnel.enable_http2 ?? true },
+        { label: 'QUIC (HTTP/3)', key: 'enable_quic', value: cfg.trusttunnel.enable_quic ?? true },
+        { label: 'IPv6 Available', key: 'ipv6_available', value: cfg.trusttunnel.ipv6_available ?? true },
+        { label: 'Allow Private Network Connections', key: 'allow_private_network_connections', value: cfg.trusttunnel.allow_private_network_connections ?? false },
+      ], <>
+        <p>Clients connect with the <code className="font-mono px-1 rounded bg-blue-100/70 dark:bg-blue-900/40">tt://</code> link using the TrustTunnel apps.</p>
+        <p>Leave both certificate and key paths empty to use an automatically generated self-signed certificate.</p>
+      </>);
       default: return null;
     }
   };

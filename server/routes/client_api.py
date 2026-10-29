@@ -13,6 +13,7 @@ import auth
 import uuid
 from system_info import get_public_ip
 from protocols.manager import protocol_manager
+import tunnels as tunnels_mod
 from config import SUPPORTED_PROTOCOLS
 
 router = APIRouter(tags=["client"])
@@ -28,6 +29,9 @@ async def client_login(req: ClientLoginRequest):
     client = await db.verify_client(req.username, req.password)
     if not client:
         raise HTTPException(status_code=401, detail="Invalid username, password or account disabled")
+    reason = db.client_limit_reason(client)
+    if reason:
+        raise HTTPException(status_code=403, detail=reason)
     
     token = auth.create_client_token(req.username, client["id"])
     
@@ -51,6 +55,77 @@ async def client_login(req: ClientLoginRequest):
         },
         "account": _format_client(client)
     }
+
+
+async def _ensure_protocol_data(client: dict, pid: str, required_key: str) -> dict:
+    """Create the client's backend data on demand (e.g. the client was created
+    before the protocol was installed, so no keys were generated then)."""
+    pdata_all = client.get("protocol_data") or {}
+    pdata = pdata_all.get(pid) or {}
+    if pdata.get(required_key):
+        return pdata
+    result = await protocol_manager.add_client_to_protocols(
+        client["username"], client, {pid: True}, existing_data=pdata_all)
+    if result.get(pid, {}).get(required_key):
+        pdata_all[pid] = result[pid]
+        await db.update_client(client["id"], {"protocol_data": pdata_all}, log=False)
+        client["protocol_data"] = pdata_all
+        return result[pid]
+    return pdata
+
+
+def _v2ray_share_link(protocol: str, inbound: dict, stream: dict, client_uuid: str,
+                      password: str, server_ip: str, port, name: str) -> str:
+    """Build a standard share link (importable in v2rayN / v2rayNG / Hiddify / sing-box)."""
+    import base64, json
+    from urllib.parse import urlencode, quote
+
+    network = stream.get("network", "tcp")
+    security = stream.get("security", "none")
+    params = {"type": network, "security": security}
+    path = host = ""
+    if network == "ws":
+        ws = stream.get("wsSettings", {}) or {}
+        path = ws.get("path", "/")
+        host = (ws.get("headers") or {}).get("Host", "") or ws.get("host", "")
+    elif network == "grpc":
+        params["serviceName"] = (stream.get("grpcSettings", {}) or {}).get("serviceName", "")
+    elif network in ("httpupgrade", "splithttp", "xhttp"):
+        hs = stream.get(f"{network}Settings", {}) or {}
+        path, host = hs.get("path", "/"), hs.get("host", "")
+    if path:
+        params["path"] = path
+    if host:
+        params["host"] = host
+    if security == "tls":
+        tls = stream.get("tlsSettings", {}) or {}
+        if tls.get("serverName"):
+            params["sni"] = tls["serverName"]
+        params["fp"] = tls.get("fingerprint", "chrome")
+    elif security == "reality":
+        from protocols.v2ray import V2RayProtocol
+        rs = V2RayProtocol._client_stream_settings(stream).get("realitySettings", {})
+        params.update({"sni": rs.get("serverName", ""), "pbk": rs.get("publicKey", ""),
+                       "sid": rs.get("shortId", ""), "fp": rs.get("fingerprint", "chrome")})
+
+    if protocol == "vmess":
+        obj = {"v": "2", "ps": name, "add": server_ip, "port": str(port), "id": client_uuid,
+               "aid": "0", "scy": "auto", "net": network, "type": "none", "host": host,
+               "path": path, "tls": "tls" if security == "tls" else "", "sni": params.get("sni", "")}
+        return "vmess://" + base64.b64encode(json.dumps(obj).encode()).decode()
+    if protocol == "shadowsocks":
+        ss = inbound.get("settings", {}) or {}
+        userinfo = base64.urlsafe_b64encode(
+            f"{ss.get('method', 'aes-256-gcm')}:{ss.get('password', '')}".encode()).decode().rstrip("=")
+        return f"ss://{userinfo}@{server_ip}:{port}#{quote(name)}"
+    if protocol == "trojan":
+        return f"trojan://{quote(password, safe='')}@{server_ip}:{port}?{urlencode(params)}#{quote(name)}"
+    # vless
+    params["encryption"] = "none"
+    for c in (inbound.get("settings", {}) or {}).get("clients", []) or []:
+        if c.get("id") == client_uuid and c.get("flow"):
+            params["flow"] = c["flow"]
+    return f"vless://{client_uuid}@{server_ip}:{port}?{urlencode(params)}#{quote(name)}"
 
 
 def _format_client(client: dict) -> dict:
@@ -171,19 +246,18 @@ async def get_all_configs(payload=Depends(auth.require_client)):
                 for inbound in inbounds:
                     tag = inbound.get("tag", "v2ray-default")
                     protocol = inbound.get("protocol", "vless")
+                    if protocol not in ("vless", "vmess", "trojan", "shadowsocks"):
+                        continue  # api / dokodemo-door / socks inbounds are not client configs
                     port = inbound.get("port", 443)
-                    stream = inbound.get("streamSettings", {})
+                    stream = inbound.get("streamSettings", {}) or {}
+                    config_link = _v2ray_share_link(
+                        protocol, inbound, stream, client_uuid,
+                        pdata.get("password") or client.get("password", ""),
+                        server_ip, port, f"CC-{protocol.upper()}-{stream.get('network', 'tcp')}",
+                    )
                     network = stream.get("network", "tcp")
                     security = stream.get("security", "none")
-                    
-                    link_params = f"type={network}&security={security}"
-                    if security == "tls":
-                        tls_settings = stream.get("tlsSettings", {})
-                        sni = tls_settings.get("serverName", "")
-                        if sni: link_params += f"&sni={sni}"
-                    
-                    config_link = f"{protocol}://{client_uuid}@{server_ip}:{port}?{link_params}#CC-{protocol.upper()}-{network}"
-                    
+
                     network_display = {
                         "ws": "WebSocket", "websocket": "WebSocket",
                         "grpc": "gRPC", "tcp": "TCP", "kcp": "mKCP",
@@ -203,6 +277,27 @@ async def get_all_configs(payload=Depends(auth.require_client)):
                         "extraData": {"uuid": client_uuid, "protocol": protocol}
                     })
                     added_v2ray = True
+
+                    # Same inbound reached through each relay tunnel that forwards its port
+                    for relay in await tunnels_mod.relays_for_port(port):
+                        base_id = tag if "-" in tag else f"v2ray-{tag}"
+                        configs.append({
+                            "id": f"{base_id}~relay-{relay['id']}",
+                            "name": f"V2Ray {protocol.upper()} + {network_display} (via {relay['name']})",
+                            "protocol": "V2Ray",
+                            "transport": network,
+                            "security": security if security != "none" else "plain",
+                            "address": relay["ip"],
+                            "port": relay["listen_port"],
+                            "configLink": _v2ray_share_link(
+                                protocol, inbound, stream, client_uuid,
+                                pdata.get("password") or client.get("password", ""),
+                                relay["ip"], relay["listen_port"],
+                                f"CC-{protocol.upper()}-{network}-{relay['name']}",
+                            ),
+                            "icon": "⚡",
+                            "extraData": {"uuid": client_uuid, "protocol": protocol, "relay": relay["name"]},
+                        })
             except Exception as e:
                 logger.error(f"Failed to build V2Ray personalised link: {e}")
 
@@ -224,7 +319,7 @@ async def get_all_configs(payload=Depends(auth.require_client)):
     if is_enabled("wireguard"):
         wg_cfg_meta = await db.get_core_config("wireguard")
         port = int((wg_cfg_meta or {}).get("listen_port", 51820))
-        pdata = protocol_data.get("wireguard", {})
+        pdata = await _ensure_protocol_data(client, "wireguard", "private_key")
         privkey = pdata.get("private_key", "")
         
         # Link including private key if available
@@ -320,7 +415,7 @@ async def get_all_configs(payload=Depends(auth.require_client)):
             "port": port,
             "configLink": f"l2tp://{server_ip}:{port}",
             "icon": "📡",
-            "extraData": {"username": client["username"]}
+            "extraData": {"username": client["username"], "psk": (l2tp_cfg or {}).get("psk", "")}
         })
 
     # 6. DNSTT
@@ -349,36 +444,49 @@ async def get_all_configs(payload=Depends(auth.require_client)):
             }
         })
 
-    # 7. SlipStream
+    # 7. SlipStream (DNS tunnel; SSH account shared with DNSTT)
     if is_enabled("slipstream"):
-        slip_cfg = await db.get_core_config("slipstream")
-        port = int((slip_cfg or {}).get("port", 8388))
+        slip_cfg = await db.get_core_config("slipstream") or {}
+        pdata = await _ensure_protocol_data(client, "slipstream", "ssh_username")
+        domain = slip_cfg.get("domain", "")
         configs.append({
             "id": "slipstream-1",
-            "name": "SlipStream",
+            "name": "SlipStream DNS Tunnel",
             "protocol": "SlipStream",
-            "transport": "tcp",
-            "security": "tls",
+            "transport": "dns",
+            "security": "quic",
             "address": server_ip,
-            "port": port,
-            "configLink": f"slipstream://{server_ip}:{port}",
+            "port": 53,
+            "configLink": f"slipstream://{pdata.get('ssh_username', '')}@{domain}",
             "icon": "💨",
+            "extraData": {
+                "domain": domain,
+                "congestion_control": slip_cfg.get("congestion_control", "bbr"),
+                "tunnel_mode": "ssh",
+                "ssh_username": pdata.get("ssh_username", ""),
+                "ssh_password": pdata.get("ssh_password", ""),
+            },
         })
 
-    # 8. TrustTunnel
+    # 8. TrustTunnel (tt:// link is exported by the endpoint itself)
     if is_enabled("trusttunnel"):
-        tt_cfg = await db.get_core_config("trusttunnel")
-        port = int((tt_cfg or {}).get("port", 9443))
+        tt_mgr = protocol_manager.get_protocol("trusttunnel")
+        tt = await tt_mgr.get_client_config(client["username"], server_ip, {"password": client.get("password", "")})
         configs.append({
             "id": "trusttunnel-1",
             "name": "TrustTunnel",
             "protocol": "TrustTunnel",
-            "transport": "tcp",
+            "transport": "https",
             "security": "tls",
             "address": server_ip,
-            "port": port,
-            "configLink": f"trusttunnel://{server_ip}:{port}",
+            "port": tt["port"],
+            "configLink": tt.get("link") or f"tt://{server_ip}:{tt['port']}",
             "icon": "🏰",
+            "extraData": {
+                "hostname": tt.get("hostname", ""),
+                "username": client["username"],
+                "endpoint_config": tt.get("endpoint_config", ""),
+            },
         })
 
     logger.info(f"Returning {len(configs)} personalised configs for client {client_id}")
@@ -407,8 +515,19 @@ async def get_protocol_config(protocol: str, payload=Depends(auth.require_client
     
     # 1. Identify core protocol
     # If protocol is "vless-tcp", root is "vless", which maps to "v2ray"
+    # "<config id>~relay-<tunnel id>": same config, but connect through a relay server
+    relay = None
+    if "~relay-" in protocol:
+        protocol, relay_id = protocol.split("~relay-", 1)
+        relay = await db.get_tunnel(relay_id)
+        if not relay or relay.get("status") != "installed":
+            raise HTTPException(status_code=404, detail="Relay tunnel not found or not installed")
+
     proto_root = protocol.split("-")[0].lower()
     core_protocol = proto_map.get(proto_root, proto_root)
+    if protocol_manager.get_protocol(core_protocol) is None:
+        # Custom V2Ray inbound tags (e.g. "inbound-443") don't start with a protocol name
+        core_protocol = "v2ray"
     
     # 2. Check if admin override (Admins have access to all)
     admin_user = await db.get_admin_username()
@@ -426,8 +545,25 @@ async def get_protocol_config(protocol: str, payload=Depends(auth.require_client
     if not p_mgr:
         raise HTTPException(status_code=404, detail=f"Protocol manager for {core_protocol} not found")
         
-    pdata = (client.get("protocol_data", {}) or {}).get(core_protocol, {})
+    if core_protocol == "wireguard":
+        pdata = await _ensure_protocol_data(client, "wireguard", "private_key")
+    elif core_protocol == "slipstream":
+        pdata = await _ensure_protocol_data(client, "slipstream", "ssh_username")
+    elif core_protocol == "trusttunnel":
+        pdata = {"password": client.get("password", "")}
+    else:
+        pdata = (client.get("protocol_data", {}) or {}).get(core_protocol, {})
     config = await p_mgr.get_client_config(client["username"], server_ip, pdata, config_id=protocol)
+    if relay and config and core_protocol == "v2ray":
+        # Point the outbound at the relay's forwarded port
+        for ob in config.get("config_json", {}).get("outbounds", []):
+            for key in ("vnext", "servers"):
+                for srv in (ob.get("settings") or {}).get(key, []) or []:
+                    matches = await tunnels_mod.relays_for_port(srv.get("port"))
+                    hit = next((m for m in matches if m["id"] == relay["id"]), None)
+                    if hit:
+                        srv["address"], srv["port"] = relay["ip"], hit["listen_port"]
+        config["server"] = relay["ip"]
     
     if not config:
         raise HTTPException(status_code=404, detail=f"No matching config found for '{protocol}'")
@@ -572,50 +708,22 @@ async def ping_config(config_id: str, payload=Depends(auth.require_client)):
     }
     
     resolved_proto = proto_map.get(protocol_id.lower(), protocol_id.lower())
-    
+    if protocol_manager.get_protocol(resolved_proto) is None:
+        resolved_proto = "v2ray"  # custom V2Ray inbound tags
+
     core_status = await db.get_core_status(resolved_proto)
     is_running = core_status.get("status") == "running"
-    
-    # Calculate processing delay as base latency
-    elapsed_ms = (time.monotonic() - start) * 1000
-    
-    if is_running:
-        # Add a realistic mock network latency (server processing + simulated RTT)
-        import random
-        base_latency = elapsed_ms + random.uniform(15, 80)  # base processing
-        # Different protocols have different typical latencies
-        protocol_overhead = {
-            "v2ray": random.uniform(10, 60),
-            "wireguard": random.uniform(5, 30),
-            "openvpn": random.uniform(20, 80),
-            "ikev2": random.uniform(15, 50),
-            "l2tp": random.uniform(25, 90),
-            "dnstt": random.uniform(50, 200),
-            "slipstream": random.uniform(15, 60),
-            "trusttunnel": random.uniform(20, 70),
+    # Latency is measured by the client (round trip to the server); the server
+    # only reports whether the protocol behind this config is up.
+    return {
+        "success": True,
+        "data": {
+            "config_id": config_id,
+            "latency": 0,
+            "reachable": is_running,
+            "protocol_status": "running" if is_running else "stopped",
         }
-        overhead = protocol_overhead.get(resolved_proto, random.uniform(20, 60))
-        latency = int(base_latency + overhead)
-        
-        return {
-            "success": True,
-            "data": {
-                "config_id": config_id,
-                "latency": 0, # Client will measure real network RTT
-                "reachable": True,
-                "protocol_status": "running",
-            }
-        }
-    else:
-        return {
-            "success": True,
-            "data": {
-                "config_id": config_id,
-                "latency": 0,
-                "reachable": False,
-                "protocol_status": "stopped",
-            }
-        }
+    }
 
 
 @router.post("/ping-all")
@@ -640,24 +748,14 @@ async def ping_all_configs(payload=Depends(auth.require_client)):
     core_map = {str(c["id"]).lower(): c for c in cores}
     
     results = []
-    import random
-    
-    protocol_overhead = {
-        "v2ray": (10, 60), "wireguard": (5, 30), "openvpn": (20, 80),
-        "ikev2": (15, 50), "l2tp": (25, 90), "dnstt": (50, 200),
-        "slipstream": (15, 60), "trusttunnel": (20, 70),
-    }
-    
     for proto_id, enabled in client_protocols.items():
         if not enabled:
             continue
-        core_info = core_map.get(proto_id, {})
-        is_running = core_info.get("status") == "running"
-        
+        is_running = core_map.get(proto_id, {}).get("status") == "running"
         results.append({
             "config_id": f"{proto_id}-1",
             "protocol": proto_id,
-            "latency": 0 if is_running else 0,
+            "latency": 0,  # measured client-side
             "reachable": is_running,
         })
     
