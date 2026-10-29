@@ -1,6 +1,7 @@
 """
 CandyConnect - Base VPN Protocol Manager
 """
+from __future__ import annotations
 import asyncio, os, signal, time, json, logging
 from typing import Optional
 from database import get_core_status, set_core_status, add_log, get_core_config

@@ -1,6 +1,7 @@
 """
 CandyConnect - WireGuard Protocol Manager
 """
+from __future__ import annotations
 import asyncio, os, json, base64, time, ipaddress
 from protocols.base import BaseProtocol
 from database import get_core_config, get_core_status, set_core_status, add_log

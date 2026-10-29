@@ -2,6 +2,7 @@
 CandyConnect Server - Redis Database Layer
 All data is stored in Redis with JSON serialization.
 """
+from __future__ import annotations
 import json, time, uuid, hashlib, logging, secrets
 from typing import Optional
 import bcrypt

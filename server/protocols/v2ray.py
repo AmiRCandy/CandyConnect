@@ -253,6 +253,13 @@ class V2RayProtocol(BaseProtocol):
         outbounds = []
         try:
             config_obj = json.loads(config.get("config_json", "{}"))
+            # Prefer an exact tag match ("vless-tcp-tls" must not resolve to "vless-tcp")
+            if config_id:
+                wanted = {config_id.lower(), config_id.lower()[6:] if config_id.lower().startswith("v2ray-") else config_id.lower()}
+                exact = [ib for ib in config_obj.get("inbounds", [])
+                         if str(ib.get("tag", "")).lower() in wanted]
+                if exact:
+                    config_obj["inbounds"] = exact
             for inbound in config_obj.get("inbounds", []):
                 proto = inbound.get("protocol", "")
                 if proto not in ("vless", "vmess", "trojan", "shadowsocks"):
@@ -307,7 +314,8 @@ class V2RayProtocol(BaseProtocol):
                         }]
                     },
                     "streamSettings": self._client_stream_settings(stream),
-                    "tag": "proxy"
+                    "tag": "proxy",
+                    "_inbound_tag": inbound_tag,
                 }
 
                 if proto == "trojan":
@@ -387,7 +395,7 @@ class V2RayProtocol(BaseProtocol):
                 
                 stream = outbound.get("streamSettings", {})
                 sub_protocols.append({
-                    "tag": outbound.get("tag", f"{proto}-{port}"),
+                    "tag": outbound.pop("_inbound_tag", None) or f"{proto}-{port}",
                     "protocol": proto,
                     "transport": stream.get("network", "tcp"),
                     "security": stream.get("security", "none"),

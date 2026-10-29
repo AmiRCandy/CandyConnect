@@ -26,7 +26,7 @@ const LogsPage: React.FC<LogsPageProps> = ({ onBack }) => {
     const loadLogs = async () => {
       try {
         const backendLogs = await LoadLogs();
-        setLogs(backendLogs);
+        setLogs(backendLogs as LogEntry[]);
       } catch (error) {
         console.error('Failed to load logs:', error);
       }

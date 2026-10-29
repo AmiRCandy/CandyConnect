@@ -11,26 +11,58 @@ use tauri::{
 
 #[tauri::command]
 async fn generate_sing_box_config(app: tauri::AppHandle, server_address: String) -> Result<String, String> {
-    use crate::sing_box_helper::{Config, RouteRule};
-    
-    let app_data_dir = app.path().app_data_dir().expect("Failed to get app data directory");
-    let settings_path = app_data_dir.join("settings.json");
-    
-    if !settings_path.exists() {
-        return Err("Settings file not found".to_string());
-    }
+    let app_data_dir = app.path().app_data_dir().map_err(|e| format!("Failed to get app data directory: {}", e))?;
+    build_tun_socks_config(&app_data_dir, &server_address, None)
+}
 
-    let settings_content = fs::read_to_string(settings_path).map_err(|e| e.to_string())?;
-    let settings: serde_json::Value = serde_json::from_str(&settings_content).map_err(|e| e.to_string())?;
+/// Read settings.json from the app data dir (returns `Null` when missing/invalid so callers fall back to defaults).
+fn read_settings(app_data_dir: &std::path::Path) -> serde_json::Value {
+    fs::read_to_string(app_data_dir.join("settings.json"))
+        .ok()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// Local proxy listen address configured by the user (ProxyPage), defaulting to 127.0.0.1:10808.
+fn local_proxy_from_settings(settings: &serde_json::Value) -> (String, u16) {
+    let host = settings["proxyHost"].as_str()
+        .or_else(|| settings["proxyAddress"].as_str())
+        .filter(|h| !h.trim().is_empty())
+        .unwrap_or("127.0.0.1")
+        .to_string();
+    let port = settings["proxyPort"].as_u64()
+        .filter(|p| *p > 0 && *p <= 65535)
+        .unwrap_or(10808) as u16;
+    (host, port)
+}
+
+/// Build a sing-box TUN config whose default outbound is a local SOCKS proxy.
+/// `proxy_override` forces the SOCKS target (e.g. xray's or SSH's local SOCKS port);
+/// otherwise proxyHost/proxyPort from settings.json are used.
+fn build_tun_socks_config(
+    app_data_dir: &std::path::Path,
+    server_address: &str,
+    proxy_override: Option<(&str, u16)>,
+) -> Result<String, String> {
+    use crate::sing_box_helper::{Config, RouteRule};
+
+    let settings = read_settings(app_data_dir);
 
     // Extract settings with defaults
-    let primary_dns = settings["primaryDns"].as_str().unwrap_or("8.8.8.8");
-    let secondary_dns = settings["secondaryDns"].as_str().unwrap_or("1.1.1.1");
-    let inet4 = settings["tunInet4CIDR"].as_str().unwrap_or("172.19.0.1/30");
-    let inet6 = settings["tunInet6CIDR"].as_str().unwrap_or("fdfe:dcba:9876::1/126");
-    let mtu = settings["mtu"].as_u64().unwrap_or(9000) as u32;
-    let proxy_host = settings["proxyHost"].as_str().unwrap_or("127.0.0.1");
-    let proxy_port = settings["proxyPort"].as_u64().unwrap_or(10808) as u16;
+    let primary_dns = settings["primaryDns"].as_str().filter(|s| !s.is_empty()).unwrap_or("8.8.8.8");
+    let secondary_dns = settings["secondaryDns"].as_str().filter(|s| !s.is_empty()).unwrap_or("1.1.1.1");
+    let inet4 = settings["tunInet4CIDR"].as_str().filter(|s| !s.is_empty()).unwrap_or("172.19.0.1/30");
+    let inet6 = settings["tunInet6CIDR"].as_str().filter(|s| !s.is_empty()).unwrap_or("fdfe:dcba:9876::1/126");
+    let mtu = settings["mtu"].as_u64().filter(|m| *m >= 576).unwrap_or(9000) as u32;
+    let (settings_host, settings_port) = local_proxy_from_settings(&settings);
+    let (mut proxy_host, proxy_port) = match proxy_override {
+        Some((h, p)) => (h.to_string(), p),
+        None => (settings_host, settings_port),
+    };
+    // A wildcard listen address is not a valid dial target
+    if proxy_host == "0.0.0.0" || proxy_host == "::" || proxy_host.is_empty() {
+        proxy_host = "127.0.0.1".to_string();
+    }
 
     // Collect custom domains
     let mut direct_domains = Vec::new();
@@ -53,7 +85,7 @@ async fn generate_sing_box_config(app: tauri::AppHandle, server_address: String)
 
     // Initialize config using helper
     let mut config = Config::mode_tun_socks(
-        proxy_host,
+        &proxy_host,
         proxy_port,
         primary_dns,
         secondary_dns,
@@ -64,25 +96,198 @@ async fn generate_sing_box_config(app: tauri::AppHandle, server_address: String)
         block_domains,
     );
 
-    // Add server bypass rule (IP or Domain)
-    if server_address.parse::<std::net::IpAddr>().is_ok() {
+    // Add server bypass rule (IP or Domain) so the tunnel's own traffic doesn't loop through TUN
+    if let Ok(ip) = server_address.parse::<std::net::IpAddr>() {
+        let prefix = if ip.is_ipv4() { 32 } else { 128 };
         config.route.rules.push(RouteRule {
             protocol: None,
             outbound: Some("direct-out".into()),
-            ip_cidr: Some(vec![format!("{}/32", server_address)]),
+            ip_cidr: Some(vec![format!("{}/{}", server_address, prefix)]),
             domain: None,
         });
-    } else {
+    } else if !server_address.is_empty() {
         config.route.rules.push(RouteRule {
             protocol: None,
             outbound: Some("direct-out".into()),
             ip_cidr: None,
-            domain: Some(vec![server_address]),
+            domain: Some(vec![server_address.to_string()]),
         });
     }
 
     // Serialize
     serde_json::to_string_pretty(&config).map_err(|e| e.to_string())
+}
+
+/// Locate a helper binary (xray, sing-box, dnstt-client, ...).
+/// Search order: bundled resource dir, `<resource_dir>/resources`, next to the app executable
+/// (same sub-path as bundled, e.g. `xray/xray.exe`, then the bare file name),
+/// then the system PATH. Returns a clear error when nothing is found (e.g. on Linux/macOS,
+/// where only the Windows .exe builds are bundled).
+fn resolve_binary(resource_dir: &std::path::Path, rel_path: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::{Path, PathBuf};
+
+    let bundled = [resource_dir.join(rel_path), resource_dir.join("resources").join(rel_path)];
+    let file_name: PathBuf = Path::new(rel_path)
+        .file_name()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(rel_path));
+
+    let mut candidates: Vec<PathBuf> = bundled.to_vec();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            // Release zip layout: <exe dir>/xray/xray(.exe), <exe dir>/sing-box/sing-box(.exe),
+            // <exe dir>/openvpn/openvpn.exe, <exe dir>/dnstt-client(.exe)
+            candidates.push(dir.join(rel_path));
+            candidates.push(dir.join("resources").join(rel_path));
+            candidates.push(dir.join(&file_name));
+        }
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            candidates.push(dir.join(&file_name));
+        }
+    }
+
+    for c in candidates {
+        if c.is_file() {
+            // Bundled resources may lose their executable bit on Unix — try to restore it
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = fs::metadata(&c) {
+                    let mode = meta.permissions().mode();
+                    if mode & 0o111 == 0 {
+                        let _ = fs::set_permissions(&c, fs::Permissions::from_mode(mode | 0o755));
+                    }
+                }
+            }
+            return Ok(c);
+        }
+    }
+
+    Err(format!(
+        "'{}' was not found (looked in {} and on the system PATH). Install it or place the binary there.",
+        file_name.display(),
+        bundled[0].display()
+    ))
+}
+
+/// Environment flags needed by the bundled sing-box (1.12.x) to accept the legacy
+/// config fields generated by sing_box_helper (special outbounds, tun inet4_address,
+/// inbound sniff fields, wireguard outbound). Without them sing-box 1.12 exits with a fatal error.
+fn apply_sing_box_env(cmd: &mut std::process::Command) {
+    cmd.env("ENABLE_DEPRECATED_SPECIAL_OUTBOUNDS", "true")
+        .env("ENABLE_DEPRECATED_TUN_ADDRESS_X", "true")
+        .env("ENABLE_DEPRECATED_WIREGUARD_OUTBOUND", "true")
+        .env("ENABLE_DEPRECATED_INBOUND_OPTIONS", "true")
+        .env("ENABLE_DEPRECATED_DESTINATION_OVERRIDE_FIELDS", "true");
+}
+
+/// Adapt the server-provided Xray client config to this machine:
+/// - bind the SOCKS inbound to the user's local proxy address/port (and HTTP on port+1)
+/// - drop geosite:/geoip: routing entries when geosite.dat/geoip.dat are not available
+///   (xray refuses to start if a referenced .dat file is missing)
+/// Returns the (host, port) of the SOCKS inbound.
+fn prepare_xray_config(
+    cfg: &mut serde_json::Value,
+    socks_host: &str,
+    socks_port: u16,
+    have_geo_files: bool,
+) -> (String, u16) {
+    use serde_json::{json, Value};
+
+    let http_port = if socks_port < 65535 { socks_port + 1 } else { socks_port - 1 };
+
+    if !cfg["inbounds"].is_array() {
+        cfg["inbounds"] = json!([]);
+    }
+    let mut has_socks = false;
+    if let Some(inbounds) = cfg["inbounds"].as_array_mut() {
+        for inbound in inbounds.iter_mut() {
+            match inbound["protocol"].as_str() {
+                Some("socks") if !has_socks => {
+                    inbound["listen"] = Value::String(socks_host.to_string());
+                    inbound["port"] = json!(socks_port);
+                    has_socks = true;
+                }
+                Some("http") => {
+                    inbound["listen"] = Value::String(socks_host.to_string());
+                    inbound["port"] = json!(http_port);
+                }
+                _ => {}
+            }
+        }
+        if !has_socks {
+            inbounds.push(json!({
+                "port": socks_port,
+                "listen": socks_host,
+                "protocol": "socks",
+                "settings": {"auth": "noauth", "udp": true}
+            }));
+        }
+    }
+
+    if !have_geo_files {
+        const PRIVATE_CIDRS: [&str; 9] = [
+            "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16",
+            "100.64.0.0/10", "fc00::/7", "fe80::/10", "::1/128",
+        ];
+        if let Some(rules) = cfg["routing"]["rules"].as_array_mut() {
+            rules.retain_mut(|rule| {
+                let had_matcher = rule.get("domain").is_some() || rule.get("ip").is_some();
+                if let Some(domains) = rule.get_mut("domain").and_then(|d| d.as_array_mut()) {
+                    domains.retain(|d| {
+                        let s = d.as_str().unwrap_or("");
+                        !s.starts_with("geosite:") && !s.starts_with("ext:")
+                    });
+                }
+                if let Some(ips) = rule.get_mut("ip").and_then(|d| d.as_array_mut()) {
+                    let mut out: Vec<Value> = Vec::new();
+                    for ip in ips.iter() {
+                        let s = ip.as_str().unwrap_or("");
+                        if s == "geoip:private" {
+                            out.extend(PRIVATE_CIDRS.iter().map(|c| Value::String(c.to_string())));
+                        } else if !s.starts_with("geoip:") && !s.starts_with("ext:") {
+                            out.push(ip.clone());
+                        }
+                    }
+                    *ips = out;
+                }
+                if let Some(obj) = rule.as_object_mut() {
+                    for key in ["domain", "ip"] {
+                        if obj.get(key).and_then(|v| v.as_array()).map_or(false, |a| a.is_empty()) {
+                            obj.remove(key);
+                        }
+                    }
+                    // A rule that lost all of its conditions would match *everything* — drop it.
+                    const MATCHERS: [&str; 10] = [
+                        "domain", "ip", "port", "sourcePort", "network", "source", "user",
+                        "inboundTag", "protocol", "attrs",
+                    ];
+                    if had_matcher && !MATCHERS.iter().any(|k| obj.contains_key(*k)) {
+                        return false;
+                    }
+                }
+                true
+            });
+        }
+    }
+
+    (socks_host.to_string(), socks_port)
+}
+
+/// Extract the remote server address from the first proxy outbound of an Xray config
+/// (vnext for vless/vmess, servers for trojan/shadowsocks).
+fn xray_server_address(cfg: &serde_json::Value) -> Option<String> {
+    let outbounds = cfg["outbounds"].as_array()?;
+    let proxy = outbounds
+        .iter()
+        .find(|o| o["tag"].as_str() == Some("proxy"))
+        .or_else(|| outbounds.iter().find(|o| !matches!(o["protocol"].as_str(), Some("freedom") | Some("blackhole") | Some("dns"))))?;
+    let settings = &proxy["settings"];
+    settings["vnext"][0]["address"].as_str()
+        .or_else(|| settings["servers"][0]["address"].as_str())
+        .map(|s| s.to_string())
 }
 
 /// Kill a process by PID. Used to tear down the companion process in TUN mode
@@ -114,19 +319,53 @@ async fn start_vpn(
     use std::io::{BufRead, BufReader};
     use std::thread;
 
-    let app_data_dir = app.path().app_data_dir().expect("Failed to get app dir");
-    let resource_dir = app.path().resource_dir().unwrap_or_else(|_| std::env::current_dir().unwrap());
+    let app_data_dir = app.path().app_data_dir().map_err(|e| format!("Failed to get app dir: {}", e))?;
+    let resource_dir = app.path().resource_dir().unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
     let logs_path = app_data_dir.join("candy.logs");
 
-    // 1. Validate and save Xray config
+    // 1. Resolve engine binaries (bundled .exe on Windows, bundled or system PATH elsewhere)
+    let xray_bin = resolve_binary(&resource_dir, if cfg!(target_os = "windows") { "xray/xray.exe" } else { "xray/xray" })
+        .map_err(|e| {
+            let msg = format!("Xray engine not available: {}", e);
+            let _ = append_log(&logs_path, "error", &msg);
+            msg
+        })?;
+    let sing_box_bin = if mode == "tun" {
+        Some(resolve_binary(&resource_dir, if cfg!(target_os = "windows") { "sing-box/sing-box.exe" } else { "sing-box/sing-box" })
+            .map_err(|e| {
+                let msg = format!("Sing-box (required for TUN mode) not available: {}", e);
+                let _ = append_log(&logs_path, "error", &msg);
+                msg
+            })?)
+    } else {
+        None
+    };
+
+    // 2. Validate, adapt and save Xray config
     let xray_config_path = app_data_dir.join("xray_config.json");
 
     // Validate that config_json is valid JSON before writing
-    let parsed: serde_json::Value = serde_json::from_str(&config_json).map_err(|e| {
+    let mut parsed: serde_json::Value = serde_json::from_str(&config_json).map_err(|e| {
         let err_msg = format!("Invalid Xray config JSON: {}. First 200 chars: {}", e, config_json.chars().take(200).collect::<String>());
         let _ = append_log(&logs_path, "error", &err_msg);
         err_msg
     })?;
+
+    // Bind the local SOCKS/HTTP inbounds to the user's proxy settings so proxy mode and
+    // the TUN (sing-box -> socks) chain agree on the port.
+    let settings = read_settings(&app_data_dir);
+    let (proxy_host, proxy_port) = local_proxy_from_settings(&settings);
+    let xray_dir = xray_bin.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| resource_dir.clone());
+    let have_geo_files = xray_dir.join("geosite.dat").is_file() && xray_dir.join("geoip.dat").is_file();
+    if !have_geo_files {
+        let _ = append_log(&logs_path, "warn", "geosite.dat/geoip.dat not found next to xray — geo routing rules will be skipped");
+    }
+    let (socks_host, socks_port) = prepare_xray_config(&mut parsed, &proxy_host, proxy_port, have_geo_files);
+    let server_address = xray_server_address(&parsed).unwrap_or_default();
+    let _ = append_log(&logs_path, "info", &format!(
+        "Xray local proxy: socks={}:{}, http={}:{}", socks_host, socks_port, socks_host,
+        if socks_port < 65535 { socks_port + 1 } else { socks_port - 1 }
+    ));
 
     // Re-serialize to ensure clean formatting
     let clean_config = serde_json::to_string_pretty(&parsed).unwrap_or(config_json.clone());
@@ -136,25 +375,15 @@ async fn start_vpn(
     let config_preview: String = clean_config.chars().take(200).collect();
     let _ = append_log(&logs_path, "info", &format!("Xray config saved ({} bytes): {}...", clean_config.len(), config_preview));
 
-    // 2. Determine paths using a more robust search
-    let resolve_tool = |base: &std::path::Path, rel_path: &str| -> std::path::PathBuf {
-        let p1 = base.join(rel_path);
-        if p1.exists() { return p1; }
-        let p2 = base.join("resources").join(rel_path);
-        if p2.exists() { return p2; }
-        p1 // fallback to p1
-    };
-
-    let xray_bin = resolve_tool(&resource_dir, if cfg!(target_os = "windows") { "xray/xray.exe" } else { "xray/xray" });
-    let sing_box_bin = resolve_tool(&resource_dir, if cfg!(target_os = "windows") { "sing-box/sing-box.exe" } else { "sing-box/sing-box" });
-
     // 3. Start Xray
     let _ = append_log(&logs_path, "info", &format!("Starting Xray engine: {}", xray_bin.display()));
-    
+
     let mut xray_cmd = Command::new(&xray_bin);
     xray_cmd
+        .arg("run")
         .arg("-c")
         .arg(&xray_config_path)
+        .env("XRAY_LOCATION_ASSET", &xray_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -168,19 +397,12 @@ async fn start_vpn(
     let mut xray_child = xray_cmd
         .spawn()
         .map_err(|e| {
-            let err_msg = format!("CRITICAL: Failed to spawn Xray: {}", e);
+            let err_msg = format!("CRITICAL: Failed to spawn Xray ({}): {}", xray_bin.display(), e);
             let _ = append_log(&logs_path, "error", &err_msg);
             err_msg
         })?;
 
     let _ = append_log(&logs_path, "info", &format!("Xray process spawned successfully (PID: {})", xray_child.id()));
-
-    // Log whether the binary actually exists at the resolved path
-    if xray_bin.exists() {
-        let _ = append_log(&logs_path, "info", &format!("Xray binary confirmed at: {}", xray_bin.display()));
-    } else {
-        let _ = append_log(&logs_path, "error", &format!("Xray binary NOT FOUND at: {}", xray_bin.display()));
-    }
 
     // Log Xray output to candy.logs
     let stdout = xray_child.stdout.take().unwrap();
@@ -277,20 +499,20 @@ async fn start_vpn(
     // 4. If TUN mode, also start Sing-box
     if mode == "tun" {
         let _ = append_log(&logs_path, "info", "Initializing TUN mode orchestration...");
-        let mut server_address = "127.0.0.1".to_string();
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&config_json) {
-            if let Some(outbound) = json["outbounds"].as_array().and_then(|a| a.get(0)) {
-               if let Some(vnext) = outbound["settings"]["vnext"].as_array().and_then(|a| a.get(0)) {
-                   if let Some(addr) = vnext["address"].as_str() {
-                       server_address = addr.to_string();
-                   }
-               }
-            }
-        }
+        let sing_box_bin = sing_box_bin.clone().unwrap_or_default();
 
-        let sb_config = generate_sing_box_config(app.clone(), server_address).await?;
+        let sb_config = match build_tun_socks_config(&app_data_dir, &server_address, Some((&socks_host, socks_port))) {
+            Ok(c) => c,
+            Err(e) => {
+                kill_process(xray_pid);
+                return Err(format!("Failed to build sing-box TUN config: {}", e));
+            }
+        };
         let sb_config_path = app_data_dir.join("sing_box_config.json");
-        fs::write(&sb_config_path, &sb_config).map_err(|e| e.to_string())?;
+        if let Err(e) = fs::write(&sb_config_path, &sb_config) {
+            kill_process(xray_pid);
+            return Err(e.to_string());
+        }
 
         let _ = append_log(&logs_path, "info", &format!("Starting Sing-box routing engine: {}", sing_box_bin.display()));
 
@@ -299,11 +521,9 @@ async fn start_vpn(
             .arg("run")
             .arg("-c")
             .arg(&sb_config_path)
-            .env("ENABLE_DEPRECATED_SPECIAL_OUTBOUNDS", "true")
-            .env("ENABLE_DEPRECATED_TUN_ADDRESS_X", "true")
-.env("ENABLE_DEPRECATED_WIREGUARD_OUTBOUND", "true")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        apply_sing_box_env(&mut sb_cmd);
 
         // Prevent console window flash on Windows
         #[cfg(target_os = "windows")]
@@ -437,6 +657,7 @@ async fn start_wireguard(
     pre_shared_key: String,
     local_addresses: Vec<String>,
     mode: String,
+    mtu: Option<u64>,
 ) -> Result<(), String> {
     use std::process::{Command, Stdio};
     use std::io::{BufRead, BufReader};
@@ -444,32 +665,32 @@ async fn start_wireguard(
     use crate::sing_box_helper::Config;
 
     let app_data_dir = app.path().app_data_dir().expect("Failed to get app dir");
-    let resource_dir = app.path().resource_dir().unwrap_or_else(|_| std::env::current_dir().unwrap());
+    let resource_dir = app.path().resource_dir().unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
     let logs_path = app_data_dir.join("candy.logs");
 
     let _ = append_log(&logs_path, "info", &format!(
         "Starting WireGuard via sing-box: server={}:{}, mode={}", server, port, mode
     ));
 
-    let resolve_tool = |base: &std::path::Path, rel_path: &str| -> std::path::PathBuf {
-        let p1 = base.join(rel_path);
-        if p1.exists() { return p1; }
-        let p2 = base.join("resources").join(rel_path);
-        if p2.exists() { return p2; }
-        p1
-    };
-
-    let sing_box_bin = resolve_tool(
+    let sing_box_bin = resolve_binary(
         &resource_dir,
         if cfg!(target_os = "windows") { "sing-box/sing-box.exe" } else { "sing-box/sing-box" }
-    );
+    ).map_err(|e| {
+        let msg = format!("Sing-box (required for WireGuard) not available: {}", e);
+        let _ = append_log(&logs_path, "error", &msg);
+        msg
+    })?;
+
+    // WireGuard tunnel MTU comes from the server (default 1420). The TUN "mtu" setting
+    // (default 9000) must NOT be used for the WireGuard interface itself.
+    let wg_mtu: u16 = mtu.filter(|m| *m >= 576 && *m <= 9000).unwrap_or(1420) as u16;
 
     // Build the correct sing-box config depending on mode
     let sb_config = if mode == "tun" {
         // TUN mode: TUN inbound + WireGuard outbound with full key material
         // Read TUN settings from settings file
         let settings_path = app_data_dir.join("settings.json");
-        let (_inet4, _inet6, mtu, primary_dns, secondary_dns) = if settings_path.exists() {
+        let (_inet4, _inet6, _tun_mtu, primary_dns, secondary_dns) = if settings_path.exists() {
             if let Ok(content) = fs::read_to_string(&settings_path) {
                 if let Ok(s) = serde_json::from_str::<serde_json::Value>(&content) {
                     (
@@ -499,7 +720,7 @@ async fn start_wireguard(
             psk_opt,
             local_addresses.clone(),
             None,
-            Some(mtu),
+            Some(wg_mtu),
             &primary_dns,
             &secondary_dns,
         );
@@ -513,7 +734,7 @@ async fn start_wireguard(
                 if let Ok(s) = serde_json::from_str::<serde_json::Value>(&content) {
                     (
                         s["proxyHost"].as_str().unwrap_or("127.0.0.1").to_string(),
-                        s["proxyPort"].as_u64().unwrap_or(1080) as u16,
+                        s["proxyPort"].as_u64().unwrap_or(10808) as u16,
                     )
                 } else {
                     ("127.0.0.1".into(), 1080u16)
@@ -536,6 +757,7 @@ async fn start_wireguard(
             local_addresses.clone(),
             &proxy_host,
             proxy_port,
+            Some(wg_mtu),
         );
         serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?
     };
@@ -553,11 +775,9 @@ async fn start_wireguard(
         .arg("run")
         .arg("-c")
         .arg(&sb_config_path)
-        .env("ENABLE_DEPRECATED_SPECIAL_OUTBOUNDS", "true")
-        .env("ENABLE_DEPRECATED_TUN_ADDRESS_X", "true")
-        .env("ENABLE_DEPRECATED_WIREGUARD_OUTBOUND", "true")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    apply_sing_box_env(&mut sb_cmd);
 
     #[cfg(target_os = "windows")]
     {
@@ -652,8 +872,7 @@ async fn start_openvpn(
     use std::thread;
 
     let app_data_dir = app.path().app_data_dir().expect("Failed to get app dir");
-    #[allow(unused_variables)]
-    let resource_dir = app.path().resource_dir().unwrap_or_else(|_| std::env::current_dir().unwrap());
+    let resource_dir = app.path().resource_dir().unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
     let logs_path = app_data_dir.join("candy.logs");
 
     let _ = append_log(&logs_path, "info", &format!(
@@ -680,67 +899,83 @@ async fn start_openvpn(
         "OpenVPN config written to: {}", ovpn_config_path.display()
     ));
 
-    // Resolve openvpn binary: try bundled first, then system
-    #[allow(unused_variables)]
-    let resolve_tool = |base: &std::path::Path, rel_path: &str| -> std::path::PathBuf {
-        let p1 = base.join(rel_path);
-        if p1.exists() { return p1; }
-        let p2 = base.join("resources").join(rel_path);
-        if p2.exists() { return p2; }
-        p1
-    };
-
-    // On Windows try bundled openvpn.exe; on other platforms use system openvpn
-    #[cfg(target_os = "windows")]
-    let openvpn_bin = {
-        let bundled = resolve_tool(&resource_dir, "openvpn/openvpn.exe");
-        if bundled.exists() {
-            bundled
-        } else {
-            std::path::PathBuf::from("openvpn.exe")
-        }
-    };
-
-    #[cfg(not(target_os = "windows"))]
-    let openvpn_bin = std::path::PathBuf::from("openvpn");
+    // Resolve openvpn binary: bundled, PATH, then the default install location on Windows
+    let openvpn_bin = resolve_binary(&resource_dir, if cfg!(target_os = "windows") { "openvpn/openvpn.exe" } else { "openvpn" })
+        .or_else(|e| {
+            #[cfg(target_os = "windows")]
+            {
+                for base in ["ProgramFiles", "ProgramFiles(x86)"] {
+                    if let Ok(pf) = std::env::var(base) {
+                        let p = std::path::Path::new(&pf).join("OpenVPN").join("bin").join("openvpn.exe");
+                        if p.is_file() {
+                            return Ok(p);
+                        }
+                    }
+                }
+            }
+            #[cfg(target_os = "macos")]
+            {
+                for p in ["/opt/homebrew/sbin/openvpn", "/usr/local/sbin/openvpn"] {
+                    if std::path::Path::new(p).is_file() {
+                        return Ok(std::path::PathBuf::from(p));
+                    }
+                }
+            }
+            Err(e)
+        })
+        .map_err(|e| {
+            let msg = format!("OpenVPN is not installed: {}", e);
+            let _ = append_log(&logs_path, "error", &msg);
+            msg
+        })?;
 
     let _ = append_log(&logs_path, "info", &format!(
         "Using OpenVPN binary: {}", openvpn_bin.display()
     ));
 
-    let mut ovpn_cmd = Command::new(&openvpn_bin);
-    ovpn_cmd
-        .arg("--config")
-        .arg(&ovpn_config_path)
-        .arg("--auth-user-pass")
-        .arg(&auth_path)
-        .arg("--auth-nocache")
-        .arg("--verb")
-        .arg("3")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    // On Linux/macOS we may need sudo for TUN interface creation
+    // OpenVPN needs root to create the TUN device on Linux/macOS. When not root, elevate
+    // with pkexec (graphical prompt) on Linux, or non-interactive sudo elsewhere
+    // (plain `sudo` would wait for a password on a terminal the GUI app doesn't have).
     #[cfg(not(target_os = "windows"))]
-    {
-        // Only wrap with sudo if not already root
-        // We rebuild the command with sudo prefix
-        let user = std::env::var("USER").unwrap_or_default();
-        if user != "root" {
-            ovpn_cmd = Command::new("sudo");
-            ovpn_cmd
-                .arg(openvpn_bin.to_str().unwrap_or("openvpn"))
-                .arg("--config")
-                .arg(&ovpn_config_path)
-                .arg("--auth-user-pass")
-                .arg(&auth_path)
-                .arg("--auth-nocache")
-                .arg("--verb")
-                .arg("3")
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-        }
-    }
+    let mut ovpn_cmd = {
+        let is_root = unsafe { libc::geteuid() } == 0;
+        let mut c = if is_root {
+            Command::new(&openvpn_bin)
+        } else if cfg!(target_os = "linux") && resolve_binary(&resource_dir, "pkexec").is_ok() {
+            let mut c = Command::new("pkexec");
+            c.arg(&openvpn_bin);
+            c
+        } else {
+            let mut c = Command::new("sudo");
+            c.arg("-n").arg(&openvpn_bin);
+            c
+        };
+        c.arg("--config")
+            .arg(&ovpn_config_path)
+            .arg("--auth-user-pass")
+            .arg(&auth_path)
+            .arg("--auth-nocache")
+            .arg("--verb")
+            .arg("3")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        c
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut ovpn_cmd = {
+        let mut c = Command::new(&openvpn_bin);
+        c.arg("--config")
+            .arg(&ovpn_config_path)
+            .arg("--auth-user-pass")
+            .arg(&auth_path)
+            .arg("--auth-nocache")
+            .arg("--verb")
+            .arg("3")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        c
+    };
 
     #[cfg(target_os = "windows")]
     {
@@ -863,20 +1098,26 @@ async fn start_dnstt(
     use std::thread;
 
     let app_data_dir = app.path().app_data_dir().expect("Failed to get app dir");
-    let resource_dir = app.path().resource_dir().unwrap_or_else(|_| std::env::current_dir().unwrap());
+    let resource_dir = app.path().resource_dir().unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
     let logs_path = app_data_dir.join("candy.logs");
 
-    // 1. Resolve dnstt-client binary
-    let resolve_tool = |base: &std::path::Path, rel_path: &str| -> std::path::PathBuf {
-        let p1 = base.join(rel_path);
-        if p1.exists() { return p1; }
-        let p2 = base.join("resources").join(rel_path);
-        if p2.exists() { return p2; }
-        p1
+    // 1. Resolve dnstt-client binary (bundled or on the system PATH)
+    let dnstt_bin = resolve_binary(&resource_dir, if cfg!(target_os = "windows") { "dnstt-client.exe" } else { "dnstt-client" })
+        .map_err(|e| {
+            let msg = format!("dnstt-client not available: {}", e);
+            let _ = append_log(&logs_path, "error", &msg);
+            msg
+        })?;
+    let sing_box_bin = if mode == "tun" {
+        resolve_binary(&resource_dir, if cfg!(target_os = "windows") { "sing-box/sing-box.exe" } else { "sing-box/sing-box" })
+            .map_err(|e| {
+                let msg = format!("Sing-box (required for TUN mode) not available: {}", e);
+                let _ = append_log(&logs_path, "error", &msg);
+                msg
+            })?
+    } else {
+        std::path::PathBuf::new()
     };
-
-    let dnstt_bin = resolve_tool(&resource_dir, if cfg!(target_os = "windows") { "dnstt-client.exe" } else { "dnstt-client" });
-    let sing_box_bin = resolve_tool(&resource_dir, if cfg!(target_os = "windows") { "sing-box/sing-box.exe" } else { "sing-box/sing-box" });
 
     let _ = append_log(&logs_path, "info", &format!("Starting DNSTT client: {}", dnstt_bin.display()));
 
@@ -1026,7 +1267,7 @@ async fn start_dnstt(
     let mut ssh_child = {
         use std::os::windows::process::CommandExt;
         // Use plink (PuTTY) on Windows for non-interactive password auth
-        let plink_bin = resolve_tool(&resource_dir, "plink.exe");
+        let plink_bin = resolve_binary(&resource_dir, "plink.exe").unwrap_or_else(|_| std::path::PathBuf::from("plink.exe"));
         let _ = append_log(&logs_path, "info", &format!("Using plink: {}", plink_bin.display()));
 
         let mut cmd = Command::new(&plink_bin);
@@ -1163,22 +1404,12 @@ async fn start_dnstt(
     if mode == "tun" {
         let _ = append_log(&logs_path, "info", "DNSTT TUN mode: starting Sing-box routing engine...");
 
-        // Generate sing-box config using dnstt's local proxy as outbound
-        // We override proxy_host/proxy_port in the settings temporarily for config generation
-        let settings_path = app_data_dir.join("settings.json");
-        let original_settings = fs::read_to_string(&settings_path).unwrap_or_default();
-        
-        // Patch settings to point sing-box at SSH's SOCKS proxy
-        if let Ok(mut settings_json) = serde_json::from_str::<serde_json::Value>(&original_settings) {
-            settings_json["proxyHost"] = serde_json::Value::String(proxy_host.clone());
-            settings_json["proxyPort"] = serde_json::Value::Number(serde_json::Number::from(proxy_port));
-            let _ = fs::write(&settings_path, serde_json::to_string_pretty(&settings_json).unwrap_or_default());
-        }
-
-        let sb_config = generate_sing_box_config(app.clone(), server_ip).await?;
-
-        // Restore original settings
-        let _ = fs::write(&settings_path, &original_settings);
+        // Generate sing-box config using SSH's local SOCKS proxy as outbound
+        let sb_config = build_tun_socks_config(&app_data_dir, &server_ip, Some((&proxy_host, proxy_port as u16)))
+            .map_err(|e| {
+                kill_process(dnstt_pid);
+                format!("Failed to build sing-box TUN config: {}", e)
+            })?;
 
         let sb_config_path = app_data_dir.join("sing_box_config.json");
         fs::write(&sb_config_path, &sb_config).map_err(|e| e.to_string())?;
@@ -1190,11 +1421,9 @@ async fn start_dnstt(
             .arg("run")
             .arg("-c")
             .arg(&sb_config_path)
-            .env("ENABLE_DEPRECATED_SPECIAL_OUTBOUNDS", "true")
-            .env("ENABLE_DEPRECATED_TUN_ADDRESS_X", "true")
-.env("ENABLE_DEPRECATED_WIREGUARD_OUTBOUND", "true")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        apply_sing_box_env(&mut sb_cmd);
 
         #[cfg(target_os = "windows")]
         {
@@ -1698,10 +1927,11 @@ async fn stop_vpn() -> Result<(), String> {
     {
         use std::process::Command;
         use std::os::windows::process::CommandExt;
-        let _ = Command::new("taskkill").args(&["/F", "/IM", "xray.exe", "/T"]).creation_flags(0x08000000).spawn();
-        let _ = Command::new("taskkill").args(&["/F", "/IM", "sing-box.exe", "/T"]).creation_flags(0x08000000).spawn();
-        let _ = Command::new("taskkill").args(&["/F", "/IM", "dnstt-client.exe", "/T"]).creation_flags(0x08000000).spawn();
-        let _ = Command::new("taskkill").args(&["/F", "/IM", "plink.exe", "/T"]).creation_flags(0x08000000).spawn();
+        let _ = Command::new("taskkill").args(&["/F", "/IM", "xray.exe", "/T"]).creation_flags(0x08000000).output();
+        let _ = Command::new("taskkill").args(&["/F", "/IM", "sing-box.exe", "/T"]).creation_flags(0x08000000).output();
+        let _ = Command::new("taskkill").args(&["/F", "/IM", "dnstt-client.exe", "/T"]).creation_flags(0x08000000).output();
+        let _ = Command::new("taskkill").args(&["/F", "/IM", "plink.exe", "/T"]).creation_flags(0x08000000).output();
+        let _ = Command::new("taskkill").args(&["/F", "/IM", "openvpn.exe", "/T"]).creation_flags(0x08000000).output();
         // Disconnect native L2TP/IKEv2 VPN connections
         let _ = Command::new("rasdial").args(&["CandyConnect-L2TP", "/DISCONNECT"]).creation_flags(0x08000000).output();
         let _ = Command::new("rasdial").args(&["CandyConnect-IKEv2", "/DISCONNECT"]).creation_flags(0x08000000).output();
@@ -1711,25 +1941,45 @@ async fn stop_vpn() -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         use std::process::Command;
-        let _ = Command::new("pkill").arg("-9").arg("-x").arg("xray").spawn();
-        let _ = Command::new("pkill").arg("-9").arg("-x").arg("sing-box").spawn();
-        let _ = Command::new("pkill").arg("-9").arg("-x").arg("dnstt-client").spawn();
-        let _ = Command::new("pkill").arg("-9").arg("-f").arg("sshpass.*ssh.*-D").spawn();
+        let _ = Command::new("pkill").arg("-9").arg("-x").arg("xray").output();
+        let _ = Command::new("pkill").arg("-9").arg("-x").arg("sing-box").output();
+        let _ = Command::new("pkill").arg("-9").arg("-x").arg("dnstt-client").output();
+        let _ = Command::new("pkill").arg("-9").arg("-f").arg("sshpass.*ssh.*-D").output();
+        // OpenVPN runs as root (pkexec/sudo); fall back to an elevated kill if a plain one fails
+        let ovpn_running = Command::new("pgrep").arg("-x").arg("openvpn").output().map(|o| o.status.success()).unwrap_or(false);
+        if ovpn_running {
+            let killed = Command::new("pkill").arg("-x").arg("openvpn").output().map(|o| o.status.success()).unwrap_or(false);
+            if !killed && unsafe { libc::geteuid() } != 0 {
+                let _ = Command::new(if cfg!(target_os = "linux") { "pkexec" } else { "sudo" })
+                    .args(if cfg!(target_os = "linux") { &["pkill", "-x", "openvpn"][..] } else { &["-n", "pkill", "-x", "openvpn"][..] })
+                    .output();
+            }
+        }
         // Disconnect native L2TP/IKEv2 VPN connections
         let _ = Command::new("nmcli").args(&["connection", "down", "CandyConnect-L2TP"]).output();
         let _ = Command::new("nmcli").args(&["connection", "down", "CandyConnect-IKEv2"]).output();
         let _ = Command::new("nmcli").args(&["connection", "delete", "CandyConnect-L2TP"]).output();
         let _ = Command::new("nmcli").args(&["connection", "delete", "CandyConnect-IKEv2"]).output();
         // Also kill xl2tpd if running as fallback
-        let _ = Command::new("pkill").arg("-9").arg("-x").arg("xl2tpd").spawn();
+        let _ = Command::new("pkill").arg("-9").arg("-x").arg("xl2tpd").output();
     }
     #[cfg(target_os = "macos")]
     {
         use std::process::Command;
-        let _ = Command::new("pkill").arg("-9").arg("-x").arg("xray").spawn();
-        let _ = Command::new("pkill").arg("-9").arg("-x").arg("sing-box").spawn();
-        let _ = Command::new("pkill").arg("-9").arg("-x").arg("dnstt-client").spawn();
-        let _ = Command::new("pkill").arg("-9").arg("-f").arg("sshpass.*ssh.*-D").spawn();
+        let _ = Command::new("pkill").arg("-9").arg("-x").arg("xray").output();
+        let _ = Command::new("pkill").arg("-9").arg("-x").arg("sing-box").output();
+        let _ = Command::new("pkill").arg("-9").arg("-x").arg("dnstt-client").output();
+        let _ = Command::new("pkill").arg("-9").arg("-f").arg("sshpass.*ssh.*-D").output();
+        // OpenVPN runs as root (pkexec/sudo); fall back to an elevated kill if a plain one fails
+        let ovpn_running = Command::new("pgrep").arg("-x").arg("openvpn").output().map(|o| o.status.success()).unwrap_or(false);
+        if ovpn_running {
+            let killed = Command::new("pkill").arg("-x").arg("openvpn").output().map(|o| o.status.success()).unwrap_or(false);
+            if !killed && unsafe { libc::geteuid() } != 0 {
+                let _ = Command::new(if cfg!(target_os = "linux") { "pkexec" } else { "sudo" })
+                    .args(if cfg!(target_os = "linux") { &["pkill", "-x", "openvpn"][..] } else { &["-n", "pkill", "-x", "openvpn"][..] })
+                    .output();
+            }
+        }
         // Disconnect native VPN
         let _ = Command::new("networksetup").args(&["-disconnectpppoeservice", "CandyConnect-L2TP"]).output();
         let _ = Command::new("scutil").args(&["--nc", "stop", "CandyConnect-IKEv2"]).output();
@@ -1884,32 +2134,18 @@ async fn measure_latency(host: String) -> Result<u64, String> {
 #[tauri::command]
 async fn check_system_executables(app: tauri::AppHandle) -> Result<Vec<String>, String> {
     let mut missing = Vec::new();
-    let app_dir = app.path().resource_dir().unwrap_or_else(|_| std::env::current_dir().unwrap());
+    let app_dir = app.path().resource_dir().unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
     
-    // Check extra-tools subdirectories/files based on workflow structure
+    // Check bundled tools (or system-installed ones on PATH)
     let tools = vec![
         ("xray", if cfg!(target_os = "windows") { "xray/xray.exe" } else { "xray/xray" }),
         ("sing-box", if cfg!(target_os = "windows") { "sing-box/sing-box.exe" } else { "sing-box/sing-box" }),
         ("dnstt", if cfg!(target_os = "windows") { "dnstt-client.exe" } else { "dnstt-client" }),
     ];
 
-    let resolve_tool_check = |base: &std::path::Path, rel_path: &str| -> bool {
-        if base.join(rel_path).exists() { return true; }
-        if base.join("resources").join(rel_path).exists() { return true; }
-        false
-    };
-
     for (name, path) in tools {
-        if !resolve_tool_check(&app_dir, path) {
+        if resolve_binary(&app_dir, path).is_err() {
             missing.push(name.to_string());
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let ovpn_path = app_dir.join("openvpn/openvpn.exe");
-        if !ovpn_path.exists() {
-            missing.push("openvpn".to_string());
         }
     }
 
@@ -2001,7 +2237,8 @@ fn net_session() -> &'static Mutex<(u64, u64)> {
 /// - ppp*     : L2TP/IPSec PPP links
 /// - sing-box : sing-box TUN interface name on some platforms
 fn is_vpn_interface(name: &str) -> bool {
-    let n = name.trim_end_matches(':');
+    let lower = name.trim_end_matches(':').to_ascii_lowercase();
+    let n = lower.as_str();
     n.starts_with("tun")
         || n.starts_with("wg")
         || n.starts_with("utun")

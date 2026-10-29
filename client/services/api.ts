@@ -232,11 +232,20 @@ async function apiRequest<T>(method: string, path: string, body?: unknown): Prom
     throw new Error('Session expired. Please login again.');
   }
 
-  const data = await res.json();
-  if (data.success === false) {
-    throw new Error(data.message || data.detail?.message || 'Request failed');
+  let data: any = null;
+  try {
+    data = await res.json();
+  } catch {
+    throw new Error(`Server returned an invalid response (HTTP ${res.status})`);
   }
-  return data.data !== undefined ? data.data : data;
+  // FastAPI errors (403/404/422/500) come back as { detail: ... } without a `success` field
+  if (!res.ok || data?.success === false) {
+    const detail = typeof data?.detail === 'string'
+      ? data.detail
+      : (data?.detail?.message || (data?.detail ? JSON.stringify(data.detail) : ''));
+    throw new Error(data?.message || detail || `Request failed (HTTP ${res.status})`);
+  }
+  return data && data.data !== undefined ? data.data : data;
 }
 
 async function addLog(level: string, message: string) {
@@ -301,11 +310,17 @@ export const Login = async (credentials: LoginCredentials): Promise<{
       body: JSON.stringify({ username: credentials.username, password: credentials.password }),
     });
 
-    const data = await res.json();
+    let data: any = null;
+    try {
+      data = await res.json();
+    } catch {
+      throw new Error(`Server returned an invalid response (HTTP ${res.status})`);
+    }
 
-    if (!data.success) {
-      addLog('error', `Login failed: ${data.message}`);
-      return { success: false, error: data.message || 'Invalid credentials' };
+    if (!res.ok || !data?.success || !data?.token) {
+      const msg = data?.message || (typeof data?.detail === 'string' ? data.detail : '') || 'Invalid credentials';
+      addLog('error', `Login failed: ${msg}`);
+      return { success: false, error: msg };
     }
 
     localStorage.setItem('cc_last_server', credentials.serverAddress);
@@ -704,18 +719,20 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
         serverIp = cachedConfig.address || serverIp;
       }
 
-      // If not cached, fetch from server
-      if (!nativeExtra) {
+      // If not cached (or the L2TP PSK is missing — /configs does not include it), fetch from server
+      if (!nativeExtra || (isL2tp && !nativeExtra.psk && !currentSettings.l2tpPsk)) {
         try {
           const configData = await apiRequest<any>('GET', `/configs/${encodeURIComponent(configId)}`);
-          nativeExtra = configData?.extra_data || configData?.extraData || configData;
+          nativeExtra = { ...(nativeExtra || {}), ...(configData?.extra_data || configData?.extraData || configData || {}) };
           serverIp = configData?.server || configData?.address || serverIp;
         } catch {
-          const allConfigs = await LoadConfigs();
-          const found = allConfigs.find(c => c.id === configId);
-          if (found?.extraData) {
-            nativeExtra = found.extraData;
-            serverIp = found.address || serverIp;
+          if (!nativeExtra) {
+            const allConfigs = await LoadConfigs();
+            const found = allConfigs.find(c => c.id === configId);
+            if (found?.extraData) {
+              nativeExtra = found.extraData;
+              serverIp = found.address || serverIp;
+            }
           }
         }
       }
@@ -797,18 +814,25 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
         throw new Error('Could not retrieve WireGuard configuration data from server');
       }
 
-      const privateKey = wgExtra.private_key || wgExtra.privateKey || '';
-      const peerPublicKey = wgExtra.peer_public_key || wgExtra.peerPublicKey || wgExtra.public_key || wgExtra.publicKey || '';
-      const preSharedKey = wgExtra.pre_shared_key || wgExtra.preSharedKey || '';
-      const wgPort = wgExtra.port || cachedConfig?.port || 51820;
-      const localAddresses = wgExtra.local_addresses || wgExtra.addresses || wgExtra.address
-        ? (Array.isArray(wgExtra.local_addresses || wgExtra.addresses || wgExtra.address)
-          ? (wgExtra.local_addresses || wgExtra.addresses || wgExtra.address)
-          : [(wgExtra.local_addresses || wgExtra.addresses || wgExtra.address)])
-        : ['10.0.0.2/32'];
+      // /configs returns { private_key, public_key, address }, /configs/wireguard returns
+      // { client_private_key, server_public_key, client_address } — accept both shapes.
+      const privateKey = wgExtra.private_key || wgExtra.privateKey || wgExtra.client_private_key || '';
+      const peerPublicKey = wgExtra.peer_public_key || wgExtra.peerPublicKey || wgExtra.server_public_key
+        || wgExtra.public_key || wgExtra.publicKey || '';
+      const preSharedKey = wgExtra.pre_shared_key || wgExtra.preSharedKey || wgExtra.preshared_key || '';
+      const wgPort = Number(wgExtra.port || cachedConfig?.port || 51820);
+      const wgMtu = Number(wgExtra.mtu) || 1420;
+      const rawAddresses = wgExtra.local_addresses || wgExtra.addresses || wgExtra.address || wgExtra.client_address;
+      const localAddresses: string[] = (Array.isArray(rawAddresses) ? rawAddresses : String(rawAddresses || '').split(','))
+        .map((a: string) => String(a).trim())
+        .filter((a: string) => a.length > 0)
+        .map((a: string) => (a.includes('/') ? a : (a.includes(':') ? `${a}/128` : `${a}/32`)));
 
       if (!privateKey || !peerPublicKey) {
         throw new Error('WireGuard config missing required keys (private_key / peer_public_key)');
+      }
+      if (localAddresses.length === 0) {
+        throw new Error('WireGuard config missing the client tunnel address — ask the admin to re-save this user');
       }
 
       addLog('info', `WireGuard: server=${serverIp}, port=${wgPort}, mode=${mode}, addresses=${localAddresses.join(',')}`);
@@ -821,6 +845,7 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
         preSharedKey: preSharedKey,
         localAddresses: localAddresses,
         mode: mode,
+        mtu: wgMtu,
       });
 
     } else if (isOpenvpn) {
@@ -873,6 +898,8 @@ export const ConnectToConfig = async (configId: string): Promise<void> => {
         mode: mode,
       });
 
+    } else if (/^(slipstream|trusttunnel)/i.test(configId)) {
+      throw new Error(`${configId.split('-')[0]} is not supported by this desktop client yet`);
     } else {
       // ── Standard (Xray) Connection Flow ──
       // Fetch full configuration from the server
@@ -999,28 +1026,10 @@ export const PingProfile = async (name: string): Promise<PingResult> => {
 };
 
 export const PingAllProfiles = async (): Promise<PingResult[]> => {
-  // Try real backend bulk ping
-  try {
-    const results = await apiRequest<any[]>('POST', '/ping-all');
-    if (Array.isArray(results) && results.length > 0) {
-      return results.map(r => ({
-        profileName: r.protocol || r.config_id,
-        configId: r.config_id,
-        latency: r.latency || 0,
-        success: r.reachable !== false,
-      }));
-    }
-  } catch {
-    // Fallback: ping each config individually
-  }
-
-  const configs = await LoadConfigs();
-  const results: PingResult[] = [];
-  for (const c of configs) {
-    const r = await PingConfig(c.id);
-    results.push(r);
-  }
-  return results;
+  // The server's /ping-all only returns placeholder latencies (0) keyed by "<protocol>-1",
+  // which don't match config ids — so measure each config from the client instead.
+  const configs = _cachedConfigs.length > 0 ? _cachedConfigs : await LoadConfigs();
+  return Promise.all(configs.map(c => PingConfig(c.id)));
 };
 
 export const PingAllConfigs = async (): Promise<PingResult[]> => {
@@ -1150,7 +1159,11 @@ export const LoadLogs = async (): Promise<Array<{ timestamp: string; level: stri
     if (content) {
       // Handle the JSONL format: each line is a JSON object
       const lines = content.split('\n').filter(l => l.trim().length > 0);
-      return lines.map(l => JSON.parse(l)).reverse(); // Newest first
+      const parsed: Array<{ timestamp: string; level: string; message: string }> = [];
+      for (const l of lines) {
+        try { parsed.push(JSON.parse(l)); } catch { /* skip malformed line */ }
+      }
+      return parsed.reverse(); // Newest first
     }
   } catch (e) {
     console.debug('Failed to read log file:', e);

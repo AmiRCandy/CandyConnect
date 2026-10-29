@@ -13,6 +13,7 @@ pub struct Config {
     pub inbounds: Vec<Inbound>,
     pub outbounds: Vec<Outbound>,
     pub route: Route,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub experimental: Option<Experimental>,
 }
 
@@ -68,7 +69,7 @@ impl Config {
                 address: secondary_dns.into(),
                 address_resolver: None,
                 strategy: None,
-                detour: Some("direct-out".into()),
+                detour: None,
             },
             DnsServer {
                 tag: "dns-block".into(),
@@ -148,19 +149,19 @@ impl Config {
         local_addresses: Vec<String>,
         socks_host: &str,
         socks_port: u16,
+        mtu: Option<u16>,
     ) -> Self {
         let mut cfg = Self::base();
 
         // DNS: route through WireGuard outbound (not socks-out which doesn't exist here)
         cfg.dns.servers[0].detour = Some("wg-out".into());
-        cfg.dns.servers[1].detour = Some("direct-out".into());
 
         cfg.inbounds = vec![Inbound::socks_inbound(socks_host, socks_port)];
         cfg.outbounds = vec![
             Outbound::wireguard_full(
                 "wg-out", wg_endpoint, wg_port,
                 private_key, peer_public_key, pre_shared_key,
-                local_addresses, None, None,
+                local_addresses, None, mtu,
                 "1.1.1.1", "8.8.8.8",
             ),
             Outbound::direct("direct-out"),
@@ -169,12 +170,7 @@ impl Config {
         ];
 
         // Bypass the WireGuard server endpoint itself (route direct so we don't loop)
-        cfg.route.rules.push(RouteRule {
-            protocol: None,
-            outbound: Some("direct-out".into()),
-            ip_cidr: Some(vec![format!("{}/32", wg_endpoint)]),
-            domain: None,
-        });
+        cfg.route.rules.push(RouteRule::direct_for(wg_endpoint));
 
         cfg.route.final_ = "wg-out".into();
         cfg
@@ -235,12 +231,7 @@ impl Config {
         ];
 
         // Add route rule to direct the WireGuard endpoint itself
-        cfg.route.rules.push(RouteRule {
-            protocol: None,
-            outbound: Some("direct-out".into()),
-            ip_cidr: Some(vec![format!("{}/32", wg_endpoint)]),
-            domain: None,
-        });
+        cfg.route.rules.push(RouteRule::direct_for(wg_endpoint));
 
         cfg.route.final_ = "wg-out".into();
         cfg
@@ -307,7 +298,7 @@ impl Default for Dns {
                     address: "8.8.8.8".into(),
                     address_resolver: None,
                     strategy: None,
-                    detour: Some("direct-out".into()),
+                    detour: None,
                 },
                 DnsServer {
                     tag: "dns-block".into(),
@@ -361,7 +352,10 @@ impl Inbound {
     pub fn tun(inet4: &str, inet6: &str, mtu: u32, stack: &str) -> Self {
         let mut extra = HashMap::new();
 
-        extra.insert("interface_name".into(), "CandyConnect".into());
+        // macOS only accepts utunN interface names — let sing-box pick one there
+        if !cfg!(target_os = "macos") {
+            extra.insert("interface_name".into(), "CandyConnect".into());
+        }
         extra.insert("inet4_address".into(), inet4.into());
         extra.insert("inet6_address".into(), inet6.into());
         extra.insert("mtu".into(), mtu.into());
@@ -372,13 +366,8 @@ impl Inbound {
         extra.insert("sniff_override_destination".into(), false.into());
         extra.insert("endpoint_independent_nat".into(), true.into());
         
-        let mut platform = serde_json::Map::new();
-        let mut http_proxy = serde_json::Map::new();
-        http_proxy.insert("enabled".into(), Value::Bool(true));
-        http_proxy.insert("server".into(), Value::String("127.0.0.1".into()));
-        http_proxy.insert("server_port".into(), Value::Number(2080.into()));
-        platform.insert("http_proxy".into(), Value::Object(http_proxy));
-        extra.insert("platform".into(), Value::Object(platform));
+        // NOTE: no `platform.http_proxy` here — sing-box would point the OS system proxy
+        // at a port nothing listens on and break browser traffic.
 
         Self {
             kind: "tun".into(),
@@ -557,10 +546,34 @@ impl Default for Route {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RouteRule {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub outbound: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ip_cidr: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub domain: Option<Vec<String>>,
+}
+
+impl RouteRule {
+    /// Route traffic to `addr` (IP or domain) via `direct-out`.
+    pub fn direct_for(addr: &str) -> Self {
+        match addr.parse::<std::net::IpAddr>() {
+            Ok(ip) => Self {
+                protocol: None,
+                outbound: Some("direct-out".into()),
+                ip_cidr: Some(vec![format!("{}/{}", addr, if ip.is_ipv4() { 32 } else { 128 })]),
+                domain: None,
+            },
+            Err(_) => Self {
+                protocol: None,
+                outbound: Some("direct-out".into()),
+                ip_cidr: None,
+                domain: Some(vec![addr.to_string()]),
+            },
+        }
+    }
 }
 
 /* =========================================================
