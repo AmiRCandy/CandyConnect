@@ -75,6 +75,9 @@ uninstall_cc() {
         systemctl stop "xl2tpd" 2>/dev/null
         # Force kill any lingering processes
         pkill -f "dnstt-server" || true
+        pkill -f "slipstream-server" || true
+        pkill -f "trusttunnel_endpoint" || true
+        pkill -f "/opt/candyconnect/cores/backhaul/backhaul" || true
         pkill -x "xray" || true
         wg-quick down wg0 2>/dev/null || true
         rm -f /etc/wireguard/wg0.conf
@@ -87,7 +90,9 @@ uninstall_cc() {
         rm -rf "$CC_DIR"
         
         echo -e "${CYAN}[i] Removing protocol binaries...${NC}"
-        rm -f "/usr/local/bin/dnstt-server"
+        rm -f "/usr/local/bin/dnstt-server" "/usr/local/bin/slipstream-server"
+        rm -rf /opt/trusttunnel
+        rm -f /etc/ssh/sshd_config.d/candyconnect-dnstt.conf
         rm -f "/usr/local/bin/xray"
 
         read -p "Do you also want to remove installed packages (wireguard, openvpn, strongswan, etc)? (y/n): " remove_pkgs

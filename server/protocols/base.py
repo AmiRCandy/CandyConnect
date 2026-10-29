@@ -202,6 +202,54 @@ class BaseProtocol:
         )
         return out.strip().splitlines()[0] if out.strip() else "eth0"
 
+    async def _dns_redirect(self, domain: str, port: int, remove: bool = False):
+        """Redirect DNS queries (udp/53) for *domain* to a local port.
+
+        The rule matches the wire-format domain name (e.g. |01|t|07|example|03|com|)
+        case-insensitively, so several DNS tunnels (DNSTT, SlipStream) can share
+        port 53 as long as they use different domains.
+        """
+        labels = [l for l in domain.strip(".").split(".") if l]
+        if not labels:
+            return
+        hexstr = "".join(f"|{len(l):02x}|{l}" for l in labels) + "|00|"
+        iface = await self._default_iface()
+        match = f'-m string --algo bm --icase --hex-string "{hexstr}"'
+        rules = [
+            ("iptables", "", f"INPUT -p udp --dport {port} -j ACCEPT"),
+            ("iptables", "-t nat ", f"PREROUTING -i {iface} -p udp --dport 53 {match} -j REDIRECT --to-ports {port}"),
+        ]
+        if os.path.exists("/proc/net/if_inet6"):
+            rules += [
+                ("ip6tables", "", f"INPUT -p udp --dport {port} -j ACCEPT"),
+                ("ip6tables", "-t nat ", f"PREROUTING -i {iface} -p udp --dport 53 {match} -j REDIRECT --to-ports {port}"),
+            ]
+        for tool, table, rule in rules:
+            if remove:
+                await self._run_cmd(f"while sudo {tool} {table}-D {rule} 2>/dev/null; do :; done", check=False)
+            else:
+                await self._run_cmd(
+                    f"sudo {tool} {table}-C {rule} 2>/dev/null || sudo {tool} {table}-I {rule}", check=False)
+
+    async def _download(self, url: str, dest: str, timeout: int = 300) -> bool:
+        """Download a file with curl (falls back to wget)."""
+        rc, _, err = await self._run_cmd(
+            f"curl -fsSL --retry 3 -o '{dest}.part' '{url}' || wget -q -O '{dest}.part' '{url}'",
+            check=False, timeout=timeout,
+        )
+        if rc != 0:
+            await add_log("ERROR", self.PROTOCOL_NAME, f"Download failed: {url} {err[-200:]}")
+            await self._run_cmd(f"rm -f '{dest}.part'", check=False)
+            return False
+        await self._run_cmd(f"mv '{dest}.part' '{dest}'", check=False)
+        return True
+
+    @staticmethod
+    def _arch() -> str:
+        """Machine architecture as x86_64 / aarch64."""
+        m = os.uname().machine
+        return {"amd64": "x86_64", "arm64": "aarch64"}.get(m, m)
+
     async def _is_installed(self, binary: str) -> bool:
         """Check if a binary is available, checking common system paths as well."""
         # 1. Try 'which'

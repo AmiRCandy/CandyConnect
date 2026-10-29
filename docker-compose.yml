@@ -43,8 +43,9 @@ services:
       - "4500:4500/udp" # IKEv2 NAT-T
       - "1701:1701/udp" # L2TP
       # - "53:53/udp"       # DNSTT (conflicts with systemd-resolved)
-      # - "8388:8388"       # SlipStream
-      # - "9443:9443"       # TrustTunnel
+      # - "9443:9443"       # TrustTunnel (HTTP/1.1, HTTP/2)
+      # - "9443:9443/udp"   # TrustTunnel (QUIC)
+      # SlipStream shares "53:53/udp" with DNSTT (see above)
     environment:
       - CC_DATA_DIR=/opt/candyconnect
       - CC_REDIS_URL=redis://redis:6379/0

@@ -5,7 +5,6 @@ Defines all endpoints for the web management panel.
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Body, BackgroundTasks
 from pydantic import BaseModel
-import paramiko
 import time
 import logging
 from starlette.concurrency import run_in_threadpool
@@ -15,6 +14,7 @@ import auth
 from config import SUPPORTED_PROTOCOLS, PANEL_PORT
 from system_info import get_server_info
 from protocols.manager import protocol_manager
+import tunnels as tunnels_mod
 
 router = APIRouter(tags=["panel"])
 logger = logging.getLogger("candyconnect")
@@ -132,14 +132,19 @@ async def update_client(id: str, req: UpdateClientRequest, user=Depends(auth.req
     try:
         updated = await db.update_client(id, req.model_dump(exclude_unset=True))
         
-        # Update protocol backends (adds, re-applies password, removes disabled protocols)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # Update protocol backends (adds, re-applies password, removes disabled protocols).
+    # The client record is already saved, so a backend error is reported as a warning.
+    try:
         pdata = await protocol_manager.sync_client(updated)
         await db.update_client(id, {"protocol_data": pdata}, log=False)
         updated["protocol_data"] = pdata
-        
-        return {"success": True, "message": "Client updated", "data": updated}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Backend sync failed")
+        return {"success": True, "message": f"Client saved, but applying it to the VPN services failed: {e}", "data": updated}
+    return {"success": True, "message": "Client updated", "data": updated}
 
 @router.delete("/clients/{id}")
 async def delete_client(id: str, user=Depends(auth.require_admin)):
@@ -158,74 +163,72 @@ async def get_logs(limit: int = 100, source: Optional[str] = None, user=Depends(
     logs = await db.get_logs(limit, source)
     return {"success": True, "message": "Logs fetched", "data": logs}
 
-# ── Tunnels ──
+# ── Tunnels (Backhaul relays) ──
 
 class TunnelRequest(BaseModel):
     ip: str
-    port: int
+    port: int = 22                     # SSH port of the relay server
     name: str
     username: str = "root"
     password: Optional[str] = None
     tunnel_type: str = "backhaul"
+    transport: str = "tcp"             # tcp, tcpmux, ws, wsmux
+    tunnel_port: int = 3080            # Backhaul port on the relay
+    ports: Optional[str] = None        # e.g. "443, 8080" (empty = all VPN TCP ports)
+    accept_udp: bool = False
 
 @router.get("/tunnels")
 async def get_tunnels(user=Depends(auth.require_admin)):
     tunnels = await db.get_tunnels()
+    for t in tunnels:
+        t["local_running"] = tunnels_mod.local_running(t["id"])
     return {"success": True, "data": tunnels}
-
-async def background_install_tunnel(tunnel_id: str, ip: str, port: int, username: str, password: str, cmd: str):
-    await db.update_tunnel_status(tunnel_id, "installing")
-    await db.add_log("INFO", "tunnel", f"Starting SSH installation for tunnel {tunnel_id} on {ip}...")
-
-    def _sync_ssh():
-        try:
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client.connect(ip, port=port, username=username, password=password, timeout=15)
-            # Execute command
-            stdin, stdout, stderr = client.exec_command(cmd)
-            exit_status = stdout.channel.recv_exit_status()
-            out_msg = stdout.read().decode().strip()
-            err_msg = stderr.read().decode().strip()
-            client.close()
-            return exit_status == 0, out_msg, err_msg
-        except Exception as e:
-            return False, "", str(e)
-
-    success, out, err = await run_in_threadpool(_sync_ssh)
-    
-    if success:
-        await db.update_tunnel_status(tunnel_id, "installed")
-        await db.add_log("INFO", "tunnel", f"Tunnel {tunnel_id} installed successfully.")
-    else:
-        await db.update_tunnel_status(tunnel_id, "failed")
-        await db.add_log("ERROR", "tunnel", f"Tunnel {tunnel_id} installation failed: {err}")
 
 @router.post("/tunnels")
 async def add_tunnel(req: TunnelRequest, tasks: BackgroundTasks, user=Depends(auth.require_admin)):
-    tunnel = await db.add_tunnel(req.ip, req.port, req.name, req.username, req.password, req.tunnel_type)
-    
-    # Generate install command
-    # Use current server IP as master
-    server_info = await get_server_info()
-    master_ip = server_info.get("ip", "YOUR_SERVER_IP")
-    
-    # Generates a command to run on the remote tunnel server
-    install_cmd = f"curl -fsSL https://get.candyconnect.io/tunnel | sudo bash -s -- --master {master_ip}:{PANEL_PORT} --secret {tunnel['id']} --type {req.tunnel_type}"
-    
-    if req.ip and req.password:
-        tasks.add_task(background_install_tunnel, tunnel['id'], req.ip, req.port, req.username, req.password, install_cmd)
-    
+    if req.tunnel_type != "backhaul":
+        raise HTTPException(status_code=400, detail="Only the 'backhaul' tunnel type is supported")
+    if req.transport not in tunnels_mod.TRANSPORTS:
+        raise HTTPException(status_code=400, detail=f"Transport must be one of {', '.join(tunnels_mod.TRANSPORTS)}")
+    ports = tunnels_mod.parse_ports(req.ports) if req.ports else await tunnels_mod.default_ports()
+    if not ports:
+        raise HTTPException(status_code=400, detail="No ports to forward")
+    if str(req.tunnel_port) in [p.split("=")[0].split(":")[-1] for p in ports]:
+        raise HTTPException(status_code=400, detail="Tunnel port must differ from the forwarded ports")
+
+    tunnel = await db.add_tunnel(req.ip.strip(), req.port, req.name.strip(), req.username, req.password or None,
+                                 req.tunnel_type, req.transport, req.tunnel_port, ports, req.accept_udp)
+    # Script for manual installation on the relay (shown when no SSH password is given)
+    install_cmd = tunnels_mod.remote_install_script(tunnel)
+    if req.password:
+        tasks.add_task(tunnels_mod.install_tunnel, tunnel["id"])
+    else:
+        # Start our side now; the relay is installed manually with the script
+        await db.update_tunnel(tunnel["id"], {"status": "installed"})
+        tasks.add_task(tunnels_mod.start_local, {**tunnel, "status": "installed"})
+
+    public = {k: v for k, v in tunnel.items() if k not in ("ssh_password", "token")}
     return {
-        "success": True, 
-        "message": "Tunnel added. installation started via SSH" if req.password else "Tunnel added. password missing for SSH install", 
-        "data": {k: v for k, v in tunnel.items() if k != "ssh_password"}, 
-        "install_command": install_cmd
+        "success": True,
+        "message": "Tunnel added. Installation started via SSH" if req.password
+                   else "Tunnel added. Run the install script on the relay server as root",
+        "data": public,
+        "install_command": install_cmd,
     }
+
+@router.post("/tunnels/{id}/reinstall")
+async def reinstall_tunnel(id: str, tasks: BackgroundTasks, user=Depends(auth.require_admin)):
+    t = await db.get_tunnel(id)
+    if not t:
+        raise HTTPException(status_code=404, detail="Tunnel not found")
+    tasks.add_task(tunnels_mod.install_tunnel, id)
+    return {"success": True, "message": "Reinstall started"}
 
 @router.delete("/tunnels/{id}")
 async def delete_tunnel(id: str, user=Depends(auth.require_admin)):
-    await db.delete_tunnel(id)
+    if not await db.get_tunnel(id):
+        raise HTTPException(status_code=404, detail="Tunnel not found")
+    await tunnels_mod.remove_tunnel(id)
     return {"success": True, "message": "Tunnel deleted"}
 
 # ── VPN Cores ──
@@ -238,7 +241,7 @@ async def get_cores(user=Depends(auth.require_admin)):
 @router.post("/cores/{id}/start")
 async def start_core(id: str, user=Depends(auth.require_admin)):
     try:
-        success = await protocol_manager.start_protocol(id)
+        success = await protocol_manager.start_protocol(id, remember=True)
         if success:
             return {"success": True, "message": f"{id.upper()} started"}
         raise HTTPException(status_code=500, detail=f"Failed to start {id}. Check the logs for details.")
@@ -251,7 +254,7 @@ async def start_core(id: str, user=Depends(auth.require_admin)):
 @router.post("/cores/{id}/stop")
 async def stop_core(id: str, user=Depends(auth.require_admin)):
     try:
-        success = await protocol_manager.stop_protocol(id)
+        success = await protocol_manager.stop_protocol(id, remember=True)
         if success:
             return {"success": True, "message": f"{id.upper()} stopped"}
         raise HTTPException(status_code=500, detail=f"Failed to stop {id}. Check the logs for details.")
@@ -320,8 +323,20 @@ async def get_panel_info(user=Depends(auth.require_admin)):
 
 @router.put("/panel")
 async def update_panel(data: dict = Body(...), user=Depends(auth.require_admin)):
-    await db.update_panel_config(data)
-    return {"success": True, "message": "Panel configuration updated"}
+    try:
+        needs_restart = await db.update_panel_config(data)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if "panel_port" in data:
+        import asyncio
+        port = int(data["panel_port"])
+        proc = await asyncio.create_subprocess_shell(
+            f"iptables -C INPUT -p tcp --dport {port} -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport {port} -j ACCEPT; "
+            f"command -v ufw >/dev/null && ufw status | grep -q 'Status: active' && ufw allow {port}/tcp >/dev/null; true",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        await proc.wait()
+    msg = "Panel configuration saved. Restart the panel to apply it" if needs_restart else "Panel configuration updated"
+    return {"success": True, "message": msg, "restart_required": needs_restart}
 
 class PwdRequest(BaseModel):
     current_password: str

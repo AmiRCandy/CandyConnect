@@ -6,12 +6,11 @@ import asyncio, os, sys, logging, time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.exceptions import RequestValidationError
 
-from config import PANEL_PORT, DATA_DIR, CORE_DIR, BACKUP_DIR, LOG_DIR
+from config import PANEL_PORT, PANEL_PATH, DATA_DIR, CORE_DIR, BACKUP_DIR, LOG_DIR
 from database import init_db, close_redis, add_log
 from protocols.manager import protocol_manager
 
@@ -82,8 +81,12 @@ async def lifespan(app: FastAPI):
     if _db_ready:
         try:
             await add_log("INFO", "System", "CandyConnect server started")
-            # Auto start protocols
-            asyncio.create_task(protocol_manager.auto_start_protocols())
+            # Auto start protocols, then relay tunnels
+            async def _boot():
+                await protocol_manager.auto_start_protocols()
+                import tunnels
+                await tunnels.start_all()
+            asyncio.create_task(_boot())
         except Exception:
             pass
     logger.info("CandyConnect server started")
@@ -167,31 +170,46 @@ app.include_router(client_router, prefix="/client-api")
 PANEL_DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "web-panel", "dist")
 PANEL_DIST = os.path.normpath(PANEL_DIST)
 
-if os.path.isdir(PANEL_DIST):
-    # Mount assets ONLY if the assets directory actually exists
-    _assets_dir = os.path.join(PANEL_DIST, "assets")
-    if os.path.isdir(_assets_dir):
-        app.mount("/candyconnect/assets", StaticFiles(directory=_assets_dir), name="panel-assets")
+# Panel URL path from CC_PANEL_PATH (e.g. "/candyconnect"); the panel is built with
+# relative asset URLs so it works under any path.
+PANEL_URL = "/" + PANEL_PATH.strip().strip("/") if PANEL_PATH.strip().strip("/") else "/candyconnect"
 
-    @app.get("/candyconnect/{rest_of_path:path}")
-    @app.get("/candyconnect")
-    async def serve_panel(rest_of_path: str = ""):
-        # Check if the requested path is actually a file (like favicon or manifest)
-        if rest_of_path:
-            file_path = os.path.join(PANEL_DIST, rest_of_path)
-            # Prevent path traversal
-            file_path = os.path.normpath(file_path)
-            if file_path.startswith(PANEL_DIST) and os.path.isfile(file_path):
-                return FileResponse(file_path)
 
-        # Otherwise return index.html for SPA routing
-        index = os.path.join(PANEL_DIST, "index.html")
-        if os.path.exists(index):
-            return FileResponse(index)
+@app.get(PANEL_URL, include_in_schema=False)
+async def panel_root_redirect():
+    # Trailing slash is required so "./assets/..." resolves under the panel path
+    return RedirectResponse(url=PANEL_URL + "/")
+
+
+@app.get(PANEL_URL + "/{rest_of_path:path}", include_in_schema=False)
+async def serve_panel(rest_of_path: str = ""):
+    if not os.path.isdir(PANEL_DIST):
         return JSONResponse(
             status_code=503,
             content={"error": "Panel not built. Run: cd web-panel && npm run build"},
         )
+    # Serve real files (assets, favicon, ...)
+    if rest_of_path:
+        file_path = os.path.normpath(os.path.join(PANEL_DIST, rest_of_path))
+        # Prevent path traversal
+        if file_path.startswith(PANEL_DIST + os.sep) and os.path.isfile(file_path):
+            return FileResponse(file_path)
+        if rest_of_path.startswith("assets/"):
+            return JSONResponse(status_code=404, content={"success": False, "message": "Not found"})
+
+    # Otherwise return index.html for SPA routing
+    index = os.path.join(PANEL_DIST, "index.html")
+    if os.path.exists(index):
+        return FileResponse(index, headers={"Cache-Control": "no-cache"})
+    return JSONResponse(
+        status_code=503,
+        content={"error": "Panel not built. Run: cd web-panel && npm run build"},
+    )
+
+
+@app.get("/", include_in_schema=False)
+async def root_redirect():
+    return RedirectResponse(url=PANEL_URL + "/")
 
 
 # ── Health Check ──

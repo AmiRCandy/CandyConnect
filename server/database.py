@@ -87,14 +87,13 @@ async def init_db():
         })
         logging.getLogger("candyconnect").info(f"Admin credentials applied from environment: {admin_user}")
 
-    # Panel config
-    if not await r.exists(K_PANEL):
-        await r.hset(K_PANEL, mapping={
-            "panel_port": str(PANEL_PORT),
-            "panel_path": PANEL_PATH,
-            "version": PANEL_VERSION,
-            "build_date": PANEL_BUILD_DATE,
-        })
+    # Panel config: the running values (from the environment) are the truth
+    await r.hset(K_PANEL, mapping={
+        "panel_port": str(PANEL_PORT),
+        "panel_path": PANEL_PATH,
+        "version": PANEL_VERSION,
+        "build_date": PANEL_BUILD_DATE,
+    })
 
     # Server start time
     if not await r.exists(K_SERVER_START):
@@ -102,19 +101,35 @@ async def init_db():
 
     # Default core configs
     defaults = _default_core_configs()
+    # Placeholder keys of the old SlipStream/TrustTunnel stubs; drop them on upgrade
+    obsolete = {
+        "slipstream": {"port", "method", "obfs", "obfs_host", "fast_open", "no_delay", "udp_relay", "timeout"},
+        "trusttunnel": {"protocol", "camouflage", "fragment_size", "fragment_interval", "sni", "alpn", "padding", "timeout"},
+    }
     for section, data in defaults.items():
-        if not await r.hexists(K_CONFIGS, section):
+        raw = await r.hget(K_CONFIGS, section)
+        if not raw:
             await r.hset(K_CONFIGS, section, json.dumps(data))
+            continue
+        # Upgrade: add keys introduced by newer versions, keep the admin's values
+        try:
+            current = json.loads(raw)
+        except ValueError:
+            current = {}
+        merged = {k: v for k, v in current.items() if k not in obsolete.get(section, set())}
+        for k, v in data.items():
+            merged.setdefault(k, v)
+        if merged != current:
+            await r.hset(K_CONFIGS, section, json.dumps(merged))
 
     # Default core statuses
     for proto in ["v2ray", "wireguard", "openvpn", "ikev2", "l2tp", "dnstt", "slipstream", "trusttunnel"]:
         if not await r.hexists(K_CORE_STATUS, proto):
             # All protocols except slipstream and trusttunnel are running by default
-            status = "running" if proto not in ["slipstream", "trusttunnel"] else "stopped"
             await r.hset(K_CORE_STATUS, proto, json.dumps({
-                "status": status,
+                "status": "stopped",
                 "pid": None,
-                "started_at": int(time.time()) if status == "running" else None,
+                "started_at": None,
                 "version": "",
             }))
 
@@ -224,17 +239,21 @@ def _default_core_configs() -> dict:
             "mtu": 1232,
         },
         "slipstream": {
-            "port": 8388, "method": "aes-256-cfb",
-            "obfs": "tls", "obfs_host": "www.microsoft.com",
-            "fast_open": True, "no_delay": True,
-            "udp_relay": True, "timeout": 300,
+            # DNS tunnel (QUIC over DNS). Needs an NS record for `domain` -> this server.
+            "domain": f"s.{PANEL_DOMAIN}",
+            "dns_listen_port": 5301,
+            "congestion_control": "bbr",
         },
         "trusttunnel": {
-            "port": 9443, "protocol": "https",
-            "camouflage": "cloudflare",
-            "fragment_size": 100, "fragment_interval": 50,
-            "sni": "www.google.com", "alpn": "h2,http/1.1",
-            "padding": True, "timeout": 60,
+            "port": 9443,
+            "hostname": PANEL_DOMAIN,      # TLS SNI / certificate name
+            "cert_path": "",               # empty = auto self-signed certificate
+            "key_path": "",
+            "enable_http1": True,
+            "enable_http2": True,
+            "enable_quic": True,
+            "ipv6_available": True,
+            "allow_private_network_connections": False,
         },
     }
 
@@ -294,15 +313,50 @@ async def get_panel_config() -> dict:
     }
 
 
-async def update_panel_config(updates: dict):
+async def update_panel_config(updates: dict) -> bool:
+    """Save panel port/path. They are written to the .env file read by the
+    service, so they take effect after a panel restart. Returns True if a
+    restart is needed."""
+    import os, re
+    from config import DATA_DIR
     r = await get_redis()
-    mapping = {}
+    mapping, env = {}, {}
     if "panel_port" in updates:
-        mapping["panel_port"] = str(updates["panel_port"])
+        port = int(updates["panel_port"])
+        if not 1 <= port <= 65535:
+            raise ValueError("Port must be between 1 and 65535")
+        mapping["panel_port"] = str(port)
+        env["CC_PANEL_PORT"] = str(port)
     if "panel_path" in updates:
-        mapping["panel_path"] = updates["panel_path"]
-    if mapping:
-        await r.hset(K_PANEL, mapping=mapping)
+        path = "/" + str(updates["panel_path"]).strip().strip("/")
+        if not re.fullmatch(r"/[A-Za-z0-9_\-]+", path) or path in ("/api", "/client-api", "/health", "/docs"):
+            raise ValueError("Path must look like /candyconnect (letters, digits, - and _)")
+        mapping["panel_path"] = path
+        env["CC_PANEL_PATH"] = path
+    if not mapping:
+        return False
+    await r.hset(K_PANEL, mapping=mapping)
+
+    env_file = os.path.join(DATA_DIR, ".env")
+    lines = []
+    if os.path.exists(env_file):
+        with open(env_file) as f:
+            lines = f.read().splitlines()
+    for key, val in env.items():
+        for i, line in enumerate(lines):
+            if line.startswith(key + "="):
+                lines[i] = f"{key}={val}"
+                break
+        else:
+            lines.append(f"{key}={val}")
+    with open(env_file, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    try:
+        os.chmod(env_file, 0o600)
+    except OSError:
+        pass
+    return (env.get("CC_PANEL_PORT", str(PANEL_PORT)) != str(PANEL_PORT)
+            or env.get("CC_PANEL_PATH", PANEL_PATH) != PANEL_PATH)
 
 
 # ── Server Uptime ──
@@ -317,6 +371,19 @@ async def get_server_uptime() -> int:
 
 # ── Clients ──
 
+def _with_time_fields(c: dict) -> dict:
+    """Add timezone-independent epoch timestamps and the elapsed days."""
+    from datetime import datetime
+    for key in ("created_at", "expires_at"):
+        try:
+            c[key.replace("_at", "_ts")] = int(datetime.strptime(c.get(key, ""), "%Y-%m-%d %H:%M:%S").timestamp())
+        except (ValueError, TypeError):
+            c[key.replace("_at", "_ts")] = None
+    if c.get("created_ts"):
+        c["time_used"] = max(0, int((time.time() - c["created_ts"]) // 86400))
+    return c
+
+
 async def get_all_clients() -> list[dict]:
     r = await get_redis()
     raw = await r.hgetall(K_CLIENTS)
@@ -326,7 +393,7 @@ async def get_all_clients() -> list[dict]:
         c["id"] = cid
         # Attach per-protocol traffic
         c["protocol_traffic"] = await _get_client_protocol_traffic(r, cid)
-        clients.append(c)
+        clients.append(_with_time_fields(c))
     return clients
 
 
@@ -338,7 +405,7 @@ async def get_client(client_id: str) -> Optional[dict]:
     c = json.loads(raw)
     c["id"] = client_id
     c["protocol_traffic"] = await _get_client_protocol_traffic(r, client_id)
-    return c
+    return _with_time_fields(c)
 
 
 async def get_client_by_username(username: str) -> Optional[dict]:
@@ -473,6 +540,13 @@ async def add_connection_history(client_id: str, protocol: str, event: str, ip: 
     now_ts = int(time.time())
 
     if event == "connect":
+        # "On hold": the time limit starts counting at the first connection
+        tl = client.get("time_limit") or {}
+        if tl.get("on_hold") or tl.get("onHold"):
+            tl["on_hold"] = False
+            tl.pop("onHold", None)
+            client["time_limit"] = tl
+            client["expires_at"] = _calc_expiry(now, tl)
         client["last_connected_ip"] = ip
         client["last_connected_time"] = now
         client["is_online"] = True
@@ -633,6 +707,25 @@ async def update_core_config(section: str, data: dict):
 
 # ── Core Status ──
 
+# Cores started automatically on boot unless the admin stopped them.
+# SlipStream / TrustTunnel are opt-in (they need a domain / extra download).
+DEFAULT_AUTOSTART = {"v2ray", "wireguard", "openvpn", "ikev2", "l2tp", "dnstt"}
+K_AUTOSTART = "cc:autostart"      # hash: core_id -> "1"/"0"
+
+
+async def get_autostart(core_id: str) -> bool:
+    r = await get_redis()
+    val = await r.hget(K_AUTOSTART, core_id)
+    if val is None:
+        return core_id in DEFAULT_AUTOSTART
+    return val == "1"
+
+
+async def set_autostart(core_id: str, enabled: bool):
+    r = await get_redis()
+    await r.hset(K_AUTOSTART, core_id, "1" if enabled else "0")
+
+
 async def get_core_status(core_id: str) -> dict:
     r = await get_redis()
     raw = await r.hget(K_CORE_STATUS, core_id)
@@ -658,6 +751,7 @@ async def get_all_core_statuses() -> dict:
 # ── Logs ──
 
 async def _add_log(level: str, source: str, message: str):
+    level = {"WARNING": "WARN", "ERR": "ERROR"}.get(str(level).upper(), str(level).upper())
     r = await get_redis()
     entry = json.dumps({
         "time": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -691,41 +785,59 @@ async def get_logs(limit: int = 100, source: str = None) -> list[dict]:
 
 K_TUNNELS = "candyconnect:tunnels"
 
-async def add_tunnel(ip: str, port: int, name: str, username: str = "root", password: Optional[str] = None, tunnel_type: str = "backhaul") -> dict:
+async def add_tunnel(ip: str, port: int, name: str, username: str = "root", password: Optional[str] = None,
+                     tunnel_type: str = "backhaul", transport: str = "tcp", tunnel_port: int = 3080,
+                     ports: Optional[list] = None, accept_udp: bool = False) -> dict:
     r = await get_redis()
     tunnel_id = secrets.token_hex(4)
     tunnel = {
         "id": tunnel_id,
         "name": name,
         "ip": ip,
-        "port": port,
+        "port": port,                 # SSH port of the relay
         "username": username,
         "ssh_password": password,
         "type": tunnel_type,
+        "transport": transport,
+        "tunnel_port": tunnel_port,   # Backhaul bind port on the relay
+        "ports": ports or [],         # forwarded ports (Backhaul syntax)
+        "accept_udp": accept_udp,
+        "token": secrets.token_hex(16),
         "created_at": int(time.time()),
-        "status": "pending",  # pending, installed
+        "status": "pending",  # pending, installing, installed, failed
+        "error": "",
     }
     await r.hset(K_TUNNELS, tunnel_id, json.dumps(tunnel))
     return tunnel
 
-async def get_tunnels() -> list[dict]:
+async def get_tunnel(tunnel_id: str) -> Optional[dict]:
+    r = await get_redis()
+    raw = await r.hget(K_TUNNELS, tunnel_id)
+    return json.loads(raw) if raw else None
+
+async def get_tunnels(include_secrets: bool = False) -> list[dict]:
     r = await get_redis()
     raw = await r.hgetall(K_TUNNELS)
     tunnels = [json.loads(val) for val in raw.values()]
-    # Never send stored SSH passwords back to the browser
-    for t in tunnels:
-        t.pop("ssh_password", None)
+    if not include_secrets:
+        # Never send stored SSH passwords / tokens back to the browser
+        for t in tunnels:
+            t["has_password"] = bool(t.pop("ssh_password", None))
+            t.pop("token", None)
     return tunnels
 
-async def update_tunnel_status(tunnel_id: str, status: str) -> bool:
+async def update_tunnel(tunnel_id: str, updates: dict) -> bool:
     r = await get_redis()
     raw = await r.hget(K_TUNNELS, tunnel_id)
     if not raw:
         return False
     tunnel = json.loads(raw)
-    tunnel["status"] = status
+    tunnel.update(updates)
     await r.hset(K_TUNNELS, tunnel_id, json.dumps(tunnel))
     return True
+
+async def update_tunnel_status(tunnel_id: str, status: str) -> bool:
+    return await update_tunnel(tunnel_id, {"status": status})
 
 async def delete_tunnel(tunnel_id: str) -> bool:
     r = await get_redis()

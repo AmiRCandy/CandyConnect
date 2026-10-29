@@ -113,8 +113,9 @@ class DNSTTProtocol(BaseProtocol):
                 # Ensure ssh is running
                 await self._run_cmd("sudo systemctl start ssh", check=False)
 
-            # Redirect port 53 to listen_port (idempotent)
-            await self._setup_redirection(listen_port)
+            # Redirect port 53 queries for our domain to listen_port (idempotent)
+            await self._setup_redirection(listen_port, remove=True)  # old catch-all rule
+            await self._dns_redirect(domain, listen_port)
 
             # Start dnstt-server
             pid = await self._start_process(
@@ -141,6 +142,7 @@ class DNSTTProtocol(BaseProtocol):
         # 3. Clean up iptables for redirection
         config = await get_core_config("dnstt") or {}
         await self._setup_redirection(int(config.get("listen_port", 5300)), remove=True)
+        await self._dns_redirect(config.get("domain", ""), int(config.get("listen_port", 5300)), remove=True)
         
         return True
 
@@ -264,6 +266,10 @@ class DNSTTProtocol(BaseProtocol):
             os.remove(conf_path)
 
     async def remove_client(self, username: str, protocol_data: dict):
+        from database import get_client_by_username
+        client = await get_client_by_username(username)
+        if client and (client.get("protocols") or {}).get("slipstream") and client.get("enabled", True):
+            return  # SSH account still used by SlipStream
         ssh_user = protocol_data.get("ssh_username") or f"dnstt_{username}"
         await self._run_cmd(f"sudo userdel -r {ssh_user} 2>/dev/null || true", check=False)
 

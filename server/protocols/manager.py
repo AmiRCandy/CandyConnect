@@ -56,7 +56,9 @@ class ProtocolManager:
         logger = logging.getLogger("candyconnect")
         
         # 1. Start Protocols
-        for pid in ["v2ray", "wireguard", "openvpn", "ikev2", "l2tp", "dnstt"]:
+        for pid in SUPPORTED_PROTOCOLS:
+            if not await db.get_autostart(pid):
+                continue
             try:
                 installed = await self.install_protocol(pid)
                 started = await self.start_protocol(pid)
@@ -110,17 +112,37 @@ class ProtocolManager:
             return False
         return await proto.install()
 
-    async def start_protocol(self, proto_id: str) -> bool:
+    async def start_protocol(self, proto_id: str, remember: bool = False) -> bool:
         proto = self.get_protocol(proto_id)
         if not proto:
             return False
+        if remember:
+            # Started by the admin: install if needed and start it on boot from now on
+            await db.set_autostart(proto_id, True)
+            if not await proto.install():
+                return False
+            ok = await proto.start()
+            if ok:
+                await self.sync_protocol_clients(proto_id)
+            return ok
         return await proto.start()
 
-    async def stop_protocol(self, proto_id: str) -> bool:
+    async def stop_protocol(self, proto_id: str, remember: bool = False) -> bool:
         proto = self.get_protocol(proto_id)
         if not proto:
             return False
+        if remember:
+            await db.set_autostart(proto_id, False)
         return await proto.stop()
+
+    async def sync_protocol_clients(self, proto_id: str) -> None:
+        """Make sure every client allowed on proto_id has its backend account/keys."""
+        for client in await get_all_clients():
+            if not (client.get("protocols") or {}).get(proto_id):
+                continue
+            pdata = await self.sync_client(client)
+            if pdata != (client.get("protocol_data") or {}):
+                await update_client(client["id"], {"protocol_data": pdata}, log=False)
 
     async def restart_protocol(self, proto_id: str) -> bool:
         proto = self.get_protocol(proto_id)
@@ -334,7 +356,9 @@ class ProtocolManager:
                 return int(cfg.get("port", default_port))
             elif pid == "dnstt":
                 return int(cfg.get("listen_port", default_port))
-            elif pid in ("slipstream", "trusttunnel"):
+            elif pid == "slipstream":
+                return int(cfg.get("dns_listen_port", default_port))
+            elif pid == "trusttunnel":
                 return int(cfg.get("port", default_port))
             elif pid == "v2ray":
                 # Parse first inbound port from JSON

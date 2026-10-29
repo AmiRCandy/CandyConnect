@@ -228,12 +228,22 @@ generate_secrets() {
         cp "$CC_DIR/.env" "$CC_DIR/.env.bak"
     fi
 
+    # Keep settings changed from the panel (port/path) and the JWT secret on re-install
+    if [ -f "$CC_DIR/.env.bak" ]; then
+        OLD_PORT=$(grep -E '^CC_PANEL_PORT=' "$CC_DIR/.env.bak" | cut -d= -f2)
+        OLD_PATH=$(grep -E '^CC_PANEL_PATH=' "$CC_DIR/.env.bak" | cut -d= -f2)
+        OLD_JWT=$(grep -E '^CC_JWT_SECRET=' "$CC_DIR/.env.bak" | cut -d= -f2-)
+        [ -n "$OLD_PORT" ] && CC_PORT="$OLD_PORT"
+        [ -n "$OLD_JWT" ] && JWT_SECRET="$OLD_JWT"
+    fi
+    CC_PATH="${OLD_PATH:-/candyconnect}"
+
     cat > "$CC_DIR/.env" << EOF
 CC_DATA_DIR=$CC_DIR
 CC_REDIS_URL=redis://127.0.0.1:6379/0
 CC_JWT_SECRET=$JWT_SECRET
 CC_PANEL_PORT=$CC_PORT
-CC_PANEL_PATH=/candyconnect
+CC_PANEL_PATH=$CC_PATH
 CC_DOMAIN=$CC_DOMAIN
 CC_ADMIN_USER=admin
 CC_ADMIN_PASS=admin123
@@ -267,9 +277,10 @@ Group=root
 WorkingDirectory=CC_SERVER_DIR_PLACEHOLDER
 EnvironmentFile=CC_DIR_PLACEHOLDER/.env
 ExecStartPre=/bin/bash -c 'redis-cli ping > /dev/null 2>&1 || sleep 5'
-ExecStart=CC_SERVER_DIR_PLACEHOLDER/venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port CC_PANEL_PORT_PLACEHOLDER --log-level info
-Restart=on-failure
-RestartSec=10
+ExecStart=CC_SERVER_DIR_PLACEHOLDER/venv/bin/python -m uvicorn main:app --host 0.0.0.0 --port ${CC_PANEL_PORT} --log-level info
+# "always": the panel's Restart button exits cleanly and relies on systemd to start it again
+Restart=always
+RestartSec=3
 StandardOutput=append:CC_DIR_PLACEHOLDER/logs/server.log
 StandardError=append:CC_DIR_PLACEHOLDER/logs/server.log
 
@@ -284,7 +295,6 @@ SERVICEEOF
     # Replace placeholders with actual paths
     sed -i "s|CC_SERVER_DIR_PLACEHOLDER|$CC_SERVER_DIR|g" /etc/systemd/system/${CC_SERVICE}.service
     sed -i "s|CC_DIR_PLACEHOLDER|$CC_DIR|g" /etc/systemd/system/${CC_SERVICE}.service
-    sed -i "s|CC_PANEL_PORT_PLACEHOLDER|$CC_PORT|g" /etc/systemd/system/${CC_SERVICE}.service
 
     systemctl daemon-reload
     systemctl enable "$CC_SERVICE"
@@ -302,8 +312,8 @@ SERVICEEOF
 setup_firewall() {
     info "Configuring firewall rules..."
 
-    # Allow panel + VPN ports (8080 = default VMess-WS inbound, 5300 = DNSTT listen port)
-    for port in $CC_PORT 443 8080 51820 1194 500 4500 1701 53 5300 8388 9443; do
+    # Allow panel + VPN ports (8080 = VMess-WS, 5300/5301 = DNSTT/SlipStream listen ports, 9443 = TrustTunnel)
+    for port in $CC_PORT 443 8080 51820 1194 500 4500 1701 53 5300 5301 9443; do
         iptables -C INPUT -p tcp --dport $port -j ACCEPT 2>/dev/null || \
             iptables -I INPUT -p tcp --dport $port -j ACCEPT
         iptables -C INPUT -p udp --dport $port -j ACCEPT 2>/dev/null || \
@@ -338,7 +348,7 @@ print_summary() {
     echo -e "${BOLD}${GREEN}  🍬 CandyConnect Installed Successfully!${NC}"
     echo -e "${BOLD}${GREEN}═══════════════════════════════════════════${NC}"
     echo ""
-    echo -e "  ${BOLD}Panel URL:${NC}    http://${SERVER_IP}:${CC_PORT}/candyconnect"
+    echo -e "  ${BOLD}Panel URL:${NC}    http://${SERVER_IP}:${CC_PORT}${CC_PATH:-/candyconnect}"
     echo -e "  ${BOLD}API URL:${NC}      http://${SERVER_IP}:${CC_PORT}/api"
     echo -e "  ${BOLD}Client API:${NC}   http://${SERVER_IP}:${CC_PORT}/client-api"
     echo -e "  ${BOLD}Admin User:${NC}   admin"
